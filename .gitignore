@@ -1,0 +1,24 @@
+/target
+**/*.rs.bk
+
+# Cargo.lock **要进版本库**（所以这里没有它）：sbx 是应用不是库，
+# CI 与 release 都用 `--locked` 构建，锁文件缺失会让发布产物里的依赖版本
+# 与本地验证过的那份不一致 —— 那种漂移只会在出问题时才被发现。
+
+# Go 产物。三个独立 module 各自可能产出:`go build -o <名字>` 给的名字,
+# 或者 `go build ./...` 按 module 名生成的默认名(e2e-driver)。
+agent/sbx-agent
+agent/sbx-agent.exe
+spike/spike
+spike/spike.exe
+e2e/driver
+e2e/driver.exe
+e2e/e2e-driver
+e2e/e2e-driver.exe
+
+# 本地运行时数据（不该进版本库）
+*.db
+*.db-wal
+*.db-shm
+last-applied.json
+/tls/

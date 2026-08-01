@@ -1,0 +1,76 @@
+# 主控配置(§11.2)。每一节、每一个字段都可以省略 —— 省略即取下面注释里的默认值。
+# 空文件也能启动,这是刻意的:加一个新配置项不该让所有老配置文件报错。
+#
+# 没有 [kernel] 段。sing-box 版本就是 agent/go.mod 里的一行 require(§9.2)。
+
+[db]
+# SQLite 文件。所在目录必须存在且可写。
+path = "/etc/sbx/sbx.db"
+
+[cluster]
+# agent 拨向这里。这是**唯一**需要对外开放的管理端口 ——
+# 被控服务器上不监听任何管理端口(§11.3)。
+listen = "0.0.0.0:18443"
+
+# 默认 wss。证书不存在时主控自己用 rcgen 生成一张自签的,
+# 启动时打印 sha256 指纹,agent 侧填进 fingerprint(TOFU,§1.3)。
+#
+# 改成 false 会退回明文 ws,那时 agent 侧也必须写 insecure = true。
+# 只有「前面已经套了 nginx 做 TLS 终止」才该这么配。
+tls       = true
+cert_path = "/etc/sbx/tls/cert.pem"
+key_path  = "/etc/sbx/tls/key.pem"
+
+# agent 每 heartbeat_secs 发一次 pong 刷新 last_seen;
+# 每 report_interval_secs 上报一次 stats + sysinfo。两个值都由握手下发给 agent。
+heartbeat_secs       = 10
+report_interval_secs = 30
+
+# 订阅 HTTP 监听。这是「不做 Web 面板」(§2)的唯一例外:
+# 它只吐订阅内容与流量页,**不提供任何管理能力**。
+# 默认只听 127.0.0.1 —— 要对外暴露就在前面放 nginx,别直接改成 0.0.0.0。
+[subscription]
+listen  = "127.0.0.1:18081"
+enabled = true
+
+# 生成订阅链接时用的对外地址(例如 "https://sub.example.com")。
+# 留空则用请求里的 Host。
+public_base = ""
+
+# true 时把 public_base 也当作节点地址下发给客户端(前置 CDN 的场景)。
+# 默认 false:节点地址取 agents.ipv4 / ipv6(§10)。
+use_public_base_as_server = false
+
+# Telegram 通知(§9.1)。默认关 —— 填了 token 也要显式打开,
+# 因为它会主动往外发消息,不该因为配置里留了一行就自己启动。
+[telegram]
+enabled   = false
+# **这是凭据**,与 token、TLS 私钥同级:日志和界面里都不回显完整值。
+bot_token = ""
+
+# 管理员的 chat_id(向 @userinfobot 发一条消息就能拿到)。
+# 空 = 没有管理员,只有用户侧的个人通知。
+admin_chat_ids = []
+
+# 只接受 ±HH:MM 偏移,以及**不走夏令时**的 IANA 别名
+# (Asia/Shanghai、Asia/Tokyo、Asia/Kolkata、Australia/Brisbane 等)。
+# 会 DST 的时区(Europe/London、America/*、Australia/Sydney)**故意不认** ——
+# 给它们一个固定偏移会在夏令时期间整整偏一小时,那种错比回落到默认更难发现。
+# 那些地区请直接填偏移,例如 "-05:00"。
+timezone = "Asia/Shanghai"
+
+poll_interval_secs   = 2
+request_timeout_secs = 10
+
+# 新用户的默认通知设置。用户可以在 bot 里各自改。
+default_notify_quota_80  = true
+default_notify_quota_90  = true
+default_notify_quota_100 = true
+default_schedule_enabled = true
+default_schedule_times   = ["09:00", "21:30"]
+
+# 管理员侧。这些只在 tg_admin_prefs 里**不存在**该 chat_id 时用作初值;
+# 管理员之后在 bot 里改过的设置不会被这里覆盖。
+admin_notify_quota   = true
+admin_schedule_enabled = true
+admin_schedule_times = ["09:00", "21:30"]

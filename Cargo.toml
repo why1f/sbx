@@ -1,0 +1,24 @@
+[workspace]
+members  = ["master", "shared"]
+resolver = "2"
+
+# 依赖版本集中在 workspace 一层，master 与 shared 用 `workspace = true` 引。
+# 相比旧项目（单 crate、版本直接写在 [dependencies]）多这一层，是因为 shared/
+# 里的 serde 版本必须与 master/ 完全一致——协议 struct 在两个 crate 之间传递，
+# 版本漂移会变成 trait 不匹配的编译错误，而报错位置离真正的原因很远。
+[workspace.dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow     = "1"
+thiserror  = "2"
+tracing    = "0.1"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+opt-level     = 3
+strip         = "debuginfo"
+lto           = true
+codegen-units = 1

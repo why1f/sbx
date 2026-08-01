@@ -1,0 +1,33 @@
+{
+  "listen": "::",
+  "listen_port": 8443,
+  "tag": "node-1",
+  "tls": {
+    "enabled": true,
+    "reality": {
+      "enabled": true,
+      "handshake": {
+        "server": "www.apple.com",
+        "server_port": 443
+      },
+      "private_key": "SDNoQP-vFjV1FQ7lQFBhE_-8mZBnkvHnBBWEqhOpU2s",
+      "short_id": [
+        "0123abcd"
+      ]
+    },
+    "server_name": "www.apple.com"
+  },
+  "type": "vless",
+  "users": [
+    {
+      "flow": "xtls-rprx-vision",
+      "name": "alice",
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+    },
+    {
+      "flow": "xtls-rprx-vision",
+      "name": "bob",
+      "uuid": "0f2d7b4a-1c3e-4a5b-8d9f-2e1a3b4c5d6e"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# 部署目标是 Linux;换行统一成 LF,免得从 Windows 提交的脚本和 workflow
+# 带着 CRLF 上去 —— shell 脚本带 CR 会报 "bad interpreter: ... ^M"。
+* text=auto eol=lf
+
+# 二进制/证书按字节处理,不做任何换行转换。
+*.png binary
+*.pem -text

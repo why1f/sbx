@@ -1,0 +1,179 @@
+name: release
+
+# 两组产物,两条独立的构建链(§11.1):
+#   sbx        Rust,musl 静态链接,x86_64 原生编 + aarch64 用 cross
+#   sbx-agent  Go,CGO_ENABLED=0 交叉编译,一个 job 出两个 arch
+#
+# **agent 侧没有内核构建。** 不 clone 上游、不打补丁、不 go mod edit -replace、
+# 不追补丁腐烂 —— sing-box 就是 agent/go.mod 里的一行 require(§0.3 结论三)。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  meta:
+    name: 校验发布元数据
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # tag、master/Cargo.toml 的 version、CHANGELOG.md 的 `## v<x>` 标题三者必须一致。
+      # 放在最前面单独一个 job:版本号写错时不该先花十分钟编两个 arch 才发现。
+      #
+      # 注意读的是 master/Cargo.toml —— 根 Cargo.toml 是 workspace,没有 version 字段。
+      - name: tag == Cargo.toml == CHANGELOG
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO_VER="$(sed -n 's/^version *= *"\(.*\)"/\1/p' master/Cargo.toml | head -n1)"
+          test -n "$CARGO_VER" || { echo "::error::master/Cargo.toml 里读不到 version"; exit 1; }
+          if [ "$TAG" != "$CARGO_VER" ]; then
+            echo "::error::tag v$TAG 与 master/Cargo.toml 的 version $CARGO_VER 不一致"
+            exit 1
+          fi
+          if ! grep -q "^## v${TAG}$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md 里没有 '## v${TAG}' 标题"
+            exit 1
+          fi
+
+  master:
+    name: sbx (${{ matrix.target }})
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
+            use_cross: true     # 用 cross(docker)跨编译,避开不稳定的 ARM runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools (native target)
+        if: matrix.use_cross != true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross == true
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build (native)
+        if: matrix.use_cross != true
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/${{ matrix.target }}/release/sbx
+          strip "$BIN" 2>/dev/null || true
+          NAME=sbx-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir -p "dist/$NAME"
+          cp "$BIN" "dist/$NAME/sbx"
+          cp packaging/config.example.toml packaging/sbx.service "dist/$NAME/"
+          cp README.md CHANGELOG.md LICENSE-MIT "dist/$NAME/"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          ( cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          echo "asset=dist/$NAME.tar.gz"       >> "$GITHUB_OUTPUT"
+          echo "sha=dist/$NAME.tar.gz.sha256"  >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbx-${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.sha }}
+
+  agent:
+    name: sbx-agent (linux)
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: agent/go.sum
+
+      # 一个 job 出两个 arch —— Go 交叉编译不需要工具链,这是相对 Rust 那条链的
+      # 全部优势所在。
+      #
+      # **-tags with_quic,with_utls 是必需的**:reality 依赖 uTLS、
+      # hysteria2/tuic 是 QUIC 协议,少了 tag 这两类节点会在 box.New 时才失败(§9.1)。
+      # 除这两个之外不该再有别的 tag —— 加了 with_v2ray_api 说明 §0.2 被误读了。
+      # (漏掉时 boxctl/buildtags.go 的编译期哨兵会让这一步直接失败。)
+      #
+      # 裸二进制 + 独立 .sha256,是 agent.upgrade(§4.2)的下载格式:
+      # 它按 <asset>.sha256 校验后 rename 覆盖自己,所以产物不能是 tar.gz。
+      - name: Build & package
+        id: pkg
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            BIN="sbx-agent-${GITHUB_REF_NAME}-linux-${arch}"
+            GOARCH="$arch" go -C agent build -trimpath \
+              -tags with_quic,with_utls \
+              -ldflags "-s -w -buildid= -X main.Version=${VERSION}" \
+              -o "../dist/${BIN}" ./cmd/sbx-agent
+            # 逐个算,不要 for f in sbx-agent-* —— 那会把下面拷进来的
+            # sbx-agent.service 和刚生成的 .sha256 也算进去。
+            ( cd dist && sha256sum "$BIN" > "${BIN}.sha256" )
+          done
+          cp packaging/agent.example.toml packaging/sbx-agent.service agent/LICENSE dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbx-agent-linux
+          path: dist/*
+
+  release:
+    needs: [master, agent]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/sbx-agent-*
+            dist/*.sha256
+            dist/agent.example.toml
+            dist/sbx-agent.service
+          generate_release_notes: true

@@ -1,0 +1,10 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+(完整 GPLv3 文本见 https://www.gnu.org/licenses/gpl-3.0.txt)
+
+本目录(`agent/`)及其子目录下的全部代码以 GPLv3 许可证发布,
+因为它静态链接 sing-box(GPLv3)。
+
+主控(`master/`)与协议定义(`shared/`)是 MIT 许可,
+两者通过 WebSocket 网络边界隔离,不受 GPL 传染(见仓库根目录 README.md)。

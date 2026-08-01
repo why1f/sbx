@@ -1,0 +1,59 @@
+[package]
+name    = "sbx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sbx"
+path = "src/main.rs"
+
+[dependencies]
+sbx-shared = { path = "../shared" }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+
+sqlx               = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+tokio              = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal", "fs", "io-util"] }
+clap               = { version = "4", features = ["derive"] }
+chrono             = { version = "0.4", default-features = false, features = ["clock", "std"] }
+uuid               = { version = "1", features = ["v4"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+toml               = "0.8"
+rand               = "0.8"
+sha2               = "0.10"
+subtle             = "2"
+base64             = "0.22"
+axum               = { version = "0.7", default-features = false, features = ["tokio", "http1", "query", "ws"] }
+futures-util       = { version = "0.3", default-features = false, features = ["sink"] }
+axum-server        = { version = "0.7", features = ["tls-rustls"] }
+rustls             = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile     = "2"
+rcgen              = "0.13"
+# reality 的密钥对是 X25519。sing-box 侧是 `sing-box generate reality-keypair`,
+# 但主控机上没有 sing-box 二进制(§0.3:agent 才内嵌它),所以在这里自己生成。
+# static_secrets 特性是为了能把私钥字节导出来下发给 agent。
+x25519-dalek       = { version = "2", features = ["static_secrets"] }
+urlencoding        = "2"
+ratatui            = "0.29"
+crossterm          = "0.28"
+# 订阅页里的二维码。只要 SVG 渲染,不要 image 那条依赖链(它会拖进一堆解码器)。
+qrcode             = { version = "0.14", default-features = false, features = ["svg"] }
+# Telegram Bot API 客户端。走 rustls 而不是 native-tls:rustls 已经因为
+# §1.3 的 wss 进来了,再拖一条 OpenSSL 依赖会让 musl 静态构建变麻烦(§11.1)。
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# 相对旧项目删除:tonic / prost / [build-dependencies](DESIGN.md §0.3 结论一、§9.2)
+# 后续步骤按需加入:ratatui、crossterm、urlencoding、reqwest、qrcode
+# **不要加 argon2** —— 理由见 DESIGN.md §8.1
+
+[dev-dependencies]
+tokio            = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+# 订阅路由的端到端测试用 ServiceExt::oneshot 直接喂请求进 Router,
+# 不占端口也不需要 HTTP 客户端。
+tower            = { version = "0.5", features = ["util"] }

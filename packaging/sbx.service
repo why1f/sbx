@@ -1,0 +1,35 @@
+[Unit]
+Description=sbx master (sing-box cluster controller)
+Documentation=https://github.com/yourorg/sbx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sbx --config /etc/sbx/config.toml daemon
+Restart=always
+RestartSec=3
+
+# 证书私钥是凭据(§11.3)。ConfigurationDirectory 让 systemd 建好 /etc/sbx
+# 并把属主设成本服务的用户;权限 0750 挡住同机其他用户。
+ConfigurationDirectory=sbx
+ConfigurationDirectoryMode=0750
+
+# 收紧运行环境。主控只需要读写 /etc/sbx(库和证书都在那儿)和监听端口,
+# 别的什么都不需要 —— 它是唯一对外开放管理端口的进程,值得多花这几行。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/etc/sbx
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

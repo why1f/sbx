@@ -1,0 +1,129 @@
+name: ci
+
+# 两个 module,两条独立的验证链。它们**没有共享构建产物**——
+# master/ 与 agent/ 之间只有 WebSocket 边界(README 的许可证一节),
+# CI 里也不该出现一个把两边编到一起的步骤。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: master (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+        continue-on-error: true
+      - run: cargo build --locked
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  go:
+    name: agent (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: agent/go.sum
+
+      # 版本漂移的守卫:go.mod 是 sing-box 版本的唯一真源(§0.3 结论三)。
+      # 出现 replace 指令说明有人开始打补丁了 —— 那会把 CI 从一条 go build
+      # 变成 clone 上游 + apply patch + 每日追补丁腐烂(§7.5 / §11.1)。
+      - name: 禁止 replace 指令与 patches/ 目录
+        working-directory: agent
+        run: |
+          set -euo pipefail
+          if grep -qE '^\s*replace\s' go.mod; then
+            echo "::error::agent/go.mod 里出现了 replace 指令。sing-box 必须是普通依赖(§0.3 结论三)。"
+            exit 1
+          fi
+          if [ -d patches ]; then
+            echo "::error::agent/patches/ 存在。若真要打补丁,先确认 §7.5 的触发条件成立并更新 DESIGN.md。"
+            exit 1
+          fi
+
+      - name: gofmt
+        working-directory: agent
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未经 gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: agent
+        run: go vet -tags with_quic,with_utls ./...
+
+      # 部署目标是 Linux;开发机上跑的是 windows/amd64,交叉编译在这里兜住
+      # 「只在某个平台编得过」这类问题。
+      #
+      # **-tags with_quic,with_utls 是必需的,不是优化**:reality 要 uTLS、
+      # hysteria2/tuic 要 QUIC,少了就在 box.New 时才炸(§9.1)。
+      # boxctl/buildtags.go 里有编译期哨兵,漏了 tag 这一步会直接编不过。
+      # 除这两个之外不该再有别的 tag —— 出现 with_v2ray_api 说明 §0.2 被误读了。
+      - name: 交叉编译两个发布 arch
+        working-directory: agent
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -tags with_quic,with_utls ./...
+          done
+
+      # -race 需要 cgo,所以只在 Linux runner 上跑。
+      # tracker 与 WS 客户端都是并发结构,这一条比普通 go test 值钱得多。
+      #
+      # 这里还会跑 boxctl 的跨语言契约测试:把 master/testdata/inbounds/*.json
+      # (Rust 侧生成的八协议 golden)喂给真正的 sing-box。
+      - name: go test -race
+        working-directory: agent
+        run: go test -race -tags with_quic,with_utls -count=1 ./...
+
+  spike:
+    name: §12.0 spike(回归)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: spike/go.sum
+
+      # spike 起真实的 sing-box 实例跑真实流量,验的是 agent/tracker 的数据路径
+      # 到底记没记到账(§12.0)。它自断言:全过 exit 0,失败 exit 1,
+      # 150s 看门狗超时 exit 2。**改了 agent/tracker 就要同步改它**,
+      # 否则这里验的不是同一份东西。
+      - name: go run .
+        working-directory: spike
+        run: go run .
+        timeout-minutes: 5
+
+  e2e-driver:
+    # §13.2 / §13.3 的驱动程序。完整的端到端跑法需要起主控 + 两个 agent
+    # (见 e2e/README.md,已在真实 ARM 机器上跑通),CI 里只保证它**编得过** ——
+    # 编不过的话那份验证下次就没法复跑了。
+    name: e2e 驱动(仅编译)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: e2e/go.sum
+      - working-directory: e2e
+        run: go build -tags with_quic,with_utls ./...

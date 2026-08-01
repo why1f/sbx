@@ -1,0 +1,46 @@
+[Unit]
+Description=sbx agent (embedded sing-box, managed by sbx master)
+Documentation=https://github.com/yourorg/sbx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sbx-agent /etc/sbx/agent.toml
+
+# Restart=always 是 §11.2 自升级的**前提**,不是可选的加固项:
+# agent.upgrade 的收尾动作是「替换掉自己的二进制,然后退出」——
+# 靠 supervisor 拉起新版本。没有它,一次升级等于一次永久下线。
+Restart=always
+RestartSec=3
+
+# last-applied.json 落在 /var/lib/sbx-agent(agent.toml 里的 state_dir)。
+# StateDirectory 让 systemd 建好目录并设属主。
+StateDirectory=sbx-agent
+StateDirectoryMode=0750
+ConfigurationDirectory=sbx
+ConfigurationDirectoryMode=0750
+
+# sing-box 要监听特权端口(443 等),但不需要 root 的其余能力。
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# 自升级要用 rename 覆盖 /usr/local/bin/sbx-agent,所以那条路径必须可写 ——
+# 这是 ProtectSystem=strict 下唯一需要额外开口的地方。
+# 不用自升级的部署可以删掉这一行,那时 agent.upgrade 会明确报错而不是静默失败。
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# 代理进程的连接数很容易顶到默认的 1024。
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

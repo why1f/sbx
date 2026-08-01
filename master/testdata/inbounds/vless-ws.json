@@ -1,0 +1,22 @@
+{
+  "listen": "::",
+  "listen_port": 8443,
+  "tag": "node-1",
+  "transport": {
+    "early_data_header_name": "Sec-WebSocket-Protocol",
+    "max_early_data": 2048,
+    "path": "/vless",
+    "type": "ws"
+  },
+  "type": "vless",
+  "users": [
+    {
+      "name": "alice",
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+    },
+    {
+      "name": "bob",
+      "uuid": "0f2d7b4a-1c3e-4a5b-8d9f-2e1a3b4c5d6e"
+    }
+  ]
+}

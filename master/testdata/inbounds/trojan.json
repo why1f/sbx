@@ -1,0 +1,22 @@
+{
+  "listen": "::",
+  "listen_port": 8443,
+  "tag": "node-1",
+  "tls": {
+    "certificate": "-----BEGIN CERTIFICATE-----\r\nMIIBZzCCAQ2gAwIBAgIUYFjJEiuJW9Gcl518kvLWCZyyIE4wCgYIKoZIzj0EAwIw\r\nITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAw\r\nMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWdu\r\nZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABAFebP1ArFEvWpA0Ej0l\r\nYKtgMYfw8ZEYbc8Jom2abBaNIlfk3AxywZAqjwE/zCo2rx4pMbD5oeVTe5InzF/U\r\nNw+jITAfMB0GA1UdEQQWMBSCEmdvbGRlbi5leGFtcGxlLmNvbTAKBggqhkjOPQQD\r\nAgNIADBFAiEAoeVqGNT+48j1LjMuXEX+M8vNB7M5xBGF+qX5tYidJUkCIGExIKRg\r\nGuXEZ/4j237UG/YROBrzGWWNeRGYLDRbzd+f\r\n-----END CERTIFICATE-----\r\n",
+    "enabled": true,
+    "key": "-----BEGIN PRIVATE KEY-----\r\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgLeK57JGdB7MRaYS8\r\nXDvyG/DnSlmMx1K57yUqgdiXKRWhRANCAAQBXmz9QKxRL1qQNBI9JWCrYDGH8PGR\r\nGG3PCaJtmmwWjSJX5NwMcsGQKo8BP8wqNq8eKTGw+aHlU3uSJ8xf1DcP\r\n-----END PRIVATE KEY-----\r\n",
+    "server_name": "bing.com"
+  },
+  "type": "trojan",
+  "users": [
+    {
+      "name": "alice",
+      "password": "alice-password"
+    },
+    {
+      "name": "bob",
+      "password": "bob-password"
+    }
+  ]
+}
