@@ -19,6 +19,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # 用 stable 而不是钉死版本:发布产物应当跟着编译器的修复走。
+      # 代价是**新版 clippy 引入新 lint 时 CI 会变红**,即使代码一行没改。
+      # 那不是误报,修法通常就是一行(照 clippy 给的 help 改),改完往往更清楚。
+      # 如果更看重「不被 Rust 发布节奏打扰」,加一个 rust-toolchain.toml 钉住版本即可。
+      #
+      # 注意本地开发机的 stable 可能落后于 runner —— 本地 clippy 干净不代表 CI 干净。
+      # 拿不准就 `rustup update stable` 再跑一遍。
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

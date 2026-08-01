@@ -177,7 +177,9 @@ mod tests {
         let mut acc = 0i64;
         let mut last = 0i64;
         for new in [10, 25, 25, 100, 3_000] {
-            acc += compute(Some("e1").filter(|_| last > 0), last, "e1", new).delta;
+            // 第一轮 last == 0,表示「库里还没有这个 (user, node) 的记录」,
+            // 此时 stored_epoch 是 None;之后每轮都带上同一个 epoch。
+            acc += compute((last > 0).then_some("e1"), last, "e1", new).delta;
             last = new;
         }
         assert_eq!(acc, 3_000, "增量之和应等于最终累计值");
