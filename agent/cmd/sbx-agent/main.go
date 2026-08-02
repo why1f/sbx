@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -33,8 +34,16 @@ func main() {
 	master.AgentVersion = Version
 
 	if len(os.Args) < 2 {
-		log.Fatal("用法: sbx-agent <config.toml>")
+		log.Fatal("用法: sbx-agent <config.toml>  |  sbx-agent --version")
 	}
+	// 版本查询走 stdout 且不带日志前缀:安装/升级脚本要拿它跟 release 比对,
+	// 多一个时间戳前缀就得在脚本里再剥一层。
+	switch os.Args[1] {
+	case "--version", "-v", "version":
+		fmt.Printf("sbx-agent %s\n", Version)
+		return
+	}
+
 	cfg, err := config.Load(os.Args[1])
 	if err != nil {
 		log.Fatalf("读配置失败: %v", err)

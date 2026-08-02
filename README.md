@@ -3,7 +3,7 @@
 主控(Rust)+ 多被控 agent(Go 内嵌 sing-box)的 sing-box 集群管理工具。
 一台主控通过 WebSocket 管理 N 台被控服务器,CLI + TUI 运维闭环。
 
-完整设计见 [`DESIGN.md`](DESIGN.md)。
+完整设计见 [`DESIGN.md`](DESIGN.md);部署与跨机验证清单见 [`DEPLOY.md`](DEPLOY.md)。
 
 ## 许可证:双许可,边界在 WebSocket 上
 
@@ -89,6 +89,18 @@ Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 >
 > 仍未实测的只剩 **agent 自升级**(`agent.upgrade`:下载、校验 sha256、
 > rename 覆盖自己再退出)—— 它需要一个真实的发布产物才能验。
+
+## 安装
+
+```sh
+# 被控机
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | sh -s -- agent
+# 主控机
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | sh -s -- master
+```
+
+不带参数重跑就是**升级**:认出本机已装的部分,已是最新版就什么都不做。
+下载后强制校验 sha256,取不到校验和宁可拒装。部署细节见 [`DEPLOY.md`](DEPLOY.md)。
 
 ## 已经能跑的东西
 

@@ -4,6 +4,27 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.1.1
+
+### 新增
+
+- **一键安装 / 升级脚本** `packaging/install.sh`(POSIX sh,被控机上可能只有 dash)。
+
+      curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | sh
+
+  不带参数时**按本机已装的东西升级**:装了什么就升什么,一个都没装则报错并让你
+  显式选 —— 免得在一台只跑 agent 的机器上莫名多出一个主控。
+  已是最新版就什么都不做;下载后**强制校验 sha256**,取不到校验和宁可拒装;
+  替换走同目录 tmp + `mv`(跨文件系统的 mv 不是原子的);
+  只在单元**本来就在跑**时才重启它。
+
+- `sbx-agent --version`。v0.1.0 没有这个,导致升级脚本认不出已装版本、每次都重装。
+  输出走 stdout 且不带日志前缀,脚本可以直接取。
+
+### 修
+
+- 新版 clippy 的 `some_filter` lint(`Some(x).filter(|_| cond)` → `cond.then_some(x)`)。
+
 ## v0.1.0
 
 首个版本。
