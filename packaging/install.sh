@@ -7,11 +7,16 @@
 #   # 装被控 agent
 #   curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash -s -- agent
 #
+#   # 装被控 agent 并**直接接入某台主控**(主控 TUI 的「新增被控服务器」会吐出整条命令)
+#   curl -fsSL .../install.sh | SBX_SERVER='wss://1.2.3.4:18443/ws' \
+#       SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+#
 # 选目标的优先级:
 #   1. 命令行参数 / SBX_TARGET
-#   2. 本机**已经装了什么**就升什么 —— 一台只跑 agent 的机器上跑裸命令
+#   2. 给了 SBX_TOKEN —— 那只可能是在装被控
+#   3. 本机**已经装了什么**就升什么 —— 一台只跑 agent 的机器上跑裸命令
 #      应该升那个 agent,而不是莫名多出一个主控
-#   3. 都没有 → 装主控
+#   4. 都没有 → 装主控
 #
 # 已是最新版就什么都不做。下载后**强制校验 sha256**,取不到校验和宁可拒装。
 #
@@ -25,9 +30,15 @@ set -eu
 
 REPO="why1f/sbx"
 BIN_DIR="${SBX_BIN_DIR:-/usr/local/bin}"
+# 配置目录。改它就得自己改 unit 里的 ExecStart —— sbx-agent.service 写死了
+# /etc/sbx/agent.toml。留这个口子主要是为了能在真机之外测这个脚本。
+CONF_DIR="${SBX_CONF_DIR:-/etc/sbx}"
+UNIT_DIR="${SBX_UNIT_DIR:-/etc/systemd/system}"
 API="https://api.github.com/repos/$REPO/releases/latest"
 DL="https://github.com/$REPO/releases/download"
 RAW="https://raw.githubusercontent.com/$REPO/main/packaging/install.sh"
+
+AGENT_CONF="$CONF_DIR/agent.toml"
 
 WANT_VERSION=""     # 空 = 用 latest
 FORCE=0
@@ -70,6 +81,13 @@ usage() {
 环境变量(自动化场景比传参省事,任何调用形式都能用):
   SBX_TARGET=agent    等价于把 agent 作为参数
   SBX_BIN_DIR=/opt/bin
+
+被控机接入(给了 SBX_TOKEN 就默认装 agent,并写好配置直接起服务):
+  SBX_SERVER=wss://主控:18443/ws   主控 WS 地址
+  SBX_TOKEN=<agent-add 给的 token>
+  SBX_FINGERPRINT=sha256:…         主控证书指纹(TLS 时必填)
+  SBX_INSECURE=1                   主控是明文 ws:// 时用这个替代指纹
+  这几个值不用自己拼:主控上 \`sbx tui\` → 服务管理页 → [a] 新增,会直接给出整条命令。
 EOF
 }
 
@@ -93,6 +111,11 @@ init_targets_from_env() {
         master|agent) add_target "$SBX_TARGET" ;;
         *) die "SBX_TARGET 只能是 master / agent / all,收到:${SBX_TARGET}" ;;
     esac
+    # 给了 token 就只可能是在装被控 —— 主控不需要 token 去连谁。
+    # 有了这条,主控 TUI 吐出来的命令就不必再带一个 SBX_TARGET=agent,
+    # 而那条命令本来就已经够长了。
+    [ -n "${SBX_TOKEN:-}" ] && add_target agent
+    return 0
 }
 
 parse_args() {
@@ -204,6 +227,74 @@ restart_if_running() {
     fi
 }
 
+# 把主控给的接入信息写成 /etc/sbx/agent.toml。没给 SBX_TOKEN 就什么都不做 ——
+# 那是「只升级二进制」的情形,绝不能顺手覆盖人家已经在用的配置。
+#
+# 给了 token 就**覆盖**(旧的先备份):这条命令是主控 TUI 在「新增 agent」或
+# 「轮换 token」之后吐出来的,人跑它的意图正是「用这份新凭据接入」。
+write_agent_config() {
+    [ -n "${SBX_TOKEN:-}" ] || return 0
+    [ -n "${SBX_SERVER:-}" ] || die "给了 SBX_TOKEN 就必须给 SBX_SERVER(形如 wss://主控地址:18443/ws)"
+
+    # wss 却既没有指纹也没说要跳过校验 —— 这种配置 agent 起不来,
+    # 与其装完再让人去看日志,不如现在就说清楚(§1.3 的 TOFU 固定)。
+    case "$SBX_SERVER" in
+        wss://*)
+            if [ -z "${SBX_FINGERPRINT:-}" ] && [ "${SBX_INSECURE:-0}" != "1" ]; then
+                die "wss:// 需要 SBX_FINGERPRINT=sha256:…(主控上跑 \`sbx fingerprint\` 可以打印),
+       或者显式 SBX_INSECURE=1 跳过校验(只建议在内网调试时用)"
+            fi
+            ;;
+    esac
+
+    [ -d "$CONF_DIR" ] || install -d -m750 "$CONF_DIR"
+    if [ -f "$AGENT_CONF" ]; then
+        cp -p "$AGENT_CONF" "$AGENT_CONF.bak"
+        info "原配置已备份为 $AGENT_CONF.bak"
+    fi
+
+    # 先写临时文件再 mv:中途失败不会留下一个半截的配置,
+    # 而半截配置会让 agent 反复起-崩,比根本没配还难查。
+    #
+    # umask 要**存下来再改回去**:这个函数不是脚本的最后一步,
+    # 让 077 漏到后面会顺手改掉别的文件的权限。
+    _conf_tmp="$AGENT_CONF.new.$$"
+    trap 'rm -f "$_conf_tmp"' EXIT INT TERM
+    _old_umask=$(umask)
+    umask 077
+    printf 'server      = "%s"\n' "$SBX_SERVER"  > "$_conf_tmp"
+    printf 'token       = "%s"\n' "$SBX_TOKEN"  >> "$_conf_tmp"
+    if [ -n "${SBX_FINGERPRINT:-}" ]; then
+        printf 'fingerprint = "%s"\n' "$SBX_FINGERPRINT" >> "$_conf_tmp"
+    fi
+    if [ "${SBX_INSECURE:-0}" = "1" ]; then
+        printf 'insecure    = true\n' >> "$_conf_tmp"
+    fi
+    printf 'state_dir   = "%s"\n' "${SBX_STATE_DIR:-/var/lib/sbx-agent}" >> "$_conf_tmp"
+    umask "$_old_umask"
+
+    # 0600:里面是明文 token(§8.1)。
+    chmod 600 "$_conf_tmp"
+    mv -f "$_conf_tmp" "$AGENT_CONF"
+    trap - EXIT INT TERM
+    info "已写入 $AGENT_CONF(0600)"
+}
+
+# 从 release 取一个附属文件(unit、示例配置)。失败**要说出来**:
+# 早先这里是一条 `curl … && systemctl …` 的 && 链,curl 失败时 set -e
+# 会让整个脚本一声不响地退出,人看到的是「装了一半」。
+fetch_asset() {
+    _url="$1"; _dest="$2"; _what="$3"
+    _asset_tmp="$_dest.new.$$"
+    if curl -fsSL --retry 3 -o "$_asset_tmp" "$_url" && [ -s "$_asset_tmp" ]; then
+        mv -f "$_asset_tmp" "$_dest"
+        return 0
+    fi
+    rm -f "$_asset_tmp"
+    info "取不到 $_what($_url),跳过"
+    return 1
+}
+
 install_master() {
     _new="$1"
     should_install "$(installed_version sbx)" "$_new" "sbx" || return 0
@@ -226,11 +317,12 @@ install_master() {
 
     # 示例配置与 unit 只在**不存在时**放过去,绝不覆盖已有的 ——
     # 覆盖 /etc/sbx/config.toml 等于把人家的部署配置冲掉。
-    [ -d /etc/sbx ] || install -d -m750 /etc/sbx
-    [ -f /etc/sbx/config.example.toml ] && :
-    install -m640 "$_src/config.example.toml" /etc/sbx/config.example.toml
-    if [ ! -f /etc/systemd/system/sbx.service ]; then
-        install -m644 "$_src/sbx.service" /etc/systemd/system/sbx.service
+    # (config.example.toml 是例外:它按定义就是「最新版本长什么样」的样本,
+    #  真正的配置是同目录的 config.toml,那个我们碰都不碰。)
+    [ -d "$CONF_DIR" ] || install -d -m750 "$CONF_DIR"
+    install -m640 "$_src/config.example.toml" "$CONF_DIR/config.example.toml"
+    if [ ! -f "$UNIT_DIR/sbx.service" ]; then
+        install -m644 "$_src/sbx.service" "$UNIT_DIR/sbx.service"
         command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
         info "已放置 sbx.service(未启用;systemctl enable --now sbx 启动)"
     fi
@@ -240,21 +332,60 @@ install_master() {
 
 install_agent() {
     _new="$1"
-    should_install "$(installed_version sbx-agent)" "$_new" "sbx-agent" || return 0
-
-    _f="sbx-agent-v$_new-linux-$GO_ARCH"
-    fetch_verify_install "$DL/v$_new/$_f" "$DL/v$_new/$_f.sha256" "$BIN_DIR/sbx-agent"
-
-    [ -d /etc/sbx ] || install -d -m750 /etc/sbx
-    if [ ! -f /etc/systemd/system/sbx-agent.service ]; then
-        curl -fsSL -o /etc/systemd/system/sbx-agent.service "$DL/v$_new/sbx-agent.service" \
-            && command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload
-        info "已放置 sbx-agent.service(未启用;需要先写 /etc/sbx/agent.toml)"
+    # 注意这里**不能**在版本相同时提前 return:带着 SBX_TOKEN 重跑
+    # (轮换 token 之后)是正当用法,那时二进制本来就该是最新的,
+    # 要做的事情全在下面写配置那一段。
+    if should_install "$(installed_version sbx-agent)" "$_new" "sbx-agent"; then
+        _f="sbx-agent-v$_new-linux-$GO_ARCH"
+        fetch_verify_install "$DL/v$_new/$_f" "$DL/v$_new/$_f.sha256" "$BIN_DIR/sbx-agent"
     fi
-    if [ ! -f /etc/sbx/agent.example.toml ]; then
-        curl -fsSL -o /etc/sbx/agent.example.toml "$DL/v$_new/agent.example.toml" || true
+
+    [ -d "$CONF_DIR" ] || install -d -m750 "$CONF_DIR"
+    if [ ! -f "$UNIT_DIR/sbx-agent.service" ]; then
+        if fetch_asset "$DL/v$_new/sbx-agent.service" "$UNIT_DIR/sbx-agent.service" "sbx-agent.service"; then
+            command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+            info "已放置 sbx-agent.service"
+        fi
     fi
-    restart_if_running sbx-agent
+    if [ ! -f "$CONF_DIR/agent.example.toml" ]; then
+        fetch_asset "$DL/v$_new/agent.example.toml" "$CONF_DIR/agent.example.toml" "agent.example.toml" || true
+    fi
+
+    write_agent_config
+    start_agent
+}
+
+# 装完之后要不要把 agent 跑起来。
+#
+# 分两种情况,差别是**意图**:
+#   * 这次带了接入信息(SBX_TOKEN)—— 人明确说了「这台机器要接进集群」,
+#     那就 enable --now,装完即用;
+#   * 没带 —— 只是升级二进制,沿用「本来在跑才重启」的规矩:
+#     替一台没在服务的机器决定「你现在开始提供服务」不是安装脚本该干的事。
+start_agent() {
+    if [ "$NO_RESTART" -ne 0 ]; then
+        info "跳过启动/重启(--no-restart),记得手动 systemctl restart sbx-agent"
+        return 0
+    fi
+    if [ -z "${SBX_TOKEN:-}" ]; then
+        restart_if_running sbx-agent
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || {
+        info "没有 systemd。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
+        return 0
+    }
+    [ -f "$UNIT_DIR/sbx-agent.service" ] || {
+        info "没有 sbx-agent.service,不启动。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
+        return 0
+    }
+    if systemctl enable --now sbx-agent 2>/dev/null; then
+        # 已经在跑的进程读的是旧配置(比如旧 token),必须重启才会用新的。
+        systemctl restart sbx-agent || true
+        info "sbx-agent 已启用并启动。看日志:journalctl -u sbx-agent -f"
+    else
+        info "systemctl enable --now sbx-agent 失败,自己看一眼:systemctl status sbx-agent"
+    fi
 }
 
 main() {
@@ -300,4 +431,7 @@ main() {
     printf '完成。\n'
 }
 
-main "$@"
+# `SBX_SOURCE_ONLY=1` 只定义函数、不动系统 —— `test-install.sh` 靠它逐个测函数。
+# 判断本身仍然是**最后一行**,所以「下载不完整 → 什么都不执行」的性质没变:
+# 截断的脚本读到的依旧只是一堆没被调用的函数定义。
+[ "${SBX_SOURCE_ONLY:-0}" = "1" ] || main "$@"

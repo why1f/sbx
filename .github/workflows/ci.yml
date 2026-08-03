@@ -120,6 +120,21 @@ jobs:
         run: go run .
         timeout-minutes: 5
 
+  install-script:
+    # `packaging/install.sh` 是一条 `curl | bash`,过去唯一的验证方式是在真机上跑一遍
+    # —— v0.1.2 那个「带参数一律报错」的回归正是这样溜出去的。
+    # 这一关把能离线测的部分(参数解析、目标选择、agent.toml 生成、权限)钉住。
+    name: install.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # dash 是 Debian/Ubuntu 的 /bin/sh。脚本声明自己是 POSIX sh,
+      # 只用 bash 测等于没测那条承诺 —— 被控机上可能只有 dash/busybox。
+      - name: dash
+        run: dash packaging/test-install.sh
+      - name: bash
+        run: bash packaging/test-install.sh
+
   e2e-driver:
     # §13.2 / §13.3 的驱动程序。完整的端到端跑法需要起主控 + 两个 agent
     # (见 e2e/README.md,已在真实 ARM 机器上跑通),CI 里只保证它**编得过** ——

@@ -54,6 +54,12 @@ pub struct NodeRow {
     pub protocol: String,
     pub listen_port: i64,
     pub user_count: i64,
+    /// 节点参数原样带回来,给「编辑节点」做预填。
+    ///
+    /// **这里面有凭据**(reality 私钥、自签证书私钥、ss 服务端密钥,见 model/node.rs)。
+    /// 页面上只准渲染 `server_name` / `path` / `ipv6` / `relay` 这几项;
+    /// 编辑时也只改这几项,其余原样写回 —— 换一套密钥等于客户端静默全部失联(§9.1)。
+    pub params: crate::model::node::NodeParams,
 }
 
 #[derive(Debug, Clone)]
@@ -67,11 +73,18 @@ pub struct UserRow {
     pub cycle_down: i64,
     pub traffic_multiplier: f64,
     pub expire_at: Option<i64>,
-    pub node_count: i64,
+    pub reset_day: Option<i64>,
+    /// 已分配的节点 id。分配框要靠它把已选项打上勾 ——
+    /// 只有个数的话,打开分配框会是一片空白,人以为原来什么都没选。
+    pub node_ids: Vec<i64>,
     pub sub_token: String,
 }
 
 impl UserRow {
+    pub fn node_count(&self) -> usize {
+        self.node_ids.len()
+    }
+
     /// 计费口径的已用量:含倍率。与 §6.3 的配额判定一致 ——
     /// 两处口径不同会让「列表显示 80%」和「已经被停用」同时出现。
     pub fn used(&self) -> i64 {
@@ -83,6 +96,17 @@ impl UserRow {
         let q = if self.quota_bytes > 0 { self.quota_bytes } else { return None };
         Some((self.used() as f64 / q as f64).clamp(0.0, 1.0))
     }
+}
+
+/// `agent_events` 的一行。仪表盘用它回答「刚才发生了什么」——
+/// 上线/掉线/计数器重置/配额自动停用都记在这张表里,
+/// 而这些恰恰是「界面上数字不对」时第一个该看的东西。
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    pub at: i64,
+    pub agent_name: Option<String>,
+    pub kind: String,
+    pub message: String,
 }
 
 /// 上一次看到的网卡累计值。做差用。
@@ -195,10 +219,14 @@ pub async fn load_agents(pool: &SqlitePool, speed: &mut SpeedTracker) -> Result<
         .collect())
 }
 
+/// `nodes` + 所属 agent 名 + 用户数 + 原始 `params_json`。
+type NodeQueryRow = (i64, i64, String, String, String, i64, i64, String);
+
 pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
-    let rows: Vec<(i64, i64, String, String, String, i64, i64)> = sqlx::query_as(
+    let rows: Vec<NodeQueryRow> = sqlx::query_as(
         "SELECT n.id, n.agent_id, a.name, n.tag, n.protocol, n.listen_port,
-                (SELECT COUNT(*) FROM user_nodes un WHERE un.node_id = n.id)
+                (SELECT COUNT(*) FROM user_nodes un WHERE un.node_id = n.id),
+                n.params_json
            FROM nodes n JOIN agents a ON a.id = n.agent_id
           ORDER BY n.agent_id, n.id",
     )
@@ -206,35 +234,51 @@ pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, agent_id, agent_name, tag, protocol, listen_port, user_count)| NodeRow {
-            id,
-            agent_id,
-            agent_name,
-            tag,
-            protocol,
-            listen_port,
-            user_count,
-        })
+        .map(
+            |(id, agent_id, agent_name, tag, protocol, listen_port, user_count, params)| NodeRow {
+                id,
+                agent_id,
+                agent_name,
+                tag,
+                protocol,
+                listen_port,
+                user_count,
+                // 解不出来就当空参数:一行坏 JSON 不该让整个节点页读不出来。
+                params: serde_json::from_str(&params).unwrap_or_default(),
+            },
+        )
         .collect())
 }
 
-type UserQueryRow = (i64, String, bool, bool, i64, f64, Option<i64>, String, i64, i64, i64);
+type UserQueryRow = (i64, String, bool, bool, i64, f64, Option<i64>, Option<i64>, String, i64, i64);
 
 pub async fn load_users(pool: &SqlitePool) -> Result<Vec<UserRow>> {
     let rows: Vec<UserQueryRow> = sqlx::query_as(
         "SELECT u.id, u.name, u.enabled, u.auto_disabled, u.quota_bytes,
-                u.traffic_multiplier, u.expire_at, u.sub_token,
-                COALESCE(t.cycle_up, 0), COALESCE(t.cycle_down, 0),
-                (SELECT COUNT(*) FROM user_nodes un WHERE un.user_id = u.id)
+                u.traffic_multiplier, u.expire_at, u.reset_day, u.sub_token,
+                COALESCE(t.cycle_up, 0), COALESCE(t.cycle_down, 0)
            FROM users u
            LEFT JOIN user_traffic_total t ON t.user_id = u.id
           ORDER BY u.id",
     )
     .fetch_all(pool)
     .await?;
+
+    // 分配关系一次查完再分发,而不是每个用户一条子查询:
+    // 用户数上百时那是上百次查询,而 TUI 每秒刷新一次。
+    let pairs: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT user_id, node_id FROM user_nodes ORDER BY node_id")
+            .fetch_all(pool)
+            .await?;
+    let mut by_user: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (uid, nid) in pairs {
+        by_user.entry(uid).or_default().push(nid);
+    }
+
     Ok(rows
         .into_iter()
         .map(|r| UserRow {
+            node_ids: by_user.remove(&r.0).unwrap_or_default(),
             id: r.0,
             name: r.1,
             enabled: r.2,
@@ -242,11 +286,31 @@ pub async fn load_users(pool: &SqlitePool) -> Result<Vec<UserRow>> {
             quota_bytes: r.4,
             traffic_multiplier: r.5,
             expire_at: r.6,
-            sub_token: r.7,
-            cycle_up: r.8,
-            cycle_down: r.9,
-            node_count: r.10,
+            reset_day: r.7,
+            sub_token: r.8,
+            cycle_up: r.9,
+            cycle_down: r.10,
         })
+        .collect())
+}
+
+/// 最近的 `limit` 条事件,新的在前。
+pub async fn load_events(pool: &SqlitePool, limit: i64) -> Result<Vec<EventRow>> {
+    // LEFT JOIN:`agent_id` 可以为 NULL(与某台机器无关的全局事件),
+    // 内连接会把那些整行吃掉,而它们往往正是要看的那几条。
+    let rows: Vec<(i64, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT e.at, a.name, e.kind, e.message
+           FROM agent_events e
+           LEFT JOIN agents a ON a.id = e.agent_id
+          ORDER BY e.at DESC, e.id DESC
+          LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(at, agent_name, kind, message)| EventRow { at, agent_name, kind, message })
         .collect())
 }
 
@@ -355,10 +419,12 @@ mod tests {
             cycle_down: 150,
             traffic_multiplier: 2.0,
             expire_at: None,
-            node_count: 1,
+            reset_day: None,
+            node_ids: vec![3],
             sub_token: "t".into(),
         };
         assert_eq!(u.used(), 500);
         assert_eq!(u.quota_ratio(), Some(0.5));
+        assert_eq!(u.node_count(), 1);
     }
 }

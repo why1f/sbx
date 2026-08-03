@@ -1,6 +1,7 @@
 //! TUI 主循环与应用状态(DESIGN.md §8)。
 //!
-//! 三个页面:服务管理(agents,两行式)、节点、用户。
+//! 四个页面:概览、服务管理(agents,两行式)、节点、用户。
+//! 页签前面的序号就是**能直接按的键**:`1`-`4` 直达,Tab 循环。
 //!
 //! **它是一个独立进程,不是 daemon 的一部分。** `sbx tui` 与 `sbx daemon` 各跑各的,
 //! 之间只通过 SQLite 交换状态。这带来一个直接后果:TUI 看不到 daemon 内存里的
@@ -11,6 +12,7 @@
 //! 状态栏都会说明「什么时候生效」,免得人对着「改了但没变」发懵。
 
 mod data;
+mod forms;
 mod modal;
 mod pages;
 mod theme;
@@ -25,27 +27,46 @@ use std::time::Duration;
 
 use crate::config::Config;
 use data::SpeedTracker;
-use modal::{Action, Field, Modal};
+use modal::{Action, Modal, Outcome};
 
-const PAGES: [&str; 3] = ["服务管理", "节点", "用户"];
+const PAGES: [&str; 4] = ["概览", "服务管理", "节点", "用户"];
 /// 刷新间隔。1 秒足够跟上 30 秒一次的上报,又不会让 SQLite 被空转拖累。
 const TICK: Duration = Duration::from_millis(1000);
+/// 概览页显示多少条事件。取够填满面板即可,查历史该用 `sqlite3`。
+const EVENT_LIMIT: i64 = 20;
+
+/// 一键安装脚本的地址。TUI 生成的接入命令要用它 ——
+/// 与 README / CHANGELOG 里那条是同一个 URL,改了要一起改。
+const INSTALL_URL: &str = "https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Agents = 0,
-    Nodes = 1,
-    Users = 2,
+    Dashboard = 0,
+    Agents = 1,
+    Nodes = 2,
+    Users = 3,
+}
+
+impl Page {
+    fn from_index(i: usize) -> Page {
+        match i {
+            1 => Page::Agents,
+            2 => Page::Nodes,
+            3 => Page::Users,
+            _ => Page::Dashboard,
+        }
+    }
 }
 
 struct App {
     pool: SqlitePool,
     cfg: Config,
     page: Page,
-    sel: [usize; 3],
+    sel: [usize; 4],
     agents: Vec<data::AgentRow>,
     nodes: Vec<data::NodeRow>,
     users: Vec<data::UserRow>,
+    events: Vec<data::EventRow>,
     speed: SpeedTracker,
     modal: Option<Modal>,
     /// 一次性消息(某个操作的结果)。为 `None` 时状态栏显示当前页的快捷键
@@ -60,11 +81,12 @@ impl App {
         Self {
             pool,
             cfg,
-            page: Page::Agents,
-            sel: [0; 3],
+            page: Page::Dashboard,
+            sel: [0; 4],
             agents: Vec::new(),
             nodes: Vec::new(),
             users: Vec::new(),
+            events: Vec::new(),
             speed: SpeedTracker::default(),
             modal: None,
             status: None,
@@ -79,6 +101,8 @@ impl App {
 
     fn len(&self) -> usize {
         match self.page {
+            // 概览页没有可选中的行,上下键在这里就该什么都不做。
+            Page::Dashboard => 0,
             Page::Agents => self.agents.len(),
             Page::Nodes => self.nodes.len(),
             Page::Users => self.users.len(),
@@ -103,8 +127,9 @@ impl App {
         if let Some(msg) = &self.status {
             return msg.clone();
         }
-        let common = "[Tab]切页  [↑↓/jk]选择  [q]退出";
+        let common = "[1-4]切页  [↑↓/jk]选择  [q]退出";
         match self.page {
+            Page::Dashboard => format!("{common}  │  概览是只读的;要动手请去 2/3/4 页"),
             Page::Agents => {
                 let sel = match self.selected_agent() {
                     Some(a) => format!(
@@ -113,24 +138,21 @@ impl App {
                     ),
                     None => "  │  还没有被控服务器,按 [a] 加一台".into(),
                 };
-                format!("{common}  [a]新增  [r]轮换token  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [i]接入命令  [r]轮换token  [d]删除{sel}")
             }
             Page::Nodes => {
                 let sel = match self.selected_node() {
-                    Some(n) => format!(
-                        "  │  #{} {} · agent #{} · {} 个用户",
-                        n.id, n.tag, n.agent_id, n.user_count
-                    ),
+                    Some(n) => format!("  │  #{} {} · {} 个用户在用", n.id, n.tag, n.user_count),
                     None => "  │  还没有节点,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [d]删除{sel}")
             }
             Page::Users => {
                 let sel = match self.selected_user() {
-                    Some(u) => format!("  │  #{} {} · {} 个节点", u.id, u.name, u.node_count),
+                    Some(u) => format!("  │  #{} {}", u.id, u.name),
                     None => "  │  还没有用户,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [e]启用  [x]停用  [n]分配节点  [s]订阅  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [n]分配节点  [t]启/停  [s]订阅  [d]删除{sel}")
             }
         }
     }
@@ -139,8 +161,10 @@ impl App {
         self.agents = data::load_agents(&self.pool, &mut self.speed).await?;
         self.nodes = data::load_nodes(&self.pool).await?;
         self.users = data::load_users(&self.pool).await?;
+        self.events = data::load_events(&self.pool, EVENT_LIMIT).await?;
         // 删掉最后一行之后光标会落在表外,下一帧渲染就会读到不存在的下标。
-        for (i, len) in [self.agents.len(), self.nodes.len(), self.users.len()].iter().enumerate() {
+        let lens = [0, self.agents.len(), self.nodes.len(), self.users.len()];
+        for (i, len) in lens.iter().enumerate() {
             if self.sel[i] >= *len {
                 self.sel[i] = len.saturating_sub(1);
             }
@@ -156,6 +180,10 @@ impl App {
     }
     fn selected_user(&self) -> Option<&data::UserRow> {
         self.users.get(self.sel[Page::Users as usize])
+    }
+
+    fn sub_base(&self) -> &str {
+        &self.cfg.subscription.public_base
     }
 }
 
@@ -244,10 +272,20 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .split(f.area());
 
     modal::tabs(f, chunks[0], &PAGES, app.page as usize);
+    let now = chrono::Local::now().timestamp();
     match app.page {
-        Page::Agents => pages::agents(f, chunks[1], &app.agents, app.sel[0]),
-        Page::Nodes => pages::nodes(f, chunks[1], &app.nodes, app.sel[1]),
-        Page::Users => pages::users(f, chunks[1], &app.users, app.sel[2]),
+        Page::Dashboard => pages::dashboard(
+            f,
+            chunks[1],
+            &app.agents,
+            &app.nodes,
+            &app.users,
+            &app.events,
+            now,
+        ),
+        Page::Agents => pages::agents(f, chunks[1], &app.agents, app.sel[1]),
+        Page::Nodes => pages::nodes(f, chunks[1], &app.nodes, app.sel[2]),
+        Page::Users => pages::users(f, chunks[1], &app.users, app.sel[3], app.sub_base(), now),
     }
     modal::status_bar(f, chunks[2], &app.status_line(), app.status_is_error);
 
@@ -259,8 +297,21 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 /// 处理一次按键。返回 `Some(action)` 表示要执行一个写操作。
 fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     // 弹窗打开时吃掉全部按键 —— 否则「输入名字」会顺带触发页面快捷键。
-    if app.modal.is_some() {
-        return modal_key(app, k);
+    if let Some(m) = &mut app.modal {
+        return match m.handle(k) {
+            Outcome::Stay => None,
+            Outcome::Close(msg) => {
+                app.modal = None;
+                if let Some(msg) = msg {
+                    app.note(msg);
+                }
+                None
+            }
+            Outcome::Run(a) => {
+                app.modal = None;
+                Some(a)
+            }
+        };
     }
     // 上一次操作的回执只留到下一次按键为止,之后让位给常驻的快捷键提示。
     app.status = None;
@@ -268,19 +319,19 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
+        // 数字直达。四页里跳来跳去时,Tab 要按三下才到得了最后一页,
+        // 而人心里想的是「去第 4 页」。
+        //
+        // 页签上印的序号是 `i + 1`,所以这里要减 1 —— 按 3 去的是第三个页签(节点),
+        // 不是下标 3 的那一页。
+        KeyCode::Char(c @ '1'..='4') => {
+            app.page = Page::from_index(c as usize - '1' as usize);
+        }
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-            app.page = match app.page {
-                Page::Agents => Page::Nodes,
-                Page::Nodes => Page::Users,
-                Page::Users => Page::Agents,
-            };
+            app.page = Page::from_index((app.page as usize + 1) % PAGES.len());
         }
         KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-            app.page = match app.page {
-                Page::Agents => Page::Users,
-                Page::Nodes => Page::Agents,
-                Page::Users => Page::Nodes,
-            };
+            app.page = Page::from_index((app.page as usize + PAGES.len() - 1) % PAGES.len());
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let len = app.len();
@@ -303,20 +354,24 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
 
 fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     match app.page {
+        Page::Dashboard => {}
+
         Page::Agents => match k.code {
             KeyCode::Char('a') => {
-                app.modal = Some(Modal::input(
-                    "新增被控服务器",
-                    vec![Field::new("名称", "例如 tokyo-1;只是给人看的标识")],
-                    |f| {
-                        let name = f[0].value.trim().to_string();
-                        if name.is_empty() {
-                            return Err("名称不能为空".into());
-                        }
-                        Ok(Action::AddAgent { name })
-                    },
-                ));
+                let host = default_host(&app.cfg);
+                app.modal = Some(forms::agent_add(&host));
             }
+            KeyCode::Char('E') => match app.selected_agent() {
+                Some(a) => app.modal = Some(agent_edit(a)),
+                None => app.fail("没有选中任何被控服务器"),
+            },
+            KeyCode::Char('i') => match app.selected_agent() {
+                Some(a) => {
+                    let (id, name) = (a.id, a.name.clone());
+                    return Some(Action::ShowInstall { id, name, host: default_host(&app.cfg) });
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
             KeyCode::Char('r') => {
                 if let Some(a) = app.selected_agent() {
                     let (id, name) = (a.id, a.name.clone());
@@ -325,12 +380,12 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                         vec![
                             format!("将为 {name} 生成新 token,旧的立即失效。"),
                             "已建立的连接不会被立刻踢掉,下次重连时才生效(§8.1)。".into(),
-                            "新 token 只会显示这一次。".into(),
+                            "新 token 只会显示这一次 —— 连同一条可以直接跑的重装命令。".into(),
                         ],
-                        Action::RotateToken { id, name },
+                        Action::RotateToken { id, name, host: default_host(&app.cfg) },
                     ));
                 } else {
-                    app.fail("没有选中任何 agent");
+                    app.fail("没有选中任何被控服务器");
                 }
             }
             KeyCode::Char('d') => {
@@ -345,7 +400,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                         Action::DeleteAgent { id, name },
                     ));
                 } else {
-                    app.fail("没有选中任何 agent");
+                    app.fail("没有选中任何被控服务器");
                 }
             }
             _ => {}
@@ -353,34 +408,18 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
 
         Page::Nodes => match k.code {
             KeyCode::Char('a') => {
-                let agent_id = app.selected_agent().map(|a| a.id).or_else(|| app.agents.first().map(|a| a.id));
-                let Some(agent_id) = agent_id else {
-                    app.fail("先在「服务管理」页加一台 agent");
+                if app.agents.is_empty() {
+                    app.fail("先在「服务管理」页(按 2)加一台被控服务器");
                     return None;
-                };
-                app.modal = Some(Modal::input(
-                    &format!("在 agent #{agent_id} 上新增节点"),
-                    vec![
-                        Field::with("agent_id", &agent_id.to_string(), "在哪台被控服务器上建"),
-                        Field::new("tag", "同一 agent 内唯一;也是流量记账的一半(§7.1)"),
-                        Field::with("端口", "443", "监听端口"),
-                        Field::with("协议", "vless-reality", "八选一,见 sbx node-add --help"),
-                    ],
-                    |f| {
-                        let agent_id: i64 = f[0].value.trim().parse().map_err(|_| "agent_id 不是数字")?;
-                        let tag = f[1].value.trim().to_string();
-                        if tag.is_empty() {
-                            return Err("tag 不能为空".into());
-                        }
-                        Ok(Action::AddNode {
-                            agent_id,
-                            tag,
-                            port: f[2].value.trim().into(),
-                            protocol: f[3].value.trim().into(),
-                        })
-                    },
-                ));
+                }
+                // 默认选中在服务管理页选着的那台 —— 多数时候人刚从那页过来。
+                let preselect = app.sel[Page::Agents as usize].min(app.agents.len() - 1);
+                app.modal = Some(forms::node_add(&app.agents, preselect));
             }
+            KeyCode::Char('E') => match app.selected_node() {
+                Some(n) => app.modal = Some(forms::node_edit(n)),
+                None => app.fail("没有选中任何节点"),
+            },
             KeyCode::Char('d') => {
                 if let Some(n) = app.selected_node() {
                     let (id, tag, users) = (n.id, n.tag.clone(), n.user_count);
@@ -400,61 +439,28 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
         },
 
         Page::Users => match k.code {
-            KeyCode::Char('a') => {
-                app.modal = Some(Modal::input(
-                    "新增用户",
-                    vec![
-                        Field::new("名称", "唯一;也是 sing-box inbound 里的用户名"),
-                        Field::with("配额 GB", "0", "0 = 不限流量"),
-                    ],
-                    |f| {
-                        let name = f[0].value.trim().to_string();
-                        if name.is_empty() {
-                            return Err("名称不能为空".into());
-                        }
-                        Ok(Action::AddUser { name, quota_gb: f[1].value.trim().into() })
-                    },
-                ));
-            }
-            KeyCode::Char('e') => {
-                if let Some(u) = app.selected_user() {
-                    return Some(Action::SetUserEnabled { name: u.name.clone(), enabled: true });
+            KeyCode::Char('a') => app.modal = Some(forms::user_add()),
+            KeyCode::Char('E') => match app.selected_user() {
+                Some(u) => app.modal = Some(forms::user_edit(u)),
+                None => app.fail("没有选中任何用户"),
+            },
+            // 一个键切换启停,而不是启用/停用各一个键:人看着那一行的状态按,
+            // 「当前是启用 → 按一下变停用」是唯一说得通的直觉。
+            KeyCode::Char('t') => match app.selected_user() {
+                Some(u) => {
+                    return Some(Action::SetUserEnabled { name: u.name.clone(), enabled: !u.enabled })
                 }
-                app.fail("没有选中任何用户");
-            }
-            KeyCode::Char('x') => {
-                if let Some(u) = app.selected_user() {
-                    return Some(Action::SetUserEnabled { name: u.name.clone(), enabled: false });
-                }
-                app.fail("没有选中任何用户");
-            }
-            KeyCode::Char('n') => {
-                let node_id = app.selected_node().map(|n| n.id).or_else(|| app.nodes.first().map(|n| n.id));
-                let Some(node_id) = node_id else {
-                    app.fail("还没有节点可分配");
-                    return None;
-                };
-                let Some(u) = app.selected_user() else {
-                    app.fail("没有选中任何用户");
-                    return None;
-                };
-                let user = u.name.clone();
-                app.modal = Some(Modal::input(
-                    &format!("把节点分配给 {user}"),
-                    vec![Field::with("node_id", &node_id.to_string(), "在「节点」页可以看到编号")],
-                    |f| {
-                        let node_id: i64 = f[0].value.trim().parse().map_err(|_| "node_id 不是数字")?;
-                        // 用户名塞在 label 里传不过来,所以这里先占位,
-                        // 由调用方在 modal_key 里补上(见那里的注释)。
-                        Ok(Action::AssignNode { user: String::new(), node_id })
-                    },
-                ));
-            }
+                None => app.fail("没有选中任何用户"),
+            },
+            KeyCode::Char('n') => match app.selected_user() {
+                Some(u) => app.modal = Some(forms::assign_nodes(u, &app.nodes)),
+                None => app.fail("没有选中任何用户"),
+            },
             KeyCode::Char('s') => {
                 if let Some(u) = app.selected_user() {
                     let base = app.cfg.subscription.public_base.trim_end_matches('/').to_string();
                     let url = if base.is_empty() {
-                        format!("/sub/{}(未配置 public_base,只能给出路径)", u.sub_token)
+                        format!("/sub/{}(配置里没填 subscription.public_base,只能给出路径)", u.sub_token)
                     } else {
                         format!("{base}/sub/{}", u.sub_token)
                     };
@@ -463,8 +469,8 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                         vec![
                             url,
                             String::new(),
-                            "Clash / Mihomo:地址后加 ?type=clash".into(),
-                            "(客户端 UA 也会被自动识别)".into(),
+                            "浏览器打开 → 流量统计页;客户端 UA 会被自动识别。".into(),
+                            "强制格式:地址后加 ?type=clash / ?type=stats。".into(),
                         ],
                     ));
                 } else {
@@ -492,75 +498,47 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     None
 }
 
-/// 弹窗打开时的按键。
-fn modal_key(app: &mut App, k: KeyEvent) -> Option<Action> {
-    let selected_user = app.selected_user().map(|u| u.name.clone());
-    let modal = app.modal.as_mut()?;
+/// 编辑被控服务器。放在这里而不是 `forms.rs`,因为它要读 `AgentRow` ——
+/// 那是 TUI 自己的视图模型,`forms` 里其余表单也都从视图模型取预填值。
+fn agent_edit(a: &data::AgentRow) -> Modal {
+    use modal::{val, Field, Form};
+    let id = a.id;
+    let quota = match a.nic_quota_bytes {
+        Some(q) if q > 0 => format!("{:.0}", q as f64 / 1_073_741_824.0),
+        _ => "0".into(),
+    };
+    let reset = a.nic_reset_day.map(|d| d.to_string()).unwrap_or_default();
 
-    match modal {
-        Modal::Info { .. } => {
-            app.modal = None;
-            None
-        }
-
-        Modal::Confirm { action, .. } => match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let a = action.clone();
-                app.modal = None;
-                Some(a)
-            }
-            _ => {
-                app.modal = None;
-                app.note("已取消");
-                None
-            }
-        },
-
-        Modal::Input { fields, focus, build, error, .. } => match k.code {
-            KeyCode::Esc => {
-                app.modal = None;
-                app.note("已取消");
-                None
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                *focus = (*focus + 1) % fields.len();
-                None
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                *focus = if *focus == 0 { fields.len() - 1 } else { *focus - 1 };
-                None
-            }
-            KeyCode::Backspace => {
-                fields[*focus].value.pop();
-                None
-            }
-            KeyCode::Char(c) => {
-                fields[*focus].value.push(c);
-                None
-            }
-            KeyCode::Enter => match build(fields) {
-                Ok(mut action) => {
-                    // AssignNode 的用户名来自当前选中行,表单里没有这个字段。
-                    if let Action::AssignNode { user, .. } = &mut action {
-                        match selected_user {
-                            Some(n) => *user = n,
-                            None => {
-                                *error = Some("没有选中任何用户".into());
-                                return None;
-                            }
-                        }
-                    }
-                    app.modal = None;
-                    Some(action)
+    Modal::Form(
+        Form::new(
+            "编辑被控服务器",
+            vec![
+                Field::text("name", "名称", &a.name, "须唯一"),
+                Field::text("quota", "网卡月配额 GB", &quota, "0 = 不限。这是**机器**进出总量,不是用户计费用量"),
+                Field::text("reset", "配额重置日", &reset, "1-31,每月这天把网卡周期用量清零;留空 = 不重置"),
+            ],
+            Box::new(move |f| {
+                let name = val(f, "name");
+                if name.is_empty() {
+                    return Err("名称不能为空".into());
                 }
-                Err(msg) => {
-                    *error = Some(msg);
-                    None
+                let gb: f64 = val(f, "quota").parse().map_err(|_| "配额要是一个数字(0 = 不限)")?;
+                if gb < 0.0 {
+                    return Err("配额不能是负数".into());
                 }
-            },
-            _ => None,
-        },
-    }
+                Ok(Action::EditAgent {
+                    id,
+                    name,
+                    quota_bytes: if gb > 0.0 { Some((gb * 1_073_741_824.0) as i64) } else { None },
+                    reset_day: forms::parse_reset_day(&val(f, "reset"))?,
+                })
+            }),
+        )
+        .head(format!("#{} {}(IP 由 agent 自探上报,在这里改会被下一次上报覆盖)", a.id, a.name))
+        .with_note(Box::new(|_| {
+            vec!["网卡配额只影响界面上的进度条与告警,不会限制 agent 转发流量。".into()]
+        })),
+    )
 }
 
 /// 执行一个写操作。**所有错误都落到状态栏,不中断 TUI** ——
@@ -578,44 +556,35 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
     let now = chrono::Local::now().timestamp();
 
     match action {
-        Action::AddAgent { name } => {
+        Action::AddAgent { name, host } => {
             let (id, token) = agent_repo::create(&app.pool, name, now).await?;
-            let fp = if app.cfg.cluster.tls {
-                crate::tls::fingerprint(&app.cfg.cluster.cert_path)
-                    .unwrap_or_else(|_| "<还没生成证书,启动一次 daemon 就有了>".into())
-            } else {
-                "<cluster.tls = false,agent 侧要写 insecure = true>".into()
-            };
-            let scheme = if app.cfg.cluster.tls { "wss" } else { "ws" };
             // token 明文只在这里出现这一次。库里只有 hash 与前 8 位(§8.1)。
             app.modal = Some(Modal::info(
-                &format!("agent #{id} {name} 的接入信息"),
-                vec![
-                    "把下面几行写进被控机的 /etc/sbx/agent.toml:".into(),
-                    String::new(),
-                    format!("server      = \"{scheme}://<主控地址>:{}/ws\"", port_of(&app.cfg.cluster.listen)),
-                    format!("token       = \"{token}\""),
-                    format!("fingerprint = \"{fp}\""),
-                    "state_dir   = \"/var/lib/sbx-agent\"".into(),
-                    String::new(),
-                    "⚠ token 明文只显示这一次,关掉就再也拿不回来了。".into(),
-                    "  丢了就用 [r] 轮换一个新的。".into(),
-                ],
+                &format!("agent #{id} {name} —— 在被控机上跑这一条"),
+                install_body(&app.cfg, host, Some(&token)),
             ));
             Ok(format!("已新增 agent #{id} {name}"))
         }
 
-        Action::RotateToken { id, name } => {
-            let token = agent_repo::rotate_token(&app.pool, *id).await?;
+        Action::EditAgent { id, name, quota_bytes, reset_day } => {
+            agent_repo::update_settings(&app.pool, *id, name, *quota_bytes, *reset_day).await?;
+            Ok(format!("已保存 agent #{id} {name} 的设置(只影响主控侧的记账口径)"))
+        }
+
+        Action::ShowInstall { id, name, host } => {
             app.modal = Some(Modal::info(
-                &format!("{name} 的新 token"),
-                vec![
-                    format!("token = \"{token}\""),
-                    String::new(),
-                    "旧 token 已失效。在线连接不会被立刻踢掉,下次重连时生效。".into(),
-                    "⚠ 同样只显示这一次。".into(),
-                ],
+                &format!("agent #{id} {name} 的接入命令"),
+                install_body(&app.cfg, host, None),
             ));
+            Ok(String::new())
+        }
+
+        Action::RotateToken { id, name, host } => {
+            let token = agent_repo::rotate_token(&app.pool, *id).await?;
+            let mut body = install_body(&app.cfg, host, Some(&token));
+            body.push(String::new());
+            body.push("旧 token 已失效。在线连接不会被立刻踢掉,下次重连时生效。".into());
+            app.modal = Some(Modal::info(&format!("{name} 的新 token"), body));
             Ok(format!("已轮换 {name} 的 token"))
         }
 
@@ -624,25 +593,50 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已删除 agent {name} 及其节点"))
         }
 
-        Action::AddNode { agent_id, tag, port, protocol } => {
-            let port: u16 = port.parse().map_err(|_| anyhow::anyhow!("端口 {port} 不是 1..65535"))?;
-            let proto = crate::model::node::Protocol::parse(protocol);
-            if matches!(proto, crate::model::node::Protocol::Unknown) {
-                anyhow::bail!(
-                    "无法识别的协议 {protocol};可选:{}",
-                    crate::model::node::Protocol::all()
-                        .iter()
-                        .map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" / ")
-                );
-            }
-            let mut params = crate::model::node::NodeParams::default();
+        Action::AddNode(d) => {
+            let mut params = crate::model::node::NodeParams {
+                server_name: d.server_name.clone(),
+                path: d.path.clone(),
+                ipv6: d.ipv6,
+                relay: crate::model::node::RelaySetting {
+                    host: d.relay_host.clone(),
+                    port: d.relay_port,
+                },
+                ..Default::default()
+            };
             // 与 CLI 走同一条路:密钥材料在**建节点时**生成一次(§9.1)。
-            crate::secrets::fill(proto, &mut params)?;
+            crate::secrets::fill(d.protocol, &mut params)?;
             let (id, rev) =
-                node_repo::add_node(&app.pool, *agent_id, tag, proto, port, &params).await?;
-            Ok(format!("已新增节点 #{id} {tag}(agent #{agent_id} 的 config_revision → {rev})"))
+                node_repo::add_node(&app.pool, d.agent_id, &d.tag, d.protocol, d.port, &params).await?;
+            Ok(format!(
+                "已新增节点 #{id} {}(agent #{} 的 config_revision → {rev};在线的会重建 box)",
+                d.tag, d.agent_id
+            ))
+        }
+
+        Action::EditNode { id, draft } => {
+            // **在原 params 上改**,不是造一个新的:reality 密钥对、自签证书、
+            // ss 服务端密钥都在里面,清掉等于客户端静默全部失联(§9.1)。
+            let node = app
+                .nodes
+                .iter()
+                .find(|n| n.id == *id)
+                .ok_or_else(|| anyhow::anyhow!("节点 #{id} 已经不在了(是不是刚被删掉?)"))?;
+            let mut params = node.params.clone();
+            params.server_name = draft.server_name.clone();
+            params.path = draft.path.clone();
+            params.ipv6 = draft.ipv6;
+            params.relay = crate::model::node::RelaySetting {
+                host: draft.relay_host.clone(),
+                port: draft.relay_port,
+            };
+            // 协议要求的字段被清空时补回默认值(比如 reality 的 server_name),
+            // 否则下发时 `build_inbound` 会报「缺少 server_name」。
+            crate::secrets::fill(draft.protocol, &mut params)?;
+
+            let tag = node.tag.clone();
+            let (agent_id, rev) = node_repo::update_node(&app.pool, *id, draft.port, &params).await?;
+            Ok(format!("已保存节点 {tag}(agent #{agent_id} 的 config_revision → {rev})"))
         }
 
         Action::DeleteNode { id, tag } => {
@@ -651,13 +645,23 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         }
 
         Action::AddUser { name, quota_gb } => {
-            let gb: f64 = quota_gb.parse().map_err(|_| anyhow::anyhow!("配额 {quota_gb} 不是数字"))?;
-            if gb < 0.0 {
-                anyhow::bail!("配额不能是负数");
-            }
-            let quota = (gb * 1_073_741_824.0) as i64;
+            let quota = parse_quota(quota_gb)?;
             let id = node_repo::add_user(&app.pool, name, quota, now).await?;
-            Ok(format!("已新增用户 #{id} {name};按 [n] 给它分配节点"))
+            Ok(format!("已新增用户 #{id} {name};按 [n] 给它分配节点,否则订阅是空的"))
+        }
+
+        Action::EditUser { id, name, quota_gb, multiplier, expire, reset_day } => {
+            let quota = parse_quota(quota_gb)?;
+            let mult: f64 = multiplier
+                .parse()
+                .map_err(|_| anyhow::anyhow!("计费倍率 {multiplier} 不是数字"))?;
+            if mult < 0.0 {
+                anyhow::bail!("计费倍率不能是负数");
+            }
+            let expire_at = forms::parse_expire(expire).map_err(|e| anyhow::anyhow!(e))?;
+            let day = forms::parse_reset_day(reset_day).map_err(|e| anyhow::anyhow!(e))?;
+            node_repo::update_user(&app.pool, *id, quota, mult, expire_at, day).await?;
+            Ok(format!("已保存 {name} 的计费设置(不重建 box;下次巡检时生效)"))
         }
 
         Action::SetUserEnabled { name, enabled } => {
@@ -675,13 +679,47 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已删除用户 {name}"))
         }
 
-        Action::AssignNode { user, node_id } => {
-            let u = node_repo::get_user_by_name(&app.pool, user)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("没有名为 {user} 的用户"))?;
-            let (agent_id, rev) = node_repo::assign_node(&app.pool, u.id, *node_id).await?;
-            Ok(format!("已把节点 #{node_id} 分配给 {user}(agent #{agent_id} → rev {rev})"))
+        Action::SetUserNodes { user_id, user, node_ids } => {
+            let affected = node_repo::set_user_nodes(&app.pool, *user_id, node_ids).await?;
+            if affected.is_empty() {
+                return Ok(format!("{user} 的节点分配没有变化"));
+            }
+            let detail = affected
+                .iter()
+                .map(|(a, r)| format!("#{a}→rev {r}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(format!("{user} 现在有 {} 个节点({detail})", node_ids.len()))
         }
+    }
+}
+
+fn parse_quota(gb: &str) -> Result<i64> {
+    let v: f64 = gb.parse().map_err(|_| anyhow::anyhow!("配额 {gb} 不是数字"))?;
+    if v < 0.0 {
+        anyhow::bail!("配额不能是负数");
+    }
+    Ok((v * 1_073_741_824.0) as i64)
+}
+
+// ─────────────────────────── 一键接入命令 ───────────────────────────
+
+/// 被控机回连主控用的默认地址。
+///
+/// 主控只知道自己 `listen` 在 `0.0.0.0:18443`,不知道对外该用哪个地址,
+/// 所以拿订阅的 `public_base` 的主机名当**猜测**填进表单 —— 多数部署里
+/// 订阅和 WS 就在同一台机器上。猜错了人可以直接改,总比让人从零开始打强。
+fn default_host(cfg: &Config) -> String {
+    let base = cfg.subscription.public_base.trim();
+    if base.is_empty() {
+        return String::new();
+    }
+    let rest = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    // `[::1]:8080` → `[::1]`;`example.com:8080` → `example.com`。
+    match hostport.strip_prefix('[') {
+        Some(r) => r.split_once(']').map(|(h, _)| format!("[{h}]")).unwrap_or_else(|| hostport.into()),
+        None => hostport.split(':').next().unwrap_or(hostport).to_string(),
     }
 }
 
@@ -689,6 +727,56 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
 /// 提示,解析失败不该让「新增 agent」整个失败。
 fn port_of(listen: &str) -> String {
     listen.rsplit_once(':').map(|(_, p)| p.to_string()).unwrap_or_else(|| "18443".into())
+}
+
+/// IPv6 字面量在 URL 里必须带方括号,否则那些冒号会被当成端口分隔符。
+fn url_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+/// 拼出被控机上的一条命令。`token` 为 `None` 时给占位符 ——
+/// 明文早就没了(§8.1),这种情况只能提示去轮换一个新的。
+fn install_command(cfg: &Config, host: &str, token: Option<&str>) -> String {
+    let scheme = if cfg.cluster.tls { "wss" } else { "ws" };
+    let host = if host.trim().is_empty() { "<主控地址>" } else { host.trim() };
+    let server = format!("{scheme}://{}:{}/ws", url_host(host), port_of(&cfg.cluster.listen));
+    let token = token.unwrap_or("<token 已经看不到了,按 [r] 轮换一个新的>");
+
+    let auth = if cfg.cluster.tls {
+        // 指纹取不到(还没生成证书)时也要把命令给全,只是那一格是占位符 ——
+        // 少给一段的话人会以为命令就该长这样,连上之后才发现 TOFU 没生效。
+        let fp = crate::tls::fingerprint(&cfg.cluster.cert_path)
+            .unwrap_or_else(|_| "<先跑一次 sbx daemon 生成证书,再按 i 取这条命令>".into());
+        format!("SBX_FINGERPRINT='{fp}' ")
+    } else {
+        // cluster.tls = false:没有证书可钉,agent 侧必须显式 insecure。
+        "SBX_INSECURE=1 ".into()
+    };
+
+    format!("curl -fsSL {INSTALL_URL} | SBX_SERVER='{server}' SBX_TOKEN='{token}' {auth}bash")
+}
+
+fn install_body(cfg: &Config, host: &str, token: Option<&str>) -> Vec<String> {
+    let mut body = vec![
+        install_command(cfg, host, token),
+        String::new(),
+        "整条复制到被控机上跑(root)。脚本会装好 sbx-agent、写 /etc/sbx/agent.toml(0600)、".into(),
+        "并 enable --now sbx-agent。以后重跑同一条命令就是升级。".into(),
+    ];
+    if host.trim().is_empty() {
+        body.push(String::new());
+        body.push("⚠ 主控地址是空的,命令里留了 <主控地址> 占位符 —— 换成被控机能连到的 IP 或域名。".into());
+    }
+    if token.is_some() {
+        body.push(String::new());
+        body.push("⚠ token 明文只显示这一次,关掉就再也拿不回来了(库里只有 hash)。".into());
+        body.push("  这条命令带着 token,别贴进聊天记录或工单里。丢了就按 [r] 轮换一个新的。".into());
+    }
+    body
 }
 
 #[cfg(test)]
@@ -702,6 +790,93 @@ mod tests {
         assert_eq!(port_of("nonsense"), "18443");
     }
 
+    /// 从订阅地址里猜主控主机名。猜错了人可以改,但不能猜出一个带端口或带路径的东西 ——
+    /// 那会拼出 `wss://example.com:8080:18443/ws` 这种一眼看不出错在哪的地址。
+    #[test]
+    fn default_host_extracts_just_the_hostname() {
+        let mut cfg = Config::default();
+        for (base, want) in [
+            ("https://sub.example.com", "sub.example.com"),
+            ("https://sub.example.com/", "sub.example.com"),
+            ("https://sub.example.com:8443/x", "sub.example.com"),
+            ("http://203.0.113.8:8080", "203.0.113.8"),
+            ("https://[2001:db8::1]:8443", "[2001:db8::1]"),
+            ("", ""),
+        ] {
+            cfg.subscription.public_base = base.into();
+            assert_eq!(default_host(&cfg), want, "public_base = {base}");
+        }
+    }
+
+    /// IPv6 主控地址必须带方括号,否则 `wss://2001:db8::1:18443/ws` 里
+    /// 哪个冒号是端口分隔符谁也说不清 —— agent 侧会解析失败。
+    #[test]
+    fn ipv6_master_address_is_bracketed() {
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        cfg.cluster.listen = "[::]:18443".into();
+        let cmd = install_command(&cfg, "2001:db8::1", Some("tok"));
+        assert!(cmd.contains("ws://[2001:db8::1]:18443/ws"), "{cmd}");
+        // 已经带方括号的不要再套一层。
+        let cmd = install_command(&cfg, "[2001:db8::1]", Some("tok"));
+        assert!(cmd.contains("ws://[2001:db8::1]:18443/ws"), "{cmd}");
+    }
+
+    /// 明文模式下没有证书可钉,命令里必须显式给 `SBX_INSECURE=1` ——
+    /// 少了它 agent 会因为「配了 ws:// 却没说明为什么不校验」而拒绝启动。
+    #[test]
+    fn plaintext_mode_tells_the_agent_to_skip_verification() {
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        let cmd = install_command(&cfg, "203.0.113.8", Some("tok"));
+        assert!(cmd.contains("SBX_INSECURE=1"), "{cmd}");
+        assert!(cmd.contains("ws://203.0.113.8"), "{cmd}");
+        assert!(!cmd.contains("wss://"), "明文模式不该给 wss: {cmd}");
+        assert!(!cmd.contains("SBX_FINGERPRINT"), "没有证书就不该有指纹: {cmd}");
+    }
+
+    /// 主控地址没填时留占位符,并且**明确说出来** ——
+    /// 直接给一条拼错的命令,人会照抄然后对着连不上发懵。
+    #[test]
+    fn missing_host_is_called_out_not_silently_wrong() {
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        let body = install_body(&cfg, "", Some("tok")).join("\n");
+        assert!(body.contains("<主控地址>"), "{body}");
+        assert!(body.contains("主控地址是空的"), "{body}");
+    }
+
+    /// 重新查看接入命令时 token 是取不到的(库里只有 hash),
+    /// 必须给一句「怎么才能拿到」而不是一个看起来能用的空值。
+    #[test]
+    fn reshown_command_admits_the_token_is_gone() {
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        let cmd = install_command(&cfg, "203.0.113.8", None);
+        assert!(cmd.contains("轮换"), "{cmd}");
+        let body = install_body(&cfg, "203.0.113.8", None).join("\n");
+        assert!(!body.contains("只显示这一次"), "没有 token 时不该说这句: {body}");
+    }
+
+    /// 接入命令必须是**一整行**。分行的命令从终端里复制会带上换行,
+    /// 粘到另一个 shell 里就变成好几条互相看不见对方的命令 ——
+    /// 而这条命令的全部价值就是「整条复制过去跑」。
+    #[test]
+    fn install_command_is_a_single_copyable_line() {
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        let cmd = install_command(&cfg, "203.0.113.8", Some("tok"));
+        assert!(!cmd.contains('\n'), "{cmd}");
+        assert!(cmd.starts_with("curl -fsSL "), "{cmd}");
+        // 环境变量赋值必须落在 `| ` 之后、`bash` 之前 —— `curl … | VAR=x bash`
+        // 是一条合法的 POSIX 简单命令,而 `VAR=x curl … | bash` 会把变量给了 curl。
+        let (_, after_pipe) = cmd.split_once("| ").expect("要有管道");
+        assert!(after_pipe.starts_with("SBX_SERVER="), "{cmd}");
+        assert!(after_pipe.ends_with(" bash"), "{cmd}");
+        // 值都用单引号包起来:token 是随机串,理论上可以出现 shell 元字符。
+        assert!(cmd.contains("SBX_TOKEN='tok'"), "{cmd}");
+    }
+
     fn app() -> App {
         // 只用来测按键与选择逻辑,不碰数据库。
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
@@ -713,34 +888,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_cycles_through_all_three_pages() {
+    async fn tab_cycles_through_all_four_pages() {
         let mut a = app();
+        assert!(a.page == Page::Dashboard);
+        for want in [Page::Agents, Page::Nodes, Page::Users, Page::Dashboard] {
+            on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            assert!(a.page == want, "Tab 顺序不对");
+        }
+    }
+
+    /// 数字键直达。Tab 要按三下才到得了最后一页,而人心里想的是「去第 4 页」。
+    #[tokio::test]
+    async fn number_keys_jump_straight_to_a_page() {
+        let mut a = app();
+        for (c, want) in
+            [('3', Page::Nodes), ('1', Page::Dashboard), ('4', Page::Users), ('2', Page::Agents)]
+        {
+            on_key(&mut a, key(c));
+            assert!(a.page == want, "按 {c} 应当到对应的页");
+        }
+        // 5 不是页码,不该有任何反应(也不该被当成别的快捷键)。
+        on_key(&mut a, key('5'));
         assert!(a.page == Page::Agents);
-        on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(a.page == Page::Nodes);
-        on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(a.page == Page::Users);
-        on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(a.page == Page::Agents, "应当回到第一页");
     }
 
     /// 空列表时按上下键不能 panic,也不能把光标挪到不存在的行。
     #[tokio::test]
     async fn navigation_on_an_empty_list_is_safe() {
         let mut a = app();
+        a.page = Page::Agents;
         on_key(&mut a, key('j'));
         on_key(&mut a, key('k'));
-        assert_eq!(a.sel[0], 0);
+        assert_eq!(a.sel[Page::Agents as usize], 0);
+    }
+
+    /// 概览页没有可选中的行 —— 上下键在那里必须是空操作。
+    #[tokio::test]
+    async fn dashboard_has_nothing_to_select() {
+        let mut a = app();
+        a.agents = (0..3).map(stub_agent).collect();
+        on_key(&mut a, key('j'));
+        assert_eq!(a.sel[Page::Dashboard as usize], 0);
+        assert_eq!(a.sel[Page::Agents as usize], 0, "不该动到别的页的选择");
     }
 
     #[tokio::test]
     async fn navigation_wraps_around() {
         let mut a = app();
+        a.page = Page::Agents;
         a.agents = (0..3).map(stub_agent).collect();
         on_key(&mut a, key('k'));
-        assert_eq!(a.sel[0], 2, "从第一行往上应当绕到最后一行");
+        assert_eq!(a.sel[Page::Agents as usize], 2, "从第一行往上应当绕到最后一行");
         on_key(&mut a, key('j'));
-        assert_eq!(a.sel[0], 0);
+        assert_eq!(a.sel[Page::Agents as usize], 0);
     }
 
     /// 弹窗打开时,页面快捷键必须被吃掉 ——
@@ -748,36 +948,26 @@ mod tests {
     #[tokio::test]
     async fn modal_swallows_page_shortcuts() {
         let mut a = app();
-        a.modal = Some(Modal::input("t", vec![Field::new("名称", "")], |_| {
-            Err("never".into())
-        }));
+        a.modal = Some(forms::user_add());
         on_key(&mut a, key('q'));
         assert!(!a.quit, "'q' 应当被当成输入,不是退出");
-        let Some(Modal::Input { fields, .. }) = &a.modal else { panic!() };
-        assert_eq!(fields[0].value, "q");
+        let Some(Modal::Form(f)) = &a.modal else { panic!() };
+        assert_eq!(f.fields[0].value(), "q");
     }
 
+    /// 数字键在弹窗里同样必须是**输入**,不是切页。
+    /// 端口 8443 里的每一个数字都会撞上页签快捷键。
     #[tokio::test]
-    async fn input_validation_keeps_the_modal_open() {
+    async fn digits_type_into_a_modal_instead_of_switching_pages() {
         let mut a = app();
-        a.modal = Some(Modal::input("t", vec![Field::new("名称", "")], |f| {
-            if f[0].value.trim().is_empty() {
-                Err("名称不能为空".into())
-            } else {
-                Ok(Action::AddAgent { name: f[0].value.clone() })
-            }
-        }));
-        // 空名字提交:弹窗留着,错误显示出来。
-        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(act.is_none());
-        let Some(Modal::Input { error, .. }) = &a.modal else { panic!("弹窗不该关掉") };
-        assert_eq!(error.as_deref(), Some("名称不能为空"));
-
-        // 填上之后再提交就通过了。
-        on_key(&mut a, key('x'));
-        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(act, Some(Action::AddAgent { .. })));
-        assert!(a.modal.is_none());
+        a.page = Page::Nodes;
+        a.modal = Some(forms::user_add());
+        for c in ['1', '2', '3', '4'] {
+            on_key(&mut a, key(c));
+        }
+        assert!(a.page == Page::Nodes, "弹窗开着时不该切页");
+        let Some(Modal::Form(f)) = &a.modal else { panic!() };
+        assert_eq!(f.fields[0].value(), "1234");
     }
 
     /// 确认框只认 y。其它键一律当取消 —— 删除类操作不该有「手滑确认」的可能。
@@ -796,19 +986,52 @@ mod tests {
         }
     }
 
+    /// 启停是**一个键切换**:按之前是启用,按完就该是停用。
     #[tokio::test]
-    async fn backspace_edits_the_focused_field_only() {
+    async fn t_toggles_the_selected_user() {
         let mut a = app();
-        a.modal = Some(Modal::input(
-            "t",
-            vec![Field::with("a", "aa", ""), Field::with("b", "bb", "")],
-            |_| Err("x".into()),
-        ));
-        on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        on_key(&mut a, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        let Some(Modal::Input { fields, .. }) = &a.modal else { panic!() };
-        assert_eq!(fields[0].value, "aa", "没聚焦的字段不该被改");
-        assert_eq!(fields[1].value, "b");
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+        let Some(Action::SetUserEnabled { enabled, .. }) = on_key(&mut a, key('t')) else {
+            panic!("应当产生一个启停动作")
+        };
+        assert!(!enabled, "当前是启用,按 t 应当停用");
+
+        a.users = vec![stub_user(false)];
+        let Some(Action::SetUserEnabled { enabled, .. }) = on_key(&mut a, key('t')) else {
+            panic!()
+        };
+        assert!(enabled);
+    }
+
+    /// 分配框打开时,已分配的节点必须是**勾上的**。
+    /// 一片空白会让人以为原来什么都没选,一保存就把现有分配全清了。
+    #[tokio::test]
+    async fn the_node_picker_starts_from_the_current_assignment() {
+        let mut a = app();
+        a.page = Page::Users;
+        a.nodes = vec![stub_node(7, "n7"), stub_node(8, "n8"), stub_node(9, "n9")];
+        let mut u = stub_user(true);
+        u.node_ids = vec![7, 9];
+        a.users = vec![u];
+
+        on_key(&mut a, key('n'));
+        let Some(Modal::Picker(p)) = &a.modal else { panic!("应当开一个多选框") };
+        let checked: Vec<i64> = p.items.iter().filter(|i| i.checked).map(|i| i.id).collect();
+        assert_eq!(checked, vec![7, 9]);
+        // 同名 tag 可以出现在不同机器上,备注必须能把它们分开。
+        assert!(p.items[0].note.contains("tokyo-1"), "{}", p.items[0].note);
+    }
+
+    /// 没有 agent 时不能开节点表单 —— 那个表单的第一个字段就没有可选项。
+    #[tokio::test]
+    async fn adding_a_node_without_any_agent_explains_itself() {
+        let mut a = app();
+        a.page = Page::Nodes;
+        on_key(&mut a, key('a'));
+        assert!(a.modal.is_none());
+        assert!(a.status_is_error);
+        assert!(a.status.as_deref().unwrap().contains("服务管理"), "{:?}", a.status);
     }
 
     fn stub_agent(id: i64) -> data::AgentRow {
@@ -827,6 +1050,36 @@ mod tests {
             up_per_sec: None,
             down_per_sec: None,
             node_count: 0,
+        }
+    }
+
+    fn stub_node(id: i64, tag: &str) -> data::NodeRow {
+        data::NodeRow {
+            id,
+            agent_id: 1,
+            agent_name: "tokyo-1".into(),
+            tag: tag.into(),
+            protocol: "vless-reality".into(),
+            listen_port: 443,
+            user_count: 0,
+            params: Default::default(),
+        }
+    }
+
+    fn stub_user(enabled: bool) -> data::UserRow {
+        data::UserRow {
+            id: 1,
+            name: "alice".into(),
+            enabled,
+            auto_disabled: false,
+            quota_bytes: 0,
+            cycle_up: 0,
+            cycle_down: 0,
+            traffic_multiplier: 1.0,
+            expire_at: None,
+            reset_day: None,
+            node_ids: vec![],
+            sub_token: "t".into(),
         }
     }
 
@@ -863,6 +1116,9 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        crate::db::agent_repo::log_event(&pool, Some(agent_id), "counter_reset", "计数器重置", 1000)
+            .await
+            .unwrap();
 
         let mut params = NodeParams::default();
         crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
@@ -887,15 +1143,20 @@ mod tests {
         assert_eq!(app.nodes.len(), 1);
         assert_eq!(app.nodes[0].tag, "tokyo-reality");
         assert_eq!(app.nodes[0].user_count, 1);
+        // reality 的 server_name 由 secrets::fill 填的默认值,编辑表单要靠它预填。
+        assert_eq!(app.nodes[0].params.server_name.as_deref(), Some("www.apple.com"));
 
         assert_eq!(app.users.len(), 1);
         assert_eq!(app.users[0].name, "alice");
-        assert_eq!(app.users[0].node_count, 1);
+        assert_eq!(app.users[0].node_ids, vec![node_id]);
 
-        // 三个页面都要能画出来。ratatui 越界写入是直接 panic 的,
+        assert_eq!(app.events.len(), 1, "事件表要读得出来(概览页要用)");
+        assert_eq!(app.events[0].agent_name.as_deref(), Some("tokyo-1"));
+
+        // 四个页面都要能画出来。ratatui 越界写入是直接 panic 的,
         // 所以「画得出来」本身就是一条有效断言。
-        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
-        for page in [Page::Agents, Page::Nodes, Page::Users] {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        for page in [Page::Dashboard, Page::Agents, Page::Nodes, Page::Users] {
             app.page = page;
             term.draw(|f| draw(f, &app)).unwrap();
         }
@@ -903,5 +1164,108 @@ mod tests {
         app.page = Page::Agents;
         assert!(app.status_line().contains("tokyo-1"), "{}", app.status_line());
         assert!(app.status_line().contains("token "), "{}", app.status_line());
+    }
+
+    /// 编辑节点**不能动密钥材料**。这条是 §9.1 最贵的那个错误的回归锚点:
+    /// 换一套 reality 密钥 = 所有客户端静默失联,而界面上什么异常都没有。
+    #[tokio::test]
+    async fn editing_a_node_preserves_its_key_material() {
+        use crate::model::node::{NodeParams, Protocol};
+
+        let path = std::env::temp_dir().join(format!("sbx-tui-edit-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "a", 0).await.unwrap();
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let (node_id, _) = crate::db::node_repo::add_node(
+            &pool,
+            agent_id,
+            "in",
+            Protocol::VlessReality,
+            443,
+            &params,
+        )
+        .await
+        .unwrap();
+
+        let mut app = App::new(pool, Config::default());
+        app.refresh().await.unwrap();
+
+        let msg = perform_inner(
+            &mut app,
+            &Action::EditNode {
+                id: node_id,
+                draft: modal::NodeDraft {
+                    agent_id,
+                    tag: String::new(),
+                    protocol: Protocol::VlessReality,
+                    port: 9443,
+                    server_name: Some("www.microsoft.com".into()),
+                    path: None,
+                    ipv6: true,
+                    relay_host: "198.51.100.9".into(),
+                    relay_port: Some(20443),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("config_revision"), "{msg}");
+
+        app.refresh().await.unwrap();
+        let n = &app.nodes[0];
+        assert_eq!(n.listen_port, 9443);
+        assert_eq!(n.params.server_name.as_deref(), Some("www.microsoft.com"));
+        assert!(n.params.ipv6);
+        assert_eq!(n.params.relay.host, "198.51.100.9");
+        assert_eq!(n.params.relay.port, Some(20443));
+        assert_eq!(n.params.private_key, params.private_key, "reality 私钥被换掉了");
+        assert_eq!(n.params.short_id, params.short_id, "short_id 被换掉了");
+    }
+
+    /// 清空 server_name 之后,下发时必须还能组装出配置 ——
+    /// reality 的 inbound 缺了它会直接报错。表单允许留空,补默认值是这里的责任。
+    #[tokio::test]
+    async fn clearing_a_required_field_falls_back_to_the_default() {
+        use crate::model::node::{NodeParams, Protocol};
+
+        let path = std::env::temp_dir().join(format!("sbx-tui-clear-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "a", 0).await.unwrap();
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let (node_id, _) =
+            crate::db::node_repo::add_node(&pool, agent_id, "in", Protocol::VlessReality, 443, &params)
+                .await
+                .unwrap();
+
+        let mut app = App::new(pool, Config::default());
+        app.refresh().await.unwrap();
+        perform_inner(
+            &mut app,
+            &Action::EditNode {
+                id: node_id,
+                draft: modal::NodeDraft {
+                    agent_id,
+                    tag: String::new(),
+                    protocol: Protocol::VlessReality,
+                    port: 443,
+                    server_name: None,
+                    path: None,
+                    ipv6: false,
+                    relay_host: String::new(),
+                    relay_port: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        app.refresh().await.unwrap();
+        assert_eq!(
+            app.nodes[0].params.server_name.as_deref(),
+            Some("www.apple.com"),
+            "留空之后应当回落到默认值,而不是留一个下发时会报错的 None"
+        );
     }
 }

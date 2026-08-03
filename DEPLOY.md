@@ -15,11 +15,10 @@
 
 ```sh
 # 1. 装
-tar xzf sbx-v0.1.0-<arch>-unknown-linux-musl.tar.gz && cd sbx-v0.1.0-*
-install -m755 sbx /usr/local/bin/sbx
-install -d -m750 /etc/sbx
-install -m640 config.example.toml /etc/sbx/config.toml
-install -m644 sbx.service /etc/systemd/system/
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+#    脚本会放好 /usr/local/bin/sbx、/etc/sbx/config.example.toml 与 sbx.service(不启用)。
+#    它**不会覆盖**已有的 /etc/sbx/config.toml。
+cp -n /etc/sbx/config.example.toml /etc/sbx/config.toml
 
 # 2. 改 /etc/sbx/config.toml —— 至少确认这两个端口没被占
 #    [cluster] listen  = "0.0.0.0:18443"   ← agent 要能连到,必须对外
@@ -43,12 +42,31 @@ ufw allow 18443/tcp comment 'sbx cluster'
 
 ## B 机(agent)
 
+**推荐:让主控把命令生成好。** 在 A 机上 `sbx --config /etc/sbx/config.toml tui`,
+按 `2` 到服务管理页,按 `a` 新增 —— 弹窗里就是一条填好 token 与证书指纹的完整命令,
+整条复制到 B 机上跑(root):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh \
+  | SBX_SERVER='wss://<A机IP>:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+```
+
+它会:装 `sbx-agent`(校验 sha256)→ 放好 unit → 写 `/etc/sbx/agent.toml`(0600)
+→ `enable --now sbx-agent`。给了 `SBX_TOKEN` 就一定是在装被控端,
+不用再带 `SBX_TARGET=agent`。
+
+token 丢了或要换,在 TUI 里按 `r` 轮换,把新命令在 B 机上再跑一遍就行 ——
+旧配置会自动备份成 `agent.toml.bak`。
+
+<details>
+<summary>手工版(想知道它到底做了什么,或者机器连不上 GitHub)</summary>
+
 ```sh
 # 1. 装。注意选对 arch,以及校验 sha256
-curl -fsSLO https://github.com/why1f/sbx/releases/download/v0.1.0/sbx-agent-v0.1.0-linux-arm64
-curl -fsSLO https://github.com/why1f/sbx/releases/download/v0.1.0/sbx-agent-v0.1.0-linux-arm64.sha256
-sha256sum -c sbx-agent-v0.1.0-linux-arm64.sha256
-install -m755 sbx-agent-v0.1.0-linux-arm64 /usr/local/bin/sbx-agent
+curl -fsSLO https://github.com/why1f/sbx/releases/download/v0.2.0/sbx-agent-v0.2.0-linux-arm64
+curl -fsSLO https://github.com/why1f/sbx/releases/download/v0.2.0/sbx-agent-v0.2.0-linux-arm64.sha256
+sha256sum -c sbx-agent-v0.2.0-linux-arm64.sha256
+install -m755 sbx-agent-v0.2.0-linux-arm64 /usr/local/bin/sbx-agent
 install -d -m750 /etc/sbx && install -m644 sbx-agent.service /etc/systemd/system/
 
 # 2. 在 A 机上生成 token
@@ -63,6 +81,11 @@ EOF
 chmod 600 /etc/sbx/agent.toml     # 里面有 token
 
 systemctl daemon-reload && systemctl enable --now sbx-agent
+```
+
+</details>
+
+```sh
 journalctl -u sbx-agent -f
 ```
 

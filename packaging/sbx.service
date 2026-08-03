@@ -1,6 +1,6 @@
 [Unit]
 Description=sbx master (sing-box cluster controller)
-Documentation=https://github.com/yourorg/sbx
+Documentation=https://github.com/why1f/sbx
 After=network-online.target
 Wants=network-online.target
 

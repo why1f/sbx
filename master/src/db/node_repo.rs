@@ -79,6 +79,49 @@ pub async fn add_node(
     Ok((node_id, rev))
 }
 
+/// 改节点的可编辑部分(端口与 `params`),推进 `config_revision`。
+///
+/// **tag / 协议 / 所属 agent 不在可改之列**,这不是偷懒:
+///   * `tag` 是 `(用户, tag)` 记账口径的一半(§7.1)。改掉它,历史流量还挂在旧 tag 上,
+///     新流量记到新 tag 上,`user_traffic` 里就出现两条谁也不认识谁的账。
+///   * 协议一改,`params` 里的密钥材料整套都不对(reality 的密钥对 ≠ ss 的服务端密钥),
+///     等于重建一个节点 —— 那就该走「删掉重建」,而不是伪装成一次编辑。
+///
+/// `params` 由调用方**在原值上改**再传回来。直接构造一个新的 `NodeParams` 会把
+/// reality 密钥对 / 自签证书 / ss 服务端密钥全部清空 —— 下发之后所有客户端静默失联(§9.1)。
+pub async fn update_node(
+    pool: &SqlitePool,
+    node_id: i64,
+    listen_port: u16,
+    params: &NodeParams,
+) -> Result<(i64, i64)> {
+    let mut tx = pool.begin().await?;
+
+    let agent_id: i64 = sqlx::query_scalar("SELECT agent_id FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("没有 id 为 {node_id} 的节点"))?;
+
+    sqlx::query("UPDATE nodes SET listen_port = ?, params_json = ? WHERE id = ?")
+        .bind(listen_port as i64)
+        .bind(serde_json::to_string(params)?)
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let rev: i64 = sqlx::query_scalar(
+        "UPDATE agents SET config_revision = config_revision + 1
+          WHERE id = ? RETURNING config_revision",
+    )
+    .bind(agent_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok((agent_id, rev))
+}
+
 /// 删除节点并推进 `config_revision`。返回该节点所属的 agent 与新 revision。
 pub async fn delete_node(pool: &SqlitePool, node_id: i64) -> Result<(i64, i64)> {
     let mut tx = pool.begin().await?;
@@ -204,6 +247,107 @@ pub async fn unassign_node(pool: &SqlitePool, user_id: i64, node_id: i64) -> Res
 
     tx.commit().await?;
     Ok((agent_id, rev))
+}
+
+/// 改用户的计费属性:配额、倍率、到期、重置日。
+///
+/// **不推进任何 revision**,这一条要记牢:这四项都不进 sing-box 的配置 ——
+/// inbound 里只有 uuid / password / 名字。它们只被 §6.3 的巡检读,
+/// 而巡检本来就是每 30 秒跑一次的。为它们推进 `config_revision` 等于
+/// 「改一次配额 = 全网重建一次 box」,把最贵的动作挂在最随手的操作上。
+///
+/// 一个有用的连带效果:把配额从 100G 调到 200G,原先因超额被**系统**停用的用户
+/// (`auto_disabled = 1`)会在下一次巡检时自动放出来 —— 不需要在这里手动改 `enabled`。
+/// 管理员手动停用的(`auto_disabled = 0`)不会被这条路径影响,那是刻意的(supervisor.rs §6.3)。
+pub async fn update_user(
+    pool: &SqlitePool,
+    user_id: i64,
+    quota_bytes: i64,
+    traffic_multiplier: f64,
+    expire_at: Option<i64>,
+    reset_day: Option<i64>,
+) -> Result<()> {
+    let n = sqlx::query(
+        "UPDATE users SET quota_bytes = ?, traffic_multiplier = ?, expire_at = ?, reset_day = ?
+          WHERE id = ?",
+    )
+    .bind(quota_bytes)
+    .bind(traffic_multiplier)
+    .bind(expire_at)
+    .bind(reset_day)
+    .bind(user_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        anyhow::bail!("没有 id 为 {user_id} 的用户");
+    }
+    Ok(())
+}
+
+/// 把某个用户的节点分配**整体替换**成 `node_ids`,返回受影响的 `(agent_id, 新 revision)`。
+///
+/// 为什么不是「循环调 assign / unassign」:那样每动一个节点就是一次独立事务,
+/// 中途失败会留下一半分配;而且同一台 agent 上勾了三个节点就会把它的
+/// `config_revision` 推进三次,日志里看起来像发生了三件事。
+///
+/// 受影响的 agent 取的是**改动前后两个集合的并集所属的 agent**:
+/// 只看新集合会漏掉「把某台机器上最后一个节点取消勾选」—— 那台恰恰是必须重下发的。
+pub async fn set_user_nodes(
+    pool: &SqlitePool,
+    user_id: i64,
+    node_ids: &[i64],
+) -> Result<Vec<(i64, i64)>> {
+    let mut tx = pool.begin().await?;
+
+    // 改动前这个用户占用了哪几台 agent。
+    let before: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT n.agent_id FROM user_nodes un
+           JOIN nodes n ON n.id = un.node_id
+          WHERE un.user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    sqlx::query("DELETE FROM user_nodes WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+    let mut after: Vec<i64> = Vec::new();
+    for nid in node_ids {
+        let agent_id: i64 = sqlx::query_scalar("SELECT agent_id FROM nodes WHERE id = ?")
+            .bind(nid)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("没有 id 为 {nid} 的节点"))?;
+        sqlx::query("INSERT OR IGNORE INTO user_nodes (user_id, node_id) VALUES (?, ?)")
+            .bind(user_id)
+            .bind(nid)
+            .execute(&mut *tx)
+            .await?;
+        after.push(agent_id);
+    }
+
+    let mut affected: Vec<i64> = before.into_iter().chain(after).collect();
+    affected.sort_unstable();
+    affected.dedup();
+
+    let mut out = Vec::with_capacity(affected.len());
+    for agent_id in affected {
+        let rev: i64 = sqlx::query_scalar(
+            "UPDATE agents SET config_revision = config_revision + 1
+              WHERE id = ? RETURNING config_revision",
+        )
+        .bind(agent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        out.push((agent_id, rev));
+    }
+
+    tx.commit().await?;
+    Ok(out)
 }
 
 /// 手工启停用户。推进**所有** agent 的 `user_state_revision`(§6.3)。
@@ -459,9 +603,177 @@ mod tests {
         assert!(!a.uuid.is_empty() && !a.password.is_empty() && !a.sub_token.is_empty());
     }
 
+    /// 改节点也要推进 config_revision —— 与新增/删除同一个理由:
+    /// 不推进的话 agent 握手看到 revision 没变,就不会拉新配置,
+    /// 表现为「端口改了但客户端还得连旧端口」且没有任何报错。
     #[tokio::test]
-    async fn list_nodes_round_trips_params_and_protocol() {
+    async fn updating_a_node_bumps_config_revision_and_keeps_key_material() {
         let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let (nid, _) = add_node(&p, a, "in", Protocol::VlessReality, 443, &params).await.unwrap();
+        let priv_key = params.private_key.clone().unwrap();
+
+        // 只改人填的那部分,密钥材料原样带回去。
+        params.server_name = Some("www.microsoft.com".into());
+        params.ipv6 = true;
+        let (agent, rev) = update_node(&p, nid, 8443, &params).await.unwrap();
+        assert_eq!(agent, a);
+        assert_eq!(rev, 2, "建一次 + 改一次");
+
+        let n = &list_nodes(&p).await.unwrap()[0];
+        assert_eq!(n.listen_port, 8443);
+        assert_eq!(n.params.server_name.as_deref(), Some("www.microsoft.com"));
+        assert!(n.params.ipv6);
+        // 这一条是本函数存在的主要风险点:密钥换了 = 全部客户端静默失联(§9.1)。
+        assert_eq!(n.params.private_key.as_deref(), Some(priv_key.as_str()));
+        assert!(n.params.short_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn updating_a_missing_node_errors() {
+        let p = pool().await;
+        assert!(update_node(&p, 999, 443, &NodeParams::default()).await.is_err());
+    }
+
+    /// 改配额/倍率/到期/重置日**不该动任何 revision**:这四项不进 sing-box 配置。
+    /// 推进的话「改一次配额」就等于「全网重建一次 box」。
+    #[tokio::test]
+    async fn updating_user_billing_fields_touches_no_revision() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let uid = add_user(&p, "alice", 0, 0).await.unwrap();
+
+        update_user(&p, uid, 100 * 1_073_741_824, 2.0, Some(1_893_456_000), Some(22))
+            .await
+            .unwrap();
+        assert_eq!(rev(&p, a).await, (0, 0), "计费属性不该推进任何 revision");
+
+        let u = get_user_by_name(&p, "alice").await.unwrap().unwrap();
+        assert_eq!(u.quota_bytes, 100 * 1_073_741_824);
+        assert_eq!(u.traffic_multiplier, 2.0);
+        assert_eq!(u.expire_at, Some(1_893_456_000));
+        assert_eq!(u.reset_day, Some(22));
+
+        // 到期与重置日都能清回「永久 / 不重置」。
+        update_user(&p, uid, 0, 1.0, None, None).await.unwrap();
+        let u = get_user_by_name(&p, "alice").await.unwrap().unwrap();
+        assert_eq!(u.expire_at, None);
+        assert_eq!(u.reset_day, None);
+    }
+
+    #[tokio::test]
+    async fn updating_a_missing_user_errors() {
+        let p = pool().await;
+        assert!(update_user(&p, 999, 0, 1.0, None, None).await.is_err());
+    }
+
+    /// 整体替换分配:一次事务、每台 agent 只推进一次 revision。
+    #[tokio::test]
+    async fn set_user_nodes_replaces_the_whole_set() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let (n1, _) = add_node(&p, a, "n1", Protocol::VlessReality, 443, &NodeParams::default())
+            .await
+            .unwrap();
+        let (n2, _) = add_node(&p, a, "n2", Protocol::VlessReality, 444, &NodeParams::default())
+            .await
+            .unwrap();
+        let (n3, _) = add_node(&p, a, "n3", Protocol::VlessReality, 445, &NodeParams::default())
+            .await
+            .unwrap();
+        let uid = add_user(&p, "alice", 0, 0).await.unwrap();
+
+        let out = set_user_nodes(&p, uid, &[n1, n2]).await.unwrap();
+        assert_eq!(out.len(), 1, "只碰了一台 agent,就该只有一条记录");
+        assert_eq!(out[0].0, a);
+        let before = rev(&p, a).await.0;
+
+        // 换成另一组:n1 留下、n2 去掉、n3 加上。
+        set_user_nodes(&p, uid, &[n1, n3]).await.unwrap();
+        assert_eq!(rev(&p, a).await.0, before + 1, "同一台 agent 一次替换只推进一次");
+
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT node_id FROM user_nodes WHERE user_id = ? ORDER BY node_id")
+                .bind(uid)
+                .fetch_all(&p)
+                .await
+                .unwrap();
+        assert_eq!(ids, vec![n1, n3]);
+    }
+
+    /// 把某台 agent 上最后一个节点取消勾选时,**那台**也必须重下发 ——
+    /// 只看新集合会漏掉它,表现为「界面上取消了,机器上还在服务」。
+    #[tokio::test]
+    async fn set_user_nodes_bumps_agents_that_lost_their_last_node() {
+        let p = pool().await;
+        let (a1, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let (a2, _) = crate::db::agent_repo::create(&p, "b", 0).await.unwrap();
+        let (n1, _) = add_node(&p, a1, "n", Protocol::VlessReality, 443, &NodeParams::default())
+            .await
+            .unwrap();
+        let (n2, _) = add_node(&p, a2, "n", Protocol::VlessReality, 443, &NodeParams::default())
+            .await
+            .unwrap();
+        let uid = add_user(&p, "alice", 0, 0).await.unwrap();
+
+        set_user_nodes(&p, uid, &[n1, n2]).await.unwrap();
+        let (r1, r2) = (rev(&p, a1).await.0, rev(&p, a2).await.0);
+
+        // 只留 a1 的节点 —— a2 上什么都不剩了,但它同样要收到新配置。
+        let out = set_user_nodes(&p, uid, &[n1]).await.unwrap();
+        assert_eq!(out.len(), 2, "两台都受影响:一台加、一台减");
+        assert_eq!(rev(&p, a1).await.0, r1 + 1);
+        assert_eq!(rev(&p, a2).await.0, r2 + 1, "失去最后一个节点的 agent 被漏掉了");
+    }
+
+    /// 传空列表 = 清空分配。这是「取消全部勾选」的正常路径,不该报错。
+    #[tokio::test]
+    async fn set_user_nodes_accepts_an_empty_set() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let (n1, _) = add_node(&p, a, "n", Protocol::VlessReality, 443, &NodeParams::default())
+            .await
+            .unwrap();
+        let uid = add_user(&p, "alice", 0, 0).await.unwrap();
+        set_user_nodes(&p, uid, &[n1]).await.unwrap();
+
+        set_user_nodes(&p, uid, &[]).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_nodes WHERE user_id = ?")
+            .bind(uid)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// 列表里混进一个不存在的 node_id 时,**整个替换都不能生效** ——
+    /// 半套分配比报错难查得多。
+    #[tokio::test]
+    async fn set_user_nodes_rolls_back_on_a_bad_id() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let (n1, _) = add_node(&p, a, "n", Protocol::VlessReality, 443, &NodeParams::default())
+            .await
+            .unwrap();
+        let uid = add_user(&p, "alice", 0, 0).await.unwrap();
+        set_user_nodes(&p, uid, &[n1]).await.unwrap();
+        let before = rev(&p, a).await.0;
+
+        assert!(set_user_nodes(&p, uid, &[n1, 999]).await.is_err());
+
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT node_id FROM user_nodes WHERE user_id = ?")
+            .bind(uid)
+            .fetch_all(&p)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![n1], "失败的替换不该动原有分配");
+        assert_eq!(rev(&p, a).await.0, before, "失败的替换不该推进 revision");
+    }
+
+    #[tokio::test]
+    async fn list_nodes_round_trips_params_and_protocol() {        let p = pool().await;
         let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
         let params = NodeParams {
             server_name: Some("www.example.com".into()),

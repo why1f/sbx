@@ -3,7 +3,7 @@
 //! token 校验路径在这里(§8.1):**按 prefix 索引定位 → sha256 → 恒定时间比较**。
 
 use crate::model::agent::Agent;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 
 /// 取全部 agent,按名字排序(TUI 列表用,需要稳定顺序)。
@@ -80,6 +80,39 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// 改 agent 的人工设置:名称、网卡月配额、网卡重置日。
+///
+/// **不推进任何 revision**:这三项都不进下发给 agent 的配置 —— 网卡配额是主控侧
+/// 用来算「这台机器烧了多少」的口径(§6.4),agent 自己根本不需要知道。
+/// 为它推进 `config_revision` 等于「改一次配额 = 那台机器重建一次 box」。
+///
+/// `ipv4` / `ipv6` **不在这里改**:它们每次 `sysinfo.report` 都会被 agent 自探的值
+/// 覆盖(§7.3),在这里手工填一个值只会在下一个上报周期悄悄变回去 ——
+/// 一个「改了但过一会儿自己变回来」的输入框比没有这个输入框更糟。
+pub async fn update_settings(
+    pool: &SqlitePool,
+    id: i64,
+    name: &str,
+    nic_quota_bytes: Option<i64>,
+    nic_reset_day: Option<i64>,
+) -> Result<()> {
+    let n = sqlx::query(
+        "UPDATE agents SET name = ?, nic_quota_bytes = ?, nic_reset_day = ? WHERE id = ?",
+    )
+    .bind(name)
+    .bind(nic_quota_bytes)
+    .bind(nic_reset_day)
+    .bind(id)
+    .execute(pool)
+    .await
+    .with_context(|| format!("改 agent #{id} 失败(名称 {name} 必须唯一)"))?
+    .rows_affected();
+    if n == 0 {
+        anyhow::bail!("没有 id 为 {id} 的被控服务器");
+    }
     Ok(())
 }
 
@@ -178,5 +211,49 @@ mod tests {
             .unwrap();
 
         assert_eq!(affected_user_count(&p, aid).await.unwrap(), 1);
+    }
+
+    /// 改名与配额都要落库,且**不能碰任何 revision** ——
+    /// 网卡配额是主控自己算账用的口径,agent 根本不需要知道(§6.4)。
+    #[tokio::test]
+    async fn update_settings_persists_without_touching_revisions() {
+        let p = pool().await;
+        let (id, _) = create(&p, "tokyo-1", 0).await.unwrap();
+
+        update_settings(&p, id, "tokyo-1a", Some(500 * 1_073_741_824), Some(22)).await.unwrap();
+        let a = get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.name, "tokyo-1a");
+        assert_eq!(a.nic_quota_bytes, Some(500 * 1_073_741_824));
+        assert_eq!(a.nic_reset_day, Some(22));
+
+        let revs: (i64, i64) =
+            sqlx::query_as("SELECT config_revision, user_state_revision FROM agents WHERE id = ?")
+                .bind(id)
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(revs, (0, 0), "改设置不该让 agent 重建 box");
+
+        // 都能清回「不限 / 不重置」。
+        update_settings(&p, id, "tokyo-1a", None, None).await.unwrap();
+        let a = get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.nic_quota_bytes, None);
+        assert_eq!(a.nic_reset_day, None);
+    }
+
+    /// 名字撞了要给一句认得出的话,不是 sqlx 的原始错误。
+    #[tokio::test]
+    async fn update_settings_reports_a_name_clash() {
+        let p = pool().await;
+        let (id, _) = create(&p, "a", 0).await.unwrap();
+        create(&p, "b", 0).await.unwrap();
+        let err = update_settings(&p, id, "b", None, None).await.unwrap_err().to_string();
+        assert!(err.contains('b'), "错误里要指出冲突的名字: {err}");
+    }
+
+    #[tokio::test]
+    async fn update_settings_on_a_missing_agent_errors() {
+        let p = pool().await;
+        assert!(update_settings(&p, 999, "x", None, None).await.is_err());
     }
 }

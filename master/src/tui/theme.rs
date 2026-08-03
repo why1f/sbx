@@ -95,22 +95,71 @@ pub fn rate(bytes_per_sec: f64) -> String {
     format!("{}/s", bytes(bytes_per_sec.round() as i64))
 }
 
-/// 按显示宽度截断,尾部补 `…`。
+/// 一个字符占几列。东亚宽字符(中日韩、全角标点)占两列,其余按一列算。
 ///
-/// 按 `char` 而不是字节切:IPv6 全是 ASCII 无所谓,但 agent 名和节点 tag
-/// 可以是中文,按字节切会切出半个字符。
+/// 需要这个是因为 `format!("{:<12}", s)` 补的是**字符数**,不是列数:
+/// 「计数器重置」5 个字符会被当成还差 7 格,于是补出 7 个空格,
+/// 而它实际已经占了 10 列 —— 后面的列全部错位。
+fn char_cols(c: char) -> usize {
+    let u = c as u32;
+    let wide = (0x1100..=0x115F).contains(&u)      // 韩文字母
+        || (0x2E80..=0xA4CF).contains(&u)          // CJK 部首 → 汉字 → 注音
+        || (0xAC00..=0xD7A3).contains(&u)          // 韩文音节
+        || (0xF900..=0xFAFF).contains(&u)          // CJK 兼容汉字
+        || (0xFE30..=0xFE6F).contains(&u)          // CJK 兼容形式
+        || (0xFF00..=0xFF60).contains(&u)          // 全角 ASCII
+        || (0xFFE0..=0xFFE6).contains(&u)          // 全角符号
+        || (0x20000..=0x3FFFD).contains(&u); // CJK 扩展
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// 字符串占几列。
+pub fn cols(s: &str) -> usize {
+    s.chars().map(char_cols).sum()
+}
+
+/// 按**显示宽度**截断,尾部补 `…`。
 ///
-/// 这不是完美的东亚宽度处理(中文占两列),但列表里的截断只需要「不撑破布局」,
-/// 而 ratatui 自己会再兜一层。
+/// 按列而不是按字符切:agent 名和节点 tag 可以是中文,一个中文占两列,
+/// 按字符数算会让「东京节点一号」这样的名字把列撑破一倍。
+/// 也不能按字节切 —— 那会切出半个字符(直接乱码或 panic)。
 pub fn truncate(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
+    if cols(s) <= max {
         return s.to_string();
     }
-    let keep = max.saturating_sub(1);
-    s.chars().take(keep).collect::<String>() + "…"
+    // 省略号自己占一列。
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = char_cols(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// 截断到 `w` 列,再用空格补齐到正好 `w` 列。
+///
+/// `Paragraph` 里手工排的列要用它,不能用 `{:<w}` —— 见 `char_cols` 的说明。
+pub fn pad(s: &str, w: usize) -> String {
+    let t = truncate(s, w);
+    let mut out = t;
+    for _ in cols(&out)..w {
+        out.push(' ');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -170,13 +219,30 @@ mod tests {
     }
 
     #[test]
-    fn truncate_keeps_char_boundaries() {
+    fn truncate_counts_display_columns_not_characters() {
         assert_eq!(truncate("abcdef", 10), "abcdef");
         assert_eq!(truncate("abcdef", 4), "abc…");
-        // 中文按字符切,不该切出半个字符(按字节切会 panic 或出乱码)。
-        assert_eq!(truncate("东京节点一号", 3), "东京…");
+        // 中文一个字占两列:6 个字 = 12 列,放进 3 列只装得下一个字加省略号。
+        assert_eq!(truncate("东京节点一号", 3), "东…");
+        assert_eq!(truncate("东京节点一号", 12), "东京节点一号");
+        assert_eq!(truncate("东京节点一号", 11), "东京节点一…");
+        // 省略号自己占一列,所以 10 列只放得下 4 个字(8 列)—— 第 5 个字放不下。
+        assert_eq!(truncate("东京节点一号", 10), "东京节点…");
         assert_eq!(truncate("2001:db8:1:aaaa::1", 12), "2001:db8:1:…");
         assert_eq!(truncate("abc", 0), "");
+        // 切在中文中间不能切出半个字符。
+        assert_eq!(cols(&truncate("节点一号", 5)), 5);
+    }
+
+    /// 手工排的列要用 `pad` 而不是 `{:<w}`:后者补的是字符数。
+    /// 「计数器重置」5 个字符已经占 10 列,`{:<12}` 还会再补 7 个空格。
+    #[test]
+    fn pad_produces_exactly_the_requested_columns() {
+        assert_eq!(cols(&pad("abc", 8)), 8);
+        assert_eq!(cols(&pad("计数器重置", 12)), 12);
+        assert_eq!(cols(&pad("从未连接的机器", 12)), 12, "超宽的要被截到正好 12 列");
+        assert_eq!(pad("", 3), "   ");
+        assert_eq!(cols(&pad("x", 0)), 0);
     }
 
     #[test]

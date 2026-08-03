@@ -26,9 +26,8 @@ GPL 的传染范围是「衍生作品」,而网络通信不构成链接。
 
 ## 状态
 
-**master 侧完整可用:CLI、daemon(TLS)、握手补齐、配额自动化 均已实现并通过测试。**
-**agent 侧已实现并通过测试:WS 客户端、box 热重载、tracker、sysinfo 采集。**
-剩下的是 TUI(§8)、订阅导出(§10)、以及 `build_inbound` 里其余 7 个协议。
+**master 与 agent 都已完成并通过测试,两端在真机上对接跑通过(见下)。**
+仍未实测的只有 agent 自升级(`agent.upgrade`)—— 它要一次真实的发布产物才能验。
 
 | 部分 | 状态 |
 |---|---|
@@ -53,12 +52,12 @@ GPL 的传染范围是「衍生作品」,而网络通信不构成链接。
 | CI / release(§11.1) | ✅ 已完成,`.github/workflows/` + `packaging/` |
 | 八协议配置生成(§9.1) | ✅ 已完成,golden 由 Rust 生成、**由真 sing-box 校验** |
 | 订阅导出(§10) | ✅ 已完成,base64 链接 + Clash YAML + `/sub/:token` HTTP 服务 |
-| TUI(§8) | ✅ 已完成,两行式 agent 列表 + 自绘渐变进度条 + token 管理 |
+| TUI(§8) | ✅ 已完成,概览 / 服务管理 / 节点 / 用户 四页,数字键直达 |
 | 流量统计页(`stats_html`) | ✅ 已完成,浏览器打开订阅地址即是它 |
 | Telegram 通知(§9.1) | ✅ 已完成,单实例租约 + 阈值告警去重 + 定时播报 |
 | §13.2 / §13.3 端到端 | ✅ **已在真实 ARM Linux 上跑通**(1 主控 + 2 agent + 真流量) |
 
-Rust 侧 290 个测试通过(`cargo test`),
+Rust 侧 336 个测试通过(`cargo test`),
 Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 **含 `-race`**,已在 Linux ARM 上跑过)。
 
@@ -107,10 +106,23 @@ curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh
 > 会把 `agent` 当成脚本文件名去打开,报 `cannot open agent`。
 > 嫌绕就用 `| SBX_TARGET=agent bash`,哪种调用形式都行。
 
+被控机通常**不用记上面这条**:主控上 `sbx tui` → 服务管理页 → `[a]` 新增,
+会直接吐出一条填好 token 与证书指纹的整行命令,复制过去跑完即接入:
+
+```sh
+curl -fsSL .../install.sh | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+```
+
+给了 `SBX_TOKEN` 就一定是在装被控端,所以不必再带 `SBX_TARGET=agent`。
+脚本会写好 `/etc/sbx/agent.toml`(0600,里面是明文 token)并 `enable --now sbx-agent`。
+轮换 token 之后按 `[r]` 拿到的新命令在那台机器上重跑一遍即可 —— 旧配置会自动备份成 `.bak`。
+
+`packaging/install.sh` 有一套离线测试:`sh packaging/test-install.sh`(CI 里用 dash 和 bash 各跑一遍)。
+
 ## 已经能跑的东西
 
 ```sh
-cargo test                      # 290 个测试
+cargo test                      # 336 个测试
 cargo build --release           # 产物 target/release/sbx
 
 # 建库 + 加一台被控服务器 + 启动主控
@@ -126,9 +138,21 @@ cargo build --release           # 产物 target/release/sbx
 ./target/release/sbx --config c.toml user-sub alice          # 订阅地址
 ./target/release/sbx --config c.toml user-sub alice --links  # 连同分享链接
 
-# 或者直接开界面(§8):服务管理 / 节点 / 用户 三页,Tab 切换
+# 或者直接开界面(§8):概览 / 服务管理 / 节点 / 用户 四页,按 1-4 直达
 ./target/release/sbx --config c.toml tui
 ```
+
+TUI 里能做的事:
+
+| 页 | 键 |
+|---|---|
+| 服务管理 | `[a]` 新增(给出一键接入命令) `[E]` 编辑配额 `[i]` 再看一次接入命令 `[r]` 轮换 token `[d]` 删除 |
+| 节点 | `[a]` 新增 `[E]` 编辑 `[d]` 删除 |
+| 用户 | `[a]` 新增 `[E]` 编辑计费 `[n]` 分配节点(多选) `[t]` 启/停 `[s]` 订阅 `[d]` 删除 |
+
+节点表单里协议和所属机器是 `←/→` 选的,不是手打;`server_name` / `path` 只在
+用得上它们的协议下出现。编辑节点时 tag 与协议不可改 —— 改 tag 会让历史流量和新流量
+记到两个互不相认的账上,改协议等于换一整套密钥材料,那两件事都该走「删掉重建」。
 
 TUI 与 daemon 是**两个独立进程**,只通过数据库交换状态:在界面里改完配置,
 由正在跑的 daemon 在下次握手或下发时同步到各 agent(§4.1)。所以每个写操作
@@ -170,9 +194,8 @@ Telegram 通知(可选,`[telegram] enabled = true` 才启动):
 同一个 `bot_token` 只能有一个长轮询,所以 bot 靠数据库里的租约做单实例互斥:
 第二个进程会打一行日志然后跳过,不会两边互抢 update。
 
-握手协议(§4.1)已经可用:token 认证、两个 revision 的分别比对、
-同 agent 重连驱逐旧连接。agent 端也已实现,但**两端还没有在真实节点上对接过**——
-目前的验证是各自的测试(master 的端到端测试走真实 socket,agent 对着假主控跑完整握手)。
+握手协议(§4.1):token 认证、两个 revision 的分别比对、同 agent 重连驱逐旧连接。
+两端已经在真实节点上对接跑通(见上面 §13.2 / §13.3 那段)。
 
 ## 构建
 

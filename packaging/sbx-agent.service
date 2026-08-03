@@ -1,6 +1,6 @@
 [Unit]
 Description=sbx agent (embedded sing-box, managed by sbx master)
-Documentation=https://github.com/yourorg/sbx
+Documentation=https://github.com/why1f/sbx
 After=network-online.target
 Wants=network-online.target
 
