@@ -25,22 +25,36 @@ REPO="why1f/sbx"
 BIN_DIR="${SBX_BIN_DIR:-/usr/local/bin}"
 API="https://api.github.com/repos/$REPO/releases/latest"
 DL="https://github.com/$REPO/releases/download"
+RAW="https://raw.githubusercontent.com/$REPO/main/packaging/install.sh"
 
 WANT_VERSION=""     # 空 = 用 latest
 FORCE=0
 NO_RESTART=0
-TARGETS=""          # master / agent,空 = 自动判断
+TARGETS="${SBX_TARGET:-}"   # master / agent / all,空 = 自动判断
 
 die() { printf 'sbx-install: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
+
+# 按**当前的调用方式**给出可以照抄的命令前缀。
+#
+# `curl … | sh` 的时候 $0 是 "sh",此时 `sh master` 会把 master 当成脚本文件名
+# 去打开(报 "cannot open master"),必须写 `sh -s -- master`。
+# 提示里如果一律写 "install.sh agent",管道用户照抄就一定踩坑 —— 踩过。
+invocation() {
+    case "$0" in
+        *install.sh) printf '%s' "$0" ;;
+        *) printf 'curl -fsSL %s | sh -s --' "$RAW" ;;
+    esac
+}
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "缺少 $1,请先安装(apt install $2 / yum install $2)"
 }
 
 usage() {
-    cat <<'EOF'
-用法: install.sh [master|agent|all] [选项]
+    _i=$(invocation)
+    cat <<EOF
+用法: $_i [master|agent|all] [选项]
 
   不带目标时:升级本机已安装的部分;一个都没装则报错。
 
@@ -50,6 +64,10 @@ usage() {
   --no-restart        替换二进制后不重启 systemd 单元
   --bin-dir <目录>    安装目录(默认 /usr/local/bin,也可用 SBX_BIN_DIR)
   -h, --help          这段
+
+环境变量(自动化场景比传参省事,任何调用形式都能用):
+  SBX_TARGET=agent    等价于把 agent 作为参数
+  SBX_BIN_DIR=/opt/bin
 EOF
 }
 
@@ -225,13 +243,24 @@ main() {
     [ -w "$BIN_DIR" ] || [ "$(id -u)" = "0" ] || die "$BIN_DIR 不可写,请用 root 运行(或 --bin-dir 指定别处)"
     [ -d "$BIN_DIR" ] || install -d -m755 "$BIN_DIR"
 
+    # SBX_TARGET 走的是环境变量,没经过 parse_args 的校验和 all 展开,这里补上。
+    case "$TARGETS" in
+        '') ;;
+        all) TARGETS="master agent" ;;
+        master|agent|'master agent'|'agent master') ;;
+        *) die "SBX_TARGET 只能是 master / agent / all,收到:$TARGETS" ;;
+    esac
+
     # 没显式指定目标时,按本机已装的东西决定升谁。
     if [ -z "$TARGETS" ]; then
         [ -x "$BIN_DIR/sbx" ] && TARGETS="$TARGETS master"
         [ -x "$BIN_DIR/sbx-agent" ] && TARGETS="$TARGETS agent"
-        [ -n "$TARGETS" ] || die "本机还没装过 sbx。首次安装请显式指定:
-       install.sh agent     # 被控机
-       install.sh master    # 主控机"
+        [ -n "$TARGETS" ] || die "本机还没装过 sbx。首次安装请显式指定装哪个:
+
+       $(invocation) agent     # 被控机
+       $(invocation) master    # 主控机
+
+       (或者用环境变量:SBX_TARGET=agent)"
         info "检测到已安装:$(printf '%s' "$TARGETS" | tr -s ' ')"
     fi
 

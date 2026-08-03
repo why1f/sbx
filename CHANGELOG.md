@@ -4,6 +4,17 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.1.2
+
+### 修
+
+- **`install.sh` 的错误提示会误导管道用户。** 没装过又不指定目标时,它一律提示
+  `install.sh agent` —— 但 `curl … | sh` 的场景下照抄过去写成 `sh master`,
+  shell 会把 `master` 当成**脚本文件名**去打开,报 `cannot open master`。
+  现在提示按**实际调用方式**生成:管道就给 `curl … | sh -s -- agent`,
+  当文件跑就给 `./install.sh agent`。
+- 顺带支持 `SBX_TARGET=agent`,任何调用形式都能用,不必记 `-s --`。
+
 ## v0.1.1
 
 ### 新增
