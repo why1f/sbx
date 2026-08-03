@@ -1,23 +1,25 @@
 #!/bin/sh
 # sbx 一键安装 / 升级脚本。
 #
-#   curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | sh
-#   ./install.sh agent          # 只装 agent
-#   ./install.sh master         # 只装主控
-#   ./install.sh --version 0.1.0
+#   # 装主控(不带参数就是这个)
+#   curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
 #
-# 不带参数时**按已安装的东西自动升级**:装了什么就升什么,
-# 一个都没装就报错并让你显式选 —— 免得在一台只跑 agent 的机器上莫名多出一个主控。
+#   # 装被控 agent
+#   curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash -s -- agent
 #
-# 行为:
-#   * 已是最新版 → 什么都不做(除非 --force)
-#   * 版本不一致 → 下载、**校验 sha256**、原子替换、必要时重启 systemd 单元
+# 选目标的优先级:
+#   1. 命令行参数 / SBX_TARGET
+#   2. 本机**已经装了什么**就升什么 —— 一台只跑 agent 的机器上跑裸命令
+#      应该升那个 agent,而不是莫名多出一个主控
+#   3. 都没有 → 装主控
 #
-# 用 POSIX sh 而不是 bash:被控机上可能只有 dash/busybox。
+# 已是最新版就什么都不做。下载后**强制校验 sha256**,取不到校验和宁可拒装。
 #
-# ── 关于 `curl | sh` ──
+# 用 POSIX sh 写(`| sh` 和 `| bash` 都能跑):被控机上可能只有 dash/busybox。
+#
+# ── 关于 `curl | bash` ──
 # 整个脚本包在函数里,最后一行才 `main "$@"`。这样连接中断导致下载不完整时,
-# sh 读到的是一堆没被调用的函数定义,不会执行到一半就动你的系统。
+# shell 读到的是一堆没被调用的函数定义,不会执行到一半就动你的系统。
 
 set -eu
 
@@ -30,7 +32,7 @@ RAW="https://raw.githubusercontent.com/$REPO/main/packaging/install.sh"
 WANT_VERSION=""     # 空 = 用 latest
 FORCE=0
 NO_RESTART=0
-TARGETS="${SBX_TARGET:-}"   # master / agent / all,空 = 自动判断
+TARGETS=""          # master / agent,空 = 自动判断
 
 die() { printf 'sbx-install: %s\n' "$*" >&2; exit 1; }
 info() { printf '  %s\n' "$*"; }
@@ -43,7 +45,7 @@ info() { printf '  %s\n' "$*"; }
 invocation() {
     case "$0" in
         *install.sh) printf '%s' "$0" ;;
-        *) printf 'curl -fsSL %s | sh -s --' "$RAW" ;;
+        *) printf 'curl -fsSL %s | bash -s --' "$RAW" ;;
     esac
 }
 
@@ -56,7 +58,7 @@ usage() {
     cat <<EOF
 用法: $_i [master|agent|all] [选项]
 
-  不带目标时:升级本机已安装的部分;一个都没装则报错。
+  不带目标时:本机装过什么就升什么;都没装过则装**主控**。
 
 选项:
   --version <X.Y.Z>   装指定版本(默认最新)
@@ -71,17 +73,39 @@ usage() {
 EOF
 }
 
+# 往 TARGETS 里加一个目标,不产生前导空格。
+#
+# 之前直接 `TARGETS="$TARGETS $1"` 会得到 " master",而后面用 case 精确匹配
+# `master` 就对不上 —— v0.1.2 的回归正是这么来的。
+add_target() {
+    case " $TARGETS " in
+        *" $1 "*) ;;                                    # 已经有了,别加两遍
+        *) TARGETS="${TARGETS:+$TARGETS }$1" ;;
+    esac
+}
+
+# 环境变量形式的目标。**在这里校验**,而不是等和命令行参数合并之后 ——
+# 合并之后就分不清「用户填错了 SBX_TARGET」和「parse_args 自己拼出来的值」了。
+init_targets_from_env() {
+    case "${SBX_TARGET:-}" in
+        '') ;;
+        all) add_target master; add_target agent ;;
+        master|agent) add_target "$SBX_TARGET" ;;
+        *) die "SBX_TARGET 只能是 master / agent / all,收到:${SBX_TARGET}" ;;
+    esac
+}
+
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            master|agent) TARGETS="$TARGETS $1" ;;
-            all) TARGETS="master agent" ;;
+            master|agent) add_target "$1" ;;
+            all) add_target master; add_target agent ;;
             --version) [ $# -ge 2 ] || die "--version 后面要跟版本号"; WANT_VERSION="${2#v}"; shift ;;
             --force) FORCE=1 ;;
             --no-restart) NO_RESTART=1 ;;
             --bin-dir) [ $# -ge 2 ] || die "--bin-dir 后面要跟目录"; BIN_DIR="$2"; shift ;;
             -h|--help) usage; exit 0 ;;
-            *) die "不认识的参数: $1(--help 看用法)" ;;
+            *) die "不认识的参数: $1($(invocation) --help 看用法)" ;;
         esac
         shift
     done
@@ -234,6 +258,7 @@ install_agent() {
 }
 
 main() {
+    init_targets_from_env
     parse_args "$@"
     need curl curl
     need sha256sum coreutils
@@ -243,25 +268,19 @@ main() {
     [ -w "$BIN_DIR" ] || [ "$(id -u)" = "0" ] || die "$BIN_DIR 不可写,请用 root 运行(或 --bin-dir 指定别处)"
     [ -d "$BIN_DIR" ] || install -d -m755 "$BIN_DIR"
 
-    # SBX_TARGET 走的是环境变量,没经过 parse_args 的校验和 all 展开,这里补上。
-    case "$TARGETS" in
-        '') ;;
-        all) TARGETS="master agent" ;;
-        master|agent|'master agent'|'agent master') ;;
-        *) die "SBX_TARGET 只能是 master / agent / all,收到:$TARGETS" ;;
-    esac
-
-    # 没显式指定目标时,按本机已装的东西决定升谁。
+    # 没显式指定目标时:先看本机已经装了什么。
+    #
+    # 「已装什么就升什么」必须排在「默认装主控」前面 —— 一台只跑 agent 的
+    # 被控机上跑裸命令,意图显然是升级那个 agent,而不是给它安一个主控。
     if [ -z "$TARGETS" ]; then
-        [ -x "$BIN_DIR/sbx" ] && TARGETS="$TARGETS master"
-        [ -x "$BIN_DIR/sbx-agent" ] && TARGETS="$TARGETS agent"
-        [ -n "$TARGETS" ] || die "本机还没装过 sbx。首次安装请显式指定装哪个:
-
-       $(invocation) agent     # 被控机
-       $(invocation) master    # 主控机
-
-       (或者用环境变量:SBX_TARGET=agent)"
-        info "检测到已安装:$(printf '%s' "$TARGETS" | tr -s ' ')"
+        [ -x "$BIN_DIR/sbx" ] && add_target master
+        [ -x "$BIN_DIR/sbx-agent" ] && add_target agent
+        if [ -n "$TARGETS" ]; then
+            info "检测到已安装:$TARGETS"
+        else
+            TARGETS="master"
+            info "本机还没装过,默认装主控(要装被控端就加 agent:$(invocation) agent)"
+        fi
     fi
 
     if [ -n "$WANT_VERSION" ]; then

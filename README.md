@@ -93,21 +93,19 @@ Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 ## 安装
 
 ```sh
+# 主控机 —— 不带参数就是装主控
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+
 # 被控机
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | sh -s -- agent
-# 主控机
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | sh -s -- master
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash -s -- agent
 ```
 
-**管道形式必须写 `sh -s -- <目标>`。** 少了 `-s --` 的话,`sh master` 会把 `master`
-当成脚本文件名去打开,报 `cannot open master`。嫌绕就用环境变量,哪种调用形式都行:
-
-```sh
-curl -fsSL .../install.sh | SBX_TARGET=agent sh
-```
-
-不带参数重跑就是**升级**:认出本机已装的部分,已是最新版就什么都不做。
+重跑同一条命令就是**升级**:本机装过什么就升什么,已是最新版则什么都不做。
 下载后强制校验 sha256,取不到校验和宁可拒装。部署细节见 [`DEPLOY.md`](DEPLOY.md)。
+
+> 管道形式要传参数必须写 `bash -s -- <目标>`。少了 `-s --` 的话,`bash agent`
+> 会把 `agent` 当成脚本文件名去打开,报 `cannot open agent`。
+> 嫌绕就用 `| SBX_TARGET=agent bash`,哪种调用形式都行。
 
 ## 已经能跑的东西
 
