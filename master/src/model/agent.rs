@@ -1,9 +1,10 @@
 //! 被控服务器(agent)模型。旧项目没有对应物,整个是新增的。
 //!
-//! 这里有一批 `#[allow(dead_code)]`,它们**不是**遗留垃圾:
-//! `AgentStatus`、`Agent` 的那几个判定方法、`AgentNicTraffic` 都是给 TUI(§8)用的,
-//! 而 TUI 还没写。db 层目前直接读写字符串/整数列,不经过这层封装。
-//! TUI 落地后这些 allow 应当逐个删掉 —— 如果那时发现某个还是没人用,那才是该删的代码。
+//! 这里有一批 `#[allow(dead_code)]`。TUI(§8)读的是它自己的视图模型
+//! (`tui/data.rs::AgentRow`,那边要 JOIN 网卡流量表并在内存里算网速),
+//! 所以这层封装目前只有 daemon 侧在用,`AgentStatus` 的判定方法还没有调用点。
+//! 它们留着是因为语义定义在这里最合适;真要删,该连着 `tui/data.rs` 一起想清楚
+//! 「状态判定到底住在哪一层」,而不是因为编译器说没人用就顺手删掉。
 
 use serde::{Deserialize, Serialize};
 

@@ -283,7 +283,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             &app.events,
             now,
         ),
-        Page::Agents => pages::agents(f, chunks[1], &app.agents, app.sel[1]),
+        Page::Agents => pages::agents(f, chunks[1], &app.agents, app.sel[1], now),
         Page::Nodes => pages::nodes(f, chunks[1], &app.nodes, app.sel[2]),
         Page::Users => pages::users(f, chunks[1], &app.users, app.sel[3], app.sub_base(), now),
     }
@@ -1050,6 +1050,12 @@ mod tests {
             up_per_sec: None,
             down_per_sec: None,
             node_count: 0,
+            cpu_pct: None,
+            mem_used: None,
+            mem_total: None,
+            load1: None,
+            uptime_secs: None,
+            sysinfo_at: None,
         }
     }
 

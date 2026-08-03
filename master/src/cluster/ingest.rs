@@ -200,6 +200,26 @@ pub async fn ingest_sysinfo(
             .await?;
     }
 
+    // 主机指标存**最新一次**就够(§8.0)。它们和网卡计数不一样:
+    // 网卡是累加的账,必须一笔不漏;CPU / 内存 / load 只有「现在多少」有意义,
+    // 留历史等于给一张每 30 秒 × N 台 agent 增长的表,而没有任何一处会去查它。
+    //
+    // `sysinfo_at` 是必须的:少了它,一台离线三天的机器会一直显示三天前那个
+    // CPU 数字,看起来和在线的机器毫无区别。
+    sqlx::query(
+        "UPDATE agents SET cpu_pct = ?, mem_used = ?, mem_total = ?, load1 = ?,
+                uptime_secs = ?, sysinfo_at = ? WHERE id = ?",
+    )
+    .bind(r.cpu_pct)
+    .bind(r.mem_used)
+    .bind(r.mem_total)
+    .bind(r.load1)
+    .bind(r.uptime_secs)
+    .bind(now)
+    .bind(agent_id)
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
     Ok(SysinfoOutcome { epoch_changed: d.epoch_changed, rx_delta: d.up, tx_delta: d.down })
 }
@@ -451,6 +471,51 @@ mod tests {
             .fetch_one(p)
             .await
             .unwrap()
+    }
+
+    /// 主机指标要落到 `agents` 上,并且**每次覆盖**成最新的一份。
+    ///
+    /// 这几个值以前是被直接扔掉的:`sysinfo.report` 每 30 秒把 CPU / 内存 / load
+    /// 送到主控,入库时只取了 nic 那一段 —— 于是概览页想显示「哪台机器忙成什么样」
+    /// 时无米下锅,而数据其实早就在线上了。
+    #[tokio::test]
+    async fn host_metrics_are_persisted_and_overwritten() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+
+        // 还没上报过:全是 NULL,不是 0。0 会被读成「这台机器闲着」。
+        let before: (Option<f64>, Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT cpu_pct, mem_used, sysinfo_at FROM agents WHERE id = ?")
+                .bind(a)
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(before, (None, None, None));
+
+        ingest_sysinfo(&p, a, &sysinfo("boot-1", 1, 1), 1_000).await.unwrap();
+        type Metrics = (Option<f64>, Option<i64>, Option<i64>, Option<f64>, Option<i64>, Option<i64>);
+        let row: Metrics = sqlx::query_as(
+            "SELECT cpu_pct, mem_used, mem_total, load1, uptime_secs, sysinfo_at
+               FROM agents WHERE id = ?",
+        )
+        .bind(a)
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(row, (Some(12.5), Some(1 << 30), Some(4 << 30), Some(0.4), Some(3600), Some(1_000)));
+
+        // 第二次上报覆盖,不是累加 —— 这几个是「现在多少」,不是账。
+        let mut r2 = sysinfo("boot-1", 2, 2);
+        r2.cpu_pct = 91.0;
+        r2.uptime_secs = 7200;
+        ingest_sysinfo(&p, a, &r2, 2_000).await.unwrap();
+        let row: (Option<f64>, Option<i64>, Option<i64>) =
+            sqlx::query_as("SELECT cpu_pct, uptime_secs, sysinfo_at FROM agents WHERE id = ?")
+                .bind(a)
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(row, (Some(91.0), Some(7200), Some(2_000)), "应当是覆盖,不是累加");
     }
 
     #[tokio::test]

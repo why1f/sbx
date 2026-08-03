@@ -100,7 +100,7 @@ pub fn dashboard(
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(c[1]);
     top_users(f, mid[0], users, now);
-    agent_quotas(f, mid[1], agents);
+    agent_quotas(f, mid[1], agents, now);
 
     recent_events(f, c[2], events);
 }
@@ -222,7 +222,11 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
     );
 }
 
-fn agent_quotas(f: &mut Frame, area: Rect, agents: &[AgentRow]) {
+/// 主机指标多久算过期。上报周期是 30s,门槛要留出余量 ——
+/// 卡在 30s 上会让正常的网络抖动表现成「CPU 数字一闪一闪地消失」。
+const HOST_METRICS_STALE_AFTER: i64 = 90;
+
+fn agent_quotas(f: &mut Frame, area: Rect, agents: &[AgentRow], now: i64) {
     let rows = area.height.saturating_sub(2) as usize;
     let bar_w = (area.width.saturating_sub(34)).clamp(0, 14) as usize;
 
@@ -233,7 +237,10 @@ fn agent_quotas(f: &mut Frame, area: Rect, agents: &[AgentRow]) {
             Style::default().fg(theme::DIM),
         )));
     }
-    for a in agents.iter().take(rows) {
+    // 每台占两行:第一行流量与配额,第二行 CPU / 内存 / load。
+    // 挤在一行里的话窄一点就全被截掉,而这两组数字回答的是不同的问题
+    // (还能跑多少流量 / 这台机器现在吃不吃得消)。
+    for a in agents.iter().take(rows / 2) {
         let (dot, color) = match a.status.as_str() {
             "online" => ("●", theme::ONLINE),
             "offline" => ("●", theme::OFFLINE),
@@ -257,12 +264,60 @@ fn agent_quotas(f: &mut Frame, area: Rect, agents: &[AgentRow]) {
             None => spans.push(Span::styled(" 不限流量", Style::default().fg(theme::DIM))),
         }
         lines.push(Line::from(spans));
+        lines.push(Line::from(Span::styled(
+            format!("      {}", host_metrics(a, now, area.width.saturating_sub(8) as usize)),
+            Style::default().fg(theme::DIM),
+        )));
     }
 
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 被控服务器 ")),
         area,
     );
+}
+
+/// 一行 CPU / 内存 / load /(放得下的话)运行时长。
+///
+/// 指标过期(或从没上报过)时整行是 `--`,**不是 0**:
+/// 一台离线三天的机器显示「CPU 0%」看起来和一台闲着的在线机器一模一样。
+///
+/// 运行时长按**能不能整段放下**决定要不要接上去。让 `Paragraph` 去截会切出
+/// 「已 」这种半截词 —— 那正是这一版到处在修的那类问题(§8.3)。
+fn host_metrics(a: &AgentRow, now: i64, width: usize) -> String {
+    if !a.host_metrics_fresh(now, HOST_METRICS_STALE_AFTER) {
+        return "CPU --   内存 --   负载 --".into();
+    }
+    let cpu = a.cpu_pct.map(|c| format!("{c:.0}%")).unwrap_or_else(|| "--".into());
+    let mem = match (a.mem_ratio(), a.mem_used) {
+        (Some(r), Some(used)) => format!("{} ({:.0}%)", theme::bytes(used), r * 100.0),
+        _ => "--".into(),
+    };
+    let load = a.load1.map(|l| format!("{l:.2}")).unwrap_or_else(|| "--".into());
+    let base = format!("CPU {cpu}   内存 {mem}   负载 {load}");
+
+    match a.uptime_secs.filter(|s| *s > 0) {
+        Some(s) => {
+            let tail = format!("   已运行 {}", uptime_label(s));
+            if theme::cols(&base) + theme::cols(&tail) <= width {
+                base + &tail
+            } else {
+                base
+            }
+        }
+        None => base,
+    }
+}
+
+/// 秒 → 「3 天 4 小时」。只给两级 —— 「3 天 4 小时 12 分 7 秒」没人会读到最后。
+fn uptime_label(secs: i64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d} 天 {h} 小时")
+    } else if h > 0 {
+        format!("{h} 小时 {m} 分")
+    } else {
+        format!("{m} 分")
+    }
 }
 
 /// 事件类型 →(中文名, 颜色)。库里的 kind 是英文标识,直接显示等于让人去猜。
@@ -333,6 +388,9 @@ fn state_color(u: &UserRow) -> Color {
 
 /// 「流量」列在宽屏下的目标宽度。
 const TRAFFIC_COL: u16 = 38;
+/// 「主机」列(CPU / 内存)。只在**宽到有余量**时才出现 ——
+/// 它是最锦上添花的一列,不该从流量或重置日那里抢地方。
+const HOST_COL: u16 = 22;
 
 /// agents 页的列宽。进度条是**可牺牲**的那一项:
 /// 重置日是信息,进度条只是同一份信息的图形化。
@@ -342,6 +400,8 @@ struct Cols {
     ip: u16,
     speed: u16,
     traffic: u16,
+    /// 0 = 放不下,整列不画。
+    host: u16,
     /// 0 = 窄到画不下,只显示重置日文字。
     bar: usize,
 }
@@ -350,25 +410,36 @@ struct Cols {
 const RESET_LABEL_COLS: u16 = 16;
 
 fn columns(total_width: u16) -> Cols {
+    // 减掉左右边框(2),以及 ratatui 在各列之间插的间隔(五列 = 四个;
+    // 加上主机列就是五个)。漏算的话总宽超出可用空间,ratatui 会静默压缩各列。
     let avail = total_width.saturating_sub(2 + 4);
     const IDEAL: (u16, u16, u16, u16) = (18, 22, 14, TRAFFIC_COL);
     const NARROW: (u16, u16, u16, u16) = (14, 18, 13, 0);
+    let ideal_sum = IDEAL.0 + IDEAL.1 + IDEAL.2 + IDEAL.3;
     let narrow_fixed = NARROW.0 + NARROW.1 + NARROW.2;
 
-    let (name, ip, speed, traffic) = if avail >= IDEAL.0 + IDEAL.1 + IDEAL.2 + IDEAL.3 {
+    let (name, ip, speed, traffic) = if avail >= ideal_sum {
         IDEAL
     } else if avail > narrow_fixed {
+        // 窄屏:三个固定列收一点,余下全给「流量」——那一列信息密度最高。
         (NARROW.0, NARROW.1, NARROW.2, (avail - narrow_fixed).min(TRAFFIC_COL))
     } else {
+        // 极窄:连收缩后的固定列都放不下。按比例分,保证**总和不超出** ——
+        // 超出的话 ratatui 会自己压缩,那时连省略号都画不出来。
         let unit = avail / 4;
         (unit, unit, unit, avail.saturating_sub(unit * 3))
     };
 
+    // 主机列多占一个列间隔,所以门槛比它自身宽一格。
+    let host = if avail > ideal_sum + HOST_COL { HOST_COL } else { 0 };
+
+    // 进度条用流量列里除去重置日之后剩下的地方。剩不下 4 格就别画了:
+    // 三四格的条读不出比例,只是占地方 —— 那时改用文字百分比。
     let bar = traffic.saturating_sub(RESET_LABEL_COLS).min(20) as usize;
-    Cols { name, ip, speed, traffic, bar: if bar < 4 { 0 } else { bar } }
+    Cols { name, ip, speed, traffic, host, bar: if bar < 4 { 0 } else { bar } }
 }
 
-pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize) {
+pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now: i64) {
     let c = columns(area.width);
     let table_rows: Vec<Row> = rows
         .iter()
@@ -461,31 +532,57 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize) {
                 ),
             };
 
-            Row::new(vec![
-                name_cell,
-                ip_cell,
-                speed_cell,
-                Cell::from(Text::from(vec![line1, line2])),
-                Cell::from(""),
-            ])
-            .height(2)
-            .style(row_style(i == selected))
+            // 主机列:CPU 一行、内存一行。指标过期时是 `--` 而不是 0 ——
+            // 一台离线三天的机器显示「CPU 0%」看起来和闲着的在线机器一模一样。
+            let fresh = a.host_metrics_fresh(now, HOST_METRICS_STALE_AFTER);
+            let host_cell = Cell::from(Text::from(vec![
+                Line::from(Span::styled(
+                    match (fresh, a.cpu_pct) {
+                        (true, Some(v)) => format!("CPU {v:.0}%"),
+                        _ => "CPU --".into(),
+                    },
+                    Style::default().fg(match (fresh, a.cpu_pct) {
+                        (true, Some(v)) => theme::gradient_at(v / 100.0),
+                        _ => theme::DIM,
+                    }),
+                )),
+                Line::from(Span::styled(
+                    match (fresh, a.mem_ratio()) {
+                        (true, Some(r)) => format!("内存 {:.0}%", r * 100.0),
+                        _ => "内存 --".into(),
+                    },
+                    Style::default().fg(theme::DIM),
+                )),
+            ]));
+
+            let mut cells = vec![name_cell, ip_cell, speed_cell, Cell::from(Text::from(vec![line1, line2]))];
+            if c.host > 0 {
+                cells.push(host_cell);
+            }
+            cells.push(Cell::from(""));
+            Row::new(cells).height(2).style(row_style(i == selected))
         })
         .collect();
 
+    let mut constraints = vec![
+        Constraint::Length(c.name),
+        Constraint::Length(c.ip),
+        Constraint::Length(c.speed),
+        Constraint::Length(c.traffic),
+    ];
+    let mut titles = vec!["名称 / 版本", "IP 地址", "网速", "流量"];
+    if c.host > 0 {
+        constraints.push(Constraint::Length(c.host));
+        titles.push("主机");
+    }
+    // 最后一列吃掉余下宽度,别让上面几列被拉伸。
+    constraints.push(Constraint::Min(0));
+    titles.push("");
+
     f.render_widget(
-        Table::new(
-            table_rows,
-            [
-                Constraint::Length(c.name),
-                Constraint::Length(c.ip),
-                Constraint::Length(c.speed),
-                Constraint::Length(c.traffic),
-                Constraint::Min(0), // 吃掉余下宽度,别让上面几列被拉伸
-            ],
-        )
-        .header(header(&["名称 / 版本", "IP 地址", "网速", "流量", ""]))
-        .block(Block::default().borders(Borders::ALL).title(" 服务管理 ")),
+        Table::new(table_rows, constraints)
+            .header(header(&titles))
+            .block(Block::default().borders(Borders::ALL).title(" 服务管理 ")),
         area,
     );
 }
@@ -928,6 +1025,12 @@ mod tests {
             up_per_sec: Some(8_600.0),
             down_per_sec: Some(6_900.0),
             node_count: 2,
+            cpu_pct: Some(37.0),
+            mem_used: Some(3 * 1_073_741_824),
+            mem_total: Some(8 * 1_073_741_824),
+            load1: Some(0.62),
+            uptime_secs: Some(86_400 * 3 + 3600 * 4),
+            sysinfo_at: Some(NOW - 5),
         }
     }
 
@@ -965,7 +1068,7 @@ mod tests {
     }
 
     fn render_agents(rows: &[AgentRow]) -> String {
-        draw_to_string(120, 12, |f| agents(f, f.area(), rows, 0))
+        draw_to_string(120, 12, |f| agents(f, f.area(), rows, 0, NOW))
     }
 
     /// 把一帧画进内存 buffer 再抠成字符串。
@@ -1054,7 +1157,7 @@ mod tests {
     #[test]
     fn narrow_terminals_do_not_panic() {
         for (w, h) in [(1u16, 1u16), (10, 3), (30, 5), (60, 10), (200, 60)] {
-            draw_to_string(w, h, |f| agents(f, f.area(), &[agent(Some(1000), Some(1))], 0));
+            draw_to_string(w, h, |f| agents(f, f.area(), &[agent(Some(1000), Some(1))], 0, NOW));
             draw_to_string(w, h, |f| nodes(f, f.area(), &[node()], 0));
             draw_to_string(w, h, |f| users(f, f.area(), &[user()], 0, "https://x.example", NOW));
             draw_to_string(w, h, |f| {
@@ -1067,7 +1170,7 @@ mod tests {
     #[test]
     fn narrow_terminal_keeps_the_reset_day_intact() {
         let out = draw_to_string(80, 8, |f| {
-            agents(f, f.area(), &[agent(Some(500 * 1_073_741_824), Some(22))], 0)
+            agents(f, f.area(), &[agent(Some(500 * 1_073_741_824), Some(22))], 0, NOW)
         });
         assert!(has_cjk(&out, "每月 22 日重置"), "80 列下重置日被截断了:\n{out}");
         assert!(out.contains('…'), "IPv6 应当截断并保留省略号:\n{out}");
@@ -1087,7 +1190,7 @@ mod tests {
     #[test]
     fn percentage_moves_to_text_when_the_bar_does_not_fit() {
         let out = draw_to_string(70, 6, |f| {
-            agents(f, f.area(), &[agent(Some(100 * 1_073_741_824), Some(22))], 0)
+            agents(f, f.area(), &[agent(Some(100 * 1_073_741_824), Some(22))], 0, NOW)
         });
         assert!(!out.contains('█'), "这么窄不该画条:\n{out}");
         assert!(out.contains("34%"), "画不下条时要给文字百分比:\n{out}");
@@ -1198,10 +1301,61 @@ mod tests {
         assert!(!out.contains("MUST-NOT-APPEAR"), "密钥材料被画到界面上了:\n{out}");
     }
 
+    /// 主机指标过期时必须显示 `--`,**不能显示上一次的数字**。
+    ///
+    /// 这是这一组里唯一真正会误导人的失败模式:一台离线三天的机器
+    /// 挂着三天前那个「CPU 3%」,看起来和一台闲着的在线机器一模一样。
+    #[test]
+    fn stale_host_metrics_read_as_dashes() {
+        let fresh = agent(None, None);
+        assert!(fresh.host_metrics_fresh(NOW, HOST_METRICS_STALE_AFTER));
+        assert!(host_metrics(&fresh, NOW, 80).contains("37%"));
+
+        let stale = AgentRow { sysinfo_at: Some(NOW - 3 * 86_400), ..agent(None, None) };
+        let line = host_metrics(&stale, NOW, 80);
+        assert!(line.contains("CPU --"), "{line}");
+        assert!(!line.contains("37"), "过期了还在显示上一次的数字:{line}");
+
+        // 从没上报过(sysinfo_at IS NULL)同样是 `--`。
+        let never = AgentRow { sysinfo_at: None, ..agent(None, None) };
+        assert!(host_metrics(&never, NOW, 80).contains("CPU --"));
+
+        // 上报周期是 30s,门槛要留余量:29 秒前的数据仍然算新鲜。
+        let recent = AgentRow { sysinfo_at: Some(NOW - 29), ..agent(None, None) };
+        assert!(recent.host_metrics_fresh(NOW, HOST_METRICS_STALE_AFTER));
+    }
+
+    #[test]
+    fn uptime_reads_in_two_units_at_most() {
+        assert_eq!(uptime_label(86_400 * 3 + 3600 * 4 + 725), "3 天 4 小时");
+        assert_eq!(uptime_label(3600 * 5 + 60 * 7), "5 小时 7 分");
+        assert_eq!(uptime_label(180), "3 分");
+        assert_eq!(uptime_label(0), "0 分");
+    }
+
+    #[test]
+    fn mem_ratio_needs_a_total() {
+        let a = agent(None, None);
+        assert_eq!(a.mem_ratio(), Some(0.375), "3G / 8G");
+        assert_eq!(AgentRow { mem_total: Some(0), ..agent(None, None) }.mem_ratio(), None);
+        assert_eq!(AgentRow { mem_total: None, ..agent(None, None) }.mem_ratio(), None);
+        assert_eq!(AgentRow { mem_used: None, ..agent(None, None) }.mem_ratio(), None);
+    }
+
+    /// 主机列只在宽到有余量时出现,而且出现时不能把别的列挤窄。
+    #[test]
+    fn the_host_column_only_appears_when_there_is_room() {
+        assert_eq!(columns(80).host, 0, "80 列放不下主机列");
+        assert!(columns(140).host > 0, "140 列该有主机列");
+        let out = draw_to_string(140, 6, |f| agents(f, f.area(), &[agent(None, None)], 0, NOW));
+        assert!(out.contains("CPU 37%"), "{out}");
+        assert!(has_cjk(&out, "内存 38%"), "{out}");
+        assert!(has_cjk(&out, "无需重置"), "加了主机列不该把流量列挤掉:\n{out}");
+    }
+
     /// 概览页要能一眼看出有机器掉线、有人快超额。
     #[test]
-    fn dashboard_summarises_the_cluster() {
-        let mut offline = agent(None, None);
+    fn dashboard_summarises_the_cluster() {        let mut offline = agent(None, None);
         offline.id = 2;
         offline.name = "osaka-2".into();
         offline.status = "offline".into();
@@ -1253,6 +1407,8 @@ mod tests {
                 cycle_tx: 4 * 1_073_741_824,
                 up_per_sec: Some(14_400.0),
                 down_per_sec: Some(13_900.0),
+                // 离线的机器指标是旧的 —— 界面上必须显示 `--`,不是最后一次的数字。
+                sysinfo_at: Some(NOW - 3 * 86_400),
                 ..agent(None, None)
             },
             AgentRow {
@@ -1268,6 +1424,12 @@ mod tests {
                 cycle_tx: 0,
                 up_per_sec: None,
                 down_per_sec: None,
+                cpu_pct: None,
+                mem_used: None,
+                mem_total: None,
+                load1: None,
+                uptime_secs: None,
+                sysinfo_at: None,
                 ..agent(None, None)
             },
         ];
@@ -1335,7 +1497,12 @@ mod tests {
                 NOW
             ))
         );
-        println!("── 服务管理 ──\n{}\n", draw_to_string(120, 9, |f| agents(f, f.area(), &agents_rows, 1)));
+        println!("── 服务管理 ──\n{}\n", draw_to_string(120, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW)));
+        // 宽一点才画得下「主机」列(CPU / 内存)。
+        println!(
+            "── 服务管理(140 列,多一个主机列)──\n{}\n",
+            draw_to_string(140, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW))
+        );
         println!("── 节点 ──\n{}\n", draw_to_string(120, 9, |f| nodes(f, f.area(), &node_rows, 1)));
         println!(
             "── 用户 ──\n{}\n",

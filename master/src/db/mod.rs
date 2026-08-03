@@ -22,6 +22,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/001_init.sql"),
     include_str!("migrations/002_reset_cycle.sql"),
     include_str!("migrations/003_telegram.sql"),
+    include_str!("migrations/004_agent_host_metrics.sql"),
 ];
 
 /// 当前程序期望的 schema 版本(= 迁移脚本数量),供 doctor 比对实际库版本。

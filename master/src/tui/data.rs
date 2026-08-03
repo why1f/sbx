@@ -30,6 +30,16 @@ pub struct AgentRow {
     pub up_per_sec: Option<f64>,
     pub down_per_sec: Option<f64>,
     pub node_count: i64,
+    /// 主机指标(§7.2 的 `sysinfo.report`)。**全都可空** ——
+    /// 从没连上过的 agent 这几项就该显示 `--`,而不是一个看起来像真的 0。
+    pub cpu_pct: Option<f64>,
+    pub mem_used: Option<i64>,
+    pub mem_total: Option<i64>,
+    pub load1: Option<f64>,
+    pub uptime_secs: Option<i64>,
+    /// 这批指标是哪一刻的。少了它,一台离线三天的机器会一直显示三天前那个
+    /// CPU 数字,看起来和在线的机器毫无区别。
+    pub sysinfo_at: Option<i64>,
 }
 
 impl AgentRow {
@@ -42,6 +52,21 @@ impl AgentRow {
     pub fn quota_ratio(&self) -> Option<f64> {
         let q = self.nic_quota_bytes.filter(|q| *q > 0)?;
         Some((self.used() as f64 / q as f64).clamp(0.0, 1.0))
+    }
+
+    /// 内存占用比例。`mem_total` 为 0 或缺失时是 `None`。
+    pub fn mem_ratio(&self) -> Option<f64> {
+        let total = self.mem_total.filter(|t| *t > 0)?;
+        let used = self.mem_used?;
+        Some((used as f64 / total as f64).clamp(0.0, 1.0))
+    }
+
+    /// 主机指标是不是还新鲜。超过 `stale_after` 秒就当作过期,界面上显示 `--`。
+    ///
+    /// 上报周期是 30s,所以门槛要留出余量 —— 卡在 30s 上会让正常的抖动
+    /// (网络慢了两秒)表现成「指标一闪一闪地消失」。
+    pub fn host_metrics_fresh(&self, now: i64, stale_after: i64) -> bool {
+        matches!(self.sysinfo_at, Some(at) if now - at <= stale_after)
     }
 }
 
@@ -155,24 +180,35 @@ impl SpeedTracker {
 }
 
 /// `agents` + `agent_nic_traffic` 的一行。
-type AgentQueryRow = (
-    i64,            // id
-    String,         // name
-    String,         // token_prefix
-    String,         // status
-    Option<String>, // agent_version
-    Option<String>, // ipv4
-    Option<String>, // ipv6
-    Option<i64>,    // nic_quota_bytes
-    Option<i64>,    // nic_reset_day
-    Option<String>, // boot_id
-    i64,            // last_rx
-    i64,            // last_tx
-    i64,            // cycle_rx
-    i64,            // cycle_tx
-    i64,            // updated_at
-    i64,            // node_count
-);
+///
+/// 用具名结构体而不是元组:sqlx 的 `FromRow` 对元组只实现到 16 元,
+/// 而这里已经贴着上限了 —— 再加一列就会撞上一个「trait 未实现」的天书报错。
+/// 具名结构体按**列名**取值,顺带把「SELECT 的列序和这里对不上」这类错也消掉了。
+#[derive(sqlx::FromRow)]
+struct AgentQueryRow {
+    id: i64,
+    name: String,
+    token_prefix: String,
+    status: String,
+    agent_version: Option<String>,
+    ipv4: Option<String>,
+    ipv6: Option<String>,
+    nic_quota_bytes: Option<i64>,
+    nic_reset_day: Option<i64>,
+    cpu_pct: Option<f64>,
+    mem_used: Option<i64>,
+    mem_total: Option<i64>,
+    load1: Option<f64>,
+    uptime_secs: Option<i64>,
+    sysinfo_at: Option<i64>,
+    boot_id: Option<String>,
+    last_rx: i64,
+    last_tx: i64,
+    cycle_rx: i64,
+    cycle_tx: i64,
+    updated_at: i64,
+    node_count: i64,
+}
 
 pub async fn load_agents(pool: &SqlitePool, speed: &mut SpeedTracker) -> Result<Vec<AgentRow>> {
     // LEFT JOIN:从没上报过的 agent 也要出现在列表里(值为 0),
@@ -180,11 +216,14 @@ pub async fn load_agents(pool: &SqlitePool, speed: &mut SpeedTracker) -> Result<
     let rows: Vec<AgentQueryRow> = sqlx::query_as(
         "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.ipv4, a.ipv6,
                 a.nic_quota_bytes, a.nic_reset_day,
+                a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
                 t.boot_id,
-                COALESCE(t.last_rx, 0), COALESCE(t.last_tx, 0),
-                COALESCE(t.cycle_rx, 0), COALESCE(t.cycle_tx, 0),
-                COALESCE(t.updated_at, 0),
-                (SELECT COUNT(*) FROM nodes n WHERE n.agent_id = a.id)
+                COALESCE(t.last_rx, 0)    AS last_rx,
+                COALESCE(t.last_tx, 0)    AS last_tx,
+                COALESCE(t.cycle_rx, 0)   AS cycle_rx,
+                COALESCE(t.cycle_tx, 0)   AS cycle_tx,
+                COALESCE(t.updated_at, 0) AS updated_at,
+                (SELECT COUNT(*) FROM nodes n WHERE n.agent_id = a.id) AS node_count
            FROM agents a
            LEFT JOIN agent_nic_traffic t ON t.agent_id = a.id
           ORDER BY a.id",
@@ -196,24 +235,30 @@ pub async fn load_agents(pool: &SqlitePool, speed: &mut SpeedTracker) -> Result<
         .into_iter()
         .map(|r| {
             let (up, down) = speed.feed(
-                r.0,
-                NicSample { rx: r.10, tx: r.11, at: r.14, boot_id: r.9.clone() },
+                r.id,
+                NicSample { rx: r.last_rx, tx: r.last_tx, at: r.updated_at, boot_id: r.boot_id },
             );
             AgentRow {
-                id: r.0,
-                name: r.1,
-                token_prefix: r.2,
-                status: r.3,
-                agent_version: r.4,
-                ipv4: r.5,
-                ipv6: r.6,
-                nic_quota_bytes: r.7,
-                nic_reset_day: r.8,
-                cycle_rx: r.12,
-                cycle_tx: r.13,
+                id: r.id,
+                name: r.name,
+                token_prefix: r.token_prefix,
+                status: r.status,
+                agent_version: r.agent_version,
+                ipv4: r.ipv4,
+                ipv6: r.ipv6,
+                nic_quota_bytes: r.nic_quota_bytes,
+                nic_reset_day: r.nic_reset_day,
+                cycle_rx: r.cycle_rx,
+                cycle_tx: r.cycle_tx,
                 up_per_sec: up,
                 down_per_sec: down,
-                node_count: r.15,
+                node_count: r.node_count,
+                cpu_pct: r.cpu_pct,
+                mem_used: r.mem_used,
+                mem_total: r.mem_total,
+                load1: r.load1,
+                uptime_secs: r.uptime_secs,
+                sysinfo_at: r.sysinfo_at,
             }
         })
         .collect())
@@ -395,6 +440,12 @@ mod tests {
             up_per_sec: None,
             down_per_sec: None,
             node_count: 0,
+            cpu_pct: None,
+            mem_used: None,
+            mem_total: None,
+            load1: None,
+            uptime_secs: None,
+            sysinfo_at: None,
         };
         assert_eq!(a.quota_ratio(), None, "不限流量时不该有比例(否则会画出 0% 的条)");
         a.nic_quota_bytes = Some(0);
