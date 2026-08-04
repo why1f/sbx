@@ -168,12 +168,30 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 这几条 glob **必须互不重叠**。原来写的是
+      #   dist/sbx-agent-*  +  dist/*.sha256
+      # 两条都能匹配 sbx-agent-<tag>-linux-{amd64,arm64}.sha256,同一个文件在
+      # 上传列表里出现两次。action-gh-release 是 Promise.all 并发上传的:两次上传
+      # 各自先查「同名资产存在吗」都答不存在,然后一起 POST,后到的那个吃
+      # 422 already_exists —— 整步就红了。谁先谁后看网络,所以它是**偶发**的,
+      # 前九次发版都没炸,v0.3.2 炸了。
+      #
+      # 改法是让每个文件只被一条 glob 命中:
+      #   *.tar.gz         只吃两个主控包(不吃 .tar.gz.sha256,glob 锚在结尾)
+      #   *.tar.gz.sha256  只吃这两个包的校验和
+      #   sbx-agent-v*     只吃 agent 裸二进制和它的 .sha256
+      #                    (sbx-agent.service 是点不是横杠,不会被误伤)
+      # 一共十个资产,和 v0.3.1 对得上。
+      #
+      # fail_on_unmatched_files:glob 收窄了,以后谁改了打包步骤的文件名,
+      # 这里就该红,而不是默默发一个少几个资产的 release(默认只 warn)。
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
-            dist/sbx-agent-*
-            dist/*.sha256
+            dist/*.tar.gz.sha256
+            dist/sbx-agent-v*
             dist/agent.example.toml
             dist/sbx-agent.service
+          fail_on_unmatched_files: true
           generate_release_notes: true
