@@ -57,7 +57,7 @@ GPL 的传染范围是「衍生作品」,而网络通信不构成链接。
 | Telegram 通知(§9.1) | ✅ 已完成,单实例租约 + 阈值告警去重 + 定时播报 |
 | §13.2 / §13.3 端到端 | ✅ **已在真实 ARM Linux 上跑通**(1 主控 + 2 agent + 真流量) |
 
-Rust 侧 382 个测试通过(`cargo test`),
+Rust 侧 383 个测试通过(`cargo test`),
 Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 **含 `-race`**,已在 Linux ARM 上跑过)。
 
@@ -122,7 +122,7 @@ curl -fsSL .../install.sh | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' S
 ## 已经能跑的东西
 
 ```sh
-cargo test                      # 382 个测试
+cargo test                      # 383 个测试
 cargo build --release           # 产物 target/release/sbx
 
 # 建库 + 加一台被控服务器 + 启动主控

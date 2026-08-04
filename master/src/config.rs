@@ -364,4 +364,40 @@ listen = "127.0.0.1:18081"
         let out = replace_in_toml("[db]\n", "db", "path", &toml_string("C:\\a\"b"));
         assert_eq!(Config::parse(&out).unwrap().db.path, "C:\\a\"b");
     }
+
+    /// 对着**真的那个文件**跑一遍:`packaging/config.example.toml` 就是
+    /// 装完之后人手里的那份,设置页要改的也正是它这个形状。
+    ///
+    /// 拿一个手写的小样本测不够 —— 真文件里有整段注释、注释掉的样例行、
+    /// 空行分节,这些恰恰是行级替换最容易踩的地方。
+    #[test]
+    fn editing_the_real_example_config_keeps_every_comment() {
+        let text = include_str!("../../packaging/config.example.toml");
+        let comments_before = text.lines().filter(|l| l.trim_start().starts_with('#')).count();
+        assert!(comments_before > 10, "样例配置本来就该有大量注释");
+
+        // 依次改几项,模拟人在设置页里连着改。
+        let mut out = text.to_string();
+        for (section, key, value) in [
+            ("subscription", "public_base", "\"https://sub.example.com\""),
+            ("cluster", "heartbeat_secs", "15"),
+            ("telegram", "enabled", "true"),
+            ("telegram", "admin_chat_ids", "[123, 456]"),
+        ] {
+            out = replace_in_toml(&out, section, key, value);
+        }
+
+        let comments_after = out.lines().filter(|l| l.trim_start().starts_with('#')).count();
+        assert_eq!(comments_after, comments_before, "注释被抹掉了:\n{out}");
+
+        let c = Config::parse(&out).expect("改完必须还能解析");
+        assert_eq!(c.subscription.public_base, "https://sub.example.com");
+        assert_eq!(c.cluster.heartbeat_secs, 15);
+        assert!(c.telegram.enabled);
+        assert_eq!(c.telegram.admin_chat_ids, vec![123, 456]);
+        // 没碰的项要保持原样。
+        let orig = Config::parse(text).unwrap();
+        assert_eq!(c.cluster.listen, orig.cluster.listen);
+        assert_eq!(c.db.path, orig.db.path);
+    }
 }
