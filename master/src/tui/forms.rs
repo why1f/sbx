@@ -61,25 +61,28 @@ fn protocol_names() -> Vec<String> {
 /// 主控只知道自己 `listen` 在 `0.0.0.0:18443`,不知道被控机该往哪个地址回连
 /// (公网 IP、内网 IP、还是一个域名),这件事只有人知道。
 pub fn agent_add(default_host: &str) -> Modal {
-    Modal::Form(Form::new(
-        "新增被控服务器",
-        vec![
-            Field::text("name", "名称", "", "例如 tokyo-1;只是给人看的标识,须唯一"),
-            Field::text(
-                "host",
-                "主控地址",
-                default_host,
-                "被控机回连主控用的 IP 或域名,不含端口。留空则命令里给占位符",
-            ),
-        ],
-        Box::new(|f| {
-            let name = val(f, "name");
-            if name.is_empty() {
-                return Err("名称不能为空".into());
-            }
-            Ok(Action::AddAgent { name, host: val(f, "host") })
-        }),
-    ))
+    Modal::Form(
+        Form::new(
+            "新增被控服务器",
+            vec![
+                Field::text("name", "名称 *必填", ""),
+                Field::text("host", "主控地址 (IP 或域名,不含端口)", default_host),
+            ],
+            Box::new(|f| {
+                let name = val(f, "name");
+                if name.is_empty() {
+                    return Err("名称不能为空".into());
+                }
+                Ok(Action::AddAgent { name, host: val(f, "host") })
+            }),
+        )
+        .with_note(Box::new(|_| {
+            vec![
+                "名称只是给人看的标识(例 tokyo-1),须唯一。".into(),
+                "主控地址是被控机回连用的,留空则命令里给一个占位符。".into(),
+            ]
+        })),
+    )
 }
 
 // ─────────────────────────── 节点 ───────────────────────────
@@ -92,15 +95,15 @@ pub fn node_add(agents: &[AgentRow], preselect: usize) -> Modal {
     let form = Form::new(
         "新增节点",
         vec![
-            Field::select("agent", "所属服务器", names, preselect, "在哪台被控机上建这个 inbound"),
-            Field::text("tag", "Tag", "", "同一台机器内唯一;也是 (用户, tag) 记账口径的一半(§7.1)"),
-            Field::select("proto", "协议", protocol_names(), 0, "八选一,←/→ 切换"),
-            Field::text("port", "监听端口", "443", "1-65535;同一台机器上别和已有服务撞"),
-            Field::text("sni", "server_name", "", "留空按协议取默认(reality → www.apple.com)"),
-            Field::text("path", "path", "", "留空取 /vless 或 /vmess"),
-            Field::toggle("ipv6", "订阅优先 IPv6", false, "订阅导出这个节点时优先用 agent 的 IPv6 地址"),
-            Field::text("relay_host", "中转地址", "", "留空 = 不中转。只改订阅里导出的落点,不动 inbound"),
-            Field::text("relay_port", "中转端口", "", "留空则沿用上面的监听端口"),
+            Field::select("agent", "所属服务器 (←/→ 切换)", names, preselect),
+            Field::text("tag", "Tag *必填", ""),
+            Field::select("proto", "协议 (←/→ 切换)", protocol_names(), 0),
+            Field::text("port", "监听端口 *必填", "443"),
+            Field::text("sni", "server_name (SNI,留空取默认)", ""),
+            Field::text("path", "path (留空取默认)", ""),
+            Field::toggle("ipv6", "订阅优先 IPv6 (空格切换)", false),
+            Field::text("relay_host", "中转地址 (例 1.2.3.4 / relay.com)", ""),
+            Field::text("relay_port", "中转端口 (例 12345)", ""),
         ],
         Box::new(move |f| {
             let i = f.iter().find(|x| x.key == "agent").map(|x| x.index()).unwrap_or(0);
@@ -116,11 +119,19 @@ pub fn node_add(agents: &[AgentRow], preselect: usize) -> Modal {
     )
     .visible_when(Box::new(|fields, f| field_applies(Protocol::parse(&val(fields, "proto")), f.key)))
     .with_note(Box::new(|fields| {
-        vec![protocol_note(Protocol::parse(&val(fields, "proto"))).into()]
+        let mut v = vec![TAG_NOTE.to_string()];
+        v.push(protocol_note(Protocol::parse(&val(fields, "proto"))).into());
+        v.push(RELAY_NOTE.into());
+        v
     }));
 
     Modal::Form(form)
 }
+
+/// Tag 的含义装不进标签的括号里,但它是这张表单里最容易随手填错的一项。
+const TAG_NOTE: &str = "Tag:同一台机器内唯一,建好之后不能改 —— 它是 (用户, tag) 记账口径的一半(§7.1)。";
+/// 中转的语义同理 —— 三种取值组合各是什么意思,一行括号写不下。
+const RELAY_NOTE: &str = "中转:地址留空 = 不启用;只填地址则沿用监听端口。只改订阅导出的落点,不动 inbound。";
 
 /// 编辑节点。
 ///
@@ -136,17 +147,12 @@ pub fn node_edit(n: &NodeRow) -> Modal {
     let form = Form::new(
         "编辑节点",
         vec![
-            Field::text("port", "监听端口", &n.listen_port.to_string(), "1-65535"),
-            Field::text(
-                "sni",
-                "server_name",
-                n.params.server_name.as_deref().unwrap_or(""),
-                "改它不会重签证书:自签证书的 CN 是建节点时定的,客户端本来就走 insecure",
-            ),
-            Field::text("path", "path", n.params.path.as_deref().unwrap_or(""), "WebSocket 路径"),
-            Field::toggle("ipv6", "订阅优先 IPv6", n.params.ipv6, "订阅导出这个节点时优先用 agent 的 IPv6"),
-            Field::text("relay_host", "中转地址", &n.params.relay.host, "留空 = 不中转"),
-            Field::text("relay_port", "中转端口", &relay_port, "留空则沿用监听端口"),
+            Field::text("port", "监听端口 *必填", &n.listen_port.to_string()),
+            Field::text("sni", "server_name (SNI)", n.params.server_name.as_deref().unwrap_or("")),
+            Field::text("path", "path", n.params.path.as_deref().unwrap_or("")),
+            Field::toggle("ipv6", "订阅优先 IPv6 (空格切换)", n.params.ipv6),
+            Field::text("relay_host", "中转地址 (例 1.2.3.4 / relay.com)", &n.params.relay.host),
+            Field::text("relay_port", "中转端口 (例 12345)", &relay_port),
         ],
         Box::new(move |f| {
             let mut draft = draft_from(f, agent_id)?;
@@ -159,9 +165,21 @@ pub fn node_edit(n: &NodeRow) -> Modal {
         n.id, n.tag, n.protocol, n.agent_name
     ))
     .visible_when(Box::new(move |_, f| field_applies(proto, f.key)))
-    .with_note(Box::new(move |_| vec![protocol_note(proto).into()]));
+    .with_note(Box::new(move |_| {
+        let mut v = vec![protocol_note(proto).to_string()];
+        if uses_sni(proto) && needs_cert(proto) {
+            v.push("改 server_name 不会重签证书:CN 是建节点时定的,客户端本来就走 insecure。".into());
+        }
+        v.push(RELAY_NOTE.into());
+        v
+    }));
 
     Modal::Form(form)
+}
+
+/// 会生成自签证书的协议。改 `server_name` 时要提醒一句证书不会跟着重签。
+fn needs_cert(p: Protocol) -> bool {
+    matches!(p, Protocol::Trojan | Protocol::Tuic | Protocol::Anytls | Protocol::Hysteria2)
 }
 
 /// 某个字段在当前协议下是否有意义。新增与编辑共用一份判定。
@@ -216,20 +234,28 @@ fn none_if_empty(s: String) -> Option<String> {
 // ─────────────────────────── 用户 ───────────────────────────
 
 pub fn user_add() -> Modal {
-    Modal::Form(Form::new(
-        "新增用户",
-        vec![
-            Field::text("name", "名称", "", "唯一;也是 sing-box inbound 里的用户名"),
-            Field::text("quota", "配额 GB", "0", "0 = 不限流量"),
-        ],
-        Box::new(|f| {
-            let name = val(f, "name");
-            if name.is_empty() {
-                return Err("名称不能为空".into());
-            }
-            Ok(Action::AddUser { name, quota_gb: val(f, "quota") })
-        }),
-    ))
+    Modal::Form(
+        Form::new(
+            "新增用户",
+            vec![
+                Field::text("name", "名称 *必填", ""),
+                Field::text("quota", "配额 GB (0 = 不限)", "0"),
+            ],
+            Box::new(|f| {
+                let name = val(f, "name");
+                if name.is_empty() {
+                    return Err("名称不能为空".into());
+                }
+                Ok(Action::AddUser { name, quota_gb: val(f, "quota") })
+            }),
+        )
+        .with_note(Box::new(|_| {
+            vec![
+                "名称唯一,也是 inbound 里的用户名,建好之后不能改。".into(),
+                "建完记得按 [n] 分配节点:没分配节点的用户,订阅是空的。".into(),
+            ]
+        })),
+    )
 }
 
 /// 编辑用户的计费属性。名字不可改 —— 它是 inbound 里的用户标识,
@@ -249,15 +275,10 @@ pub fn user_edit(u: &UserRow) -> Modal {
         Form::new(
             "编辑用户",
             vec![
-                Field::text("quota", "配额 GB", &quota_gb, "0 = 不限流量"),
-                Field::text(
-                    "mult",
-                    "计费倍率",
-                    &format!("{:.1}", u.traffic_multiplier),
-                    "计费用量 = (上行 + 下行) × 倍率。1.0 = 按实际,2.0 = 双倍",
-                ),
-                Field::text("expire", "到期", &expire, "YYYY-MM-DD;留空 = 永久。当天 23:59:59 到期"),
-                Field::text("reset", "重置日", &reset, "1-31,每月这天清零本周期用量;留空 = 不重置"),
+                Field::text("quota", "配额 GB (0 = 不限)", &quota_gb),
+                Field::text("mult", "计费倍率 (1.0 按实际 / 2.0 双倍)", &format!("{:.1}", u.traffic_multiplier)),
+                Field::text("expire", "到期 (YYYY-MM-DD,留空 = 永久)", &expire),
+                Field::text("reset", "重置日 (1-31,留空 = 不重置)", &reset),
             ],
             Box::new(move |f| {
                 Ok(Action::EditUser {
@@ -270,14 +291,12 @@ pub fn user_edit(u: &UserRow) -> Modal {
                 })
             }),
         )
-        .head(format!(
-            "#{} {}(名字不可改:它是 inbound 里的用户标识,改了历史流量会对不上)",
-            u.id, u.name
-        ))
+        .head(format!("#{} {}(名字不可改:它是 inbound 里的用户标识)", u.id, u.name))
         .with_note(Box::new(|_| {
             vec![
-                "配额/到期只被 §6.3 的巡检读,不进 sing-box 配置 —— 改它不会重建 box。".into(),
-                "把配额调大之后,原先因超额被系统停用的用户会在下一次巡检时自动放出来。".into(),
+                "计费用量 = (上行 + 下行) × 倍率;到期按当天 23:59:59 算。".into(),
+                "这四项不进 sing-box 配置,改它不会重建 box,下次巡检(30s)时生效。".into(),
+                "把配额调大之后,原先因超额被系统停用的用户会自动放出来。".into(),
             ]
         })),
     )
@@ -460,18 +479,18 @@ mod tests {
     #[test]
     fn relay_port_without_a_host_is_rejected() {
         let f = vec![
-            Field::text("port", "", "443", ""),
-            Field::text("relay_host", "", "", ""),
-            Field::text("relay_port", "", "12345", ""),
+            Field::text("port", "", "443"),
+            Field::text("relay_host", "", ""),
+            Field::text("relay_port", "", "12345"),
         ];
         let err = draft_from(&f, 1).unwrap_err();
         assert!(err.contains("中转地址"), "{err}");
 
         // 两项都留空 = 不中转,正常通过。
         let f = vec![
-            Field::text("port", "", "443", ""),
-            Field::text("relay_host", "", "", ""),
-            Field::text("relay_port", "", "", ""),
+            Field::text("port", "", "443"),
+            Field::text("relay_host", "", ""),
+            Field::text("relay_port", "", ""),
         ];
         let d = draft_from(&f, 1).unwrap();
         assert!(d.relay_host.is_empty() && d.relay_port.is_none());
@@ -480,8 +499,100 @@ mod tests {
     #[test]
     fn port_must_be_a_valid_number() {
         for bad in ["", "0", "70000", "四四三"] {
-            let f = vec![Field::text("port", "", bad, "")];
+            let f = vec![Field::text("port", "", bad)];
             assert!(draft_from(&f, 1).is_err(), "端口 {bad:?} 应当被拒");
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::tui::modal;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// 把每个二级页面画出来打到 stdout,给人看一眼:
+    ///
+    /// ```sh
+    /// cargo test tui::forms::preview -- --nocapture
+    /// ```
+    ///
+    /// 「留白太多、太散」这类问题读代码看不出来,必须看渲染结果。
+    #[test]
+    fn all_forms() {
+        let agents = vec![crate::tui::data::AgentRow {
+            id: 1,
+            name: "azure".into(),
+            token_prefix: "abcd1234".into(),
+            status: "online".into(),
+            agent_version: Some("v0.2.1".into()),
+            ipv4: Some("203.0.113.8".into()),
+            ipv6: None,
+            nic_quota_bytes: None,
+            nic_reset_day: None,
+            cycle_rx: 0,
+            cycle_tx: 0,
+            up_per_sec: None,
+            down_per_sec: None,
+            node_count: 1,
+            cpu_pct: None,
+            mem_used: None,
+            mem_total: None,
+            load1: None,
+            uptime_secs: None,
+            sysinfo_at: None,
+        }];
+        let node = NodeRow {
+            id: 1,
+            agent_id: 1,
+            agent_name: "azure".into(),
+            tag: "vless".into(),
+            protocol: "vless-reality".into(),
+            listen_port: 443,
+            user_count: 0,
+            params: crate::model::node::NodeParams {
+                server_name: Some("www.apple.com".into()),
+                ..Default::default()
+            },
+        };
+        let user = UserRow {
+            id: 1,
+            name: "alice".into(),
+            enabled: true,
+            auto_disabled: false,
+            quota_bytes: 100 * 1_073_741_824,
+            cycle_up: 0,
+            cycle_down: 0,
+            traffic_multiplier: 1.0,
+            expire_at: None,
+            reset_day: Some(22),
+            node_ids: vec![1],
+            sub_token: "tok".into(),
+        };
+
+        for (name, m) in [
+            ("新增节点", node_add(&agents, 0)),
+            ("编辑节点", node_edit(&node)),
+            ("新增用户", user_add()),
+            ("编辑用户", user_edit(&user)),
+            ("新增被控服务器", agent_add("203.0.113.8")),
+            ("分配节点", assign_nodes(&user, std::slice::from_ref(&node))),
+        ] {
+            let mut term = Terminal::new(TestBackend::new(116, 30)).unwrap();
+            term.draw(|f| modal::render(f, f.area(), &m)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let out: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .filter(|l| !l.is_empty())
+                .collect();
+            println!("── {name} ──\n{}\n", out.join("\n"));
         }
     }
 }

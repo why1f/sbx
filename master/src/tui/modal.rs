@@ -23,7 +23,7 @@
 //! 明文关掉就再也拿不回来了(§8.1)。所以它必须**显式**告诉人这件事。
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -95,29 +95,27 @@ pub struct Field {
     /// 给 `build` / `visible` 闭包按名字取值用。用下标取值的话,
     /// 中间插一个字段就会静默改掉后面每一个的含义。
     pub key: &'static str,
+    /// **提示写在标签里**,不再单独占一行(`端口 *必填 (默认 443)`)。
+    ///
+    /// 早先每个字段是「标签 / 灰色提示 / 空行」三行,八九个字段就把弹窗撑到快满屏,
+    /// 读起来是散的:视线要跨过两行才能从一个输入框走到下一个。
+    /// 装不进括号的长说明放到表单底部的说明区(`Form::with_note`)。
     pub label: String,
-    /// 灰色提示,写清默认值或格式。表单里最贵的错误是「填错了但看起来像对的」。
-    pub hint: String,
     pub kind: FieldKind,
 }
 
 impl Field {
-    pub fn text(key: &'static str, label: &str, value: &str, hint: &str) -> Self {
-        Self {
-            key,
-            label: label.into(),
-            hint: hint.into(),
-            kind: FieldKind::Text { value: value.into() },
-        }
+    pub fn text(key: &'static str, label: &str, value: &str) -> Self {
+        Self { key, label: label.into(), kind: FieldKind::Text { value: value.into() } }
     }
 
-    pub fn select(key: &'static str, label: &str, options: Vec<String>, idx: usize, hint: &str) -> Self {
+    pub fn select(key: &'static str, label: &str, options: Vec<String>, idx: usize) -> Self {
         let idx = if options.is_empty() { 0 } else { idx.min(options.len() - 1) };
-        Self { key, label: label.into(), hint: hint.into(), kind: FieldKind::Select { options, idx } }
+        Self { key, label: label.into(), kind: FieldKind::Select { options, idx } }
     }
 
-    pub fn toggle(key: &'static str, label: &str, on: bool, hint: &str) -> Self {
-        Self { key, label: label.into(), hint: hint.into(), kind: FieldKind::Toggle { on } }
+    pub fn toggle(key: &'static str, label: &str, on: bool) -> Self {
+        Self { key, label: label.into(), kind: FieldKind::Toggle { on } }
     }
 
     /// 当前值的字符串形式。`Toggle` 给的是**显示用**的「开/关」,
@@ -279,7 +277,17 @@ pub enum Modal {
     Form(Form),
     Picker(Picker),
     Confirm { title: String, body: Vec<String>, action: Action },
-    Info { title: String, body: Vec<String> },
+    Info {
+        title: String,
+        body: Vec<String>,
+        /// 按 `y` 要复制走的东西。`None` = 这个框里没什么值得复制的。
+        ///
+        /// 接入命令那种两百多字符、还带着 token 的东西,用鼠标跨行选中很容易
+        /// 漏掉一截或多带一个换行,而漏一截的表现是「粘过去跑了一半」。
+        copy: Option<String>,
+        /// 复制之后的回执,渲染在框里。
+        copied: Option<String>,
+    },
 }
 
 /// 一次按键之后弹窗该怎么办。
@@ -298,7 +306,12 @@ impl Modal {
     }
 
     pub fn info(title: &str, body: Vec<String>) -> Self {
-        Modal::Info { title: title.into(), body }
+        Modal::Info { title: title.into(), body, copy: None, copied: None }
+    }
+
+    /// 带一键复制的信息框。`copy` 是按 `y` 时发给终端的内容。
+    pub fn info_copyable(title: &str, body: Vec<String>, copy: impl Into<String>) -> Self {
+        Modal::Info { title: title.into(), body, copy: Some(copy.into()), copied: None }
     }
 
     /// 处理一次按键。**弹窗打开时主循环把全部按键都交给这里** ——
@@ -306,8 +319,23 @@ impl Modal {
     pub fn handle(&mut self, k: crossterm::event::KeyEvent) -> Outcome {
         use crossterm::event::KeyCode;
         match self {
-            // 只读信息框:任意键关掉。
-            Modal::Info { .. } => Outcome::Close(None),
+            // 只读信息框:`y` 复制,其它键关掉。
+            //
+            // 复制**不关窗**:OSC 52 没有回执(见 clip.rs),关掉的话人根本不知道
+            // 刚才那一下有没有生效。留着并显示一行回执,至少能看出程序确实做了动作。
+            Modal::Info { copy, copied, .. } => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if copy.is_some() => {
+                    let text = copy.clone().unwrap_or_default();
+                    *copied = Some(match super::clip::copy(&text) {
+                        Ok(()) => "已发给终端(OSC 52)。终端不支持的话这一下不会有任何效果 —— \
+                                   那就用鼠标选中复制,或者在主控上跑 sbx agent-add 从普通终端里复制。"
+                            .into(),
+                        Err(e) => format!("复制失败:{e}"),
+                    });
+                    Outcome::Stay
+                }
+                _ => Outcome::Close(None),
+            },
 
             // 删除类操作只认 y。其它键一律当取消 —— 不该有「手滑确认」的可能。
             Modal::Confirm { action, .. } => match k.code {
@@ -446,59 +474,128 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
             );
         }
 
-        Modal::Info { title, body } => {
-            let rect = centered(area, 84, 60, 50, body.len() as u16 + 4);
+        Modal::Info { title, body, copy, copied } => {
+            let w = (area.width * 84 / 100).clamp(50, 110).min(area.width.max(1));
+            let inner = (w as usize).saturating_sub(6);
+            // 接入命令有两百多字符,一定会折行。自己折才能把折出来的行数
+            // 算进高度 —— 交给 Wrap 的话框底下会被裁掉,命令只剩前两行。
+            let wrapped: Vec<Vec<String>> = body.iter().map(|l| theme::wrap(l, inner)).collect();
+            let n: usize = wrapped.iter().map(|l| l.len()).sum();
+            let extra = 4 + u16::from(copied.is_some()) * 3;
+            let h = (n as u16 + extra).min(area.height.max(1));
+            let rect = centered(area, 0, 0, w, h);
             f.render_widget(Clear, rect);
-            let mut lines: Vec<Line> = body.iter().map(|l| Line::from(format!("  {l}"))).collect();
+
+            let mut lines: Vec<Line> = Vec::new();
+            for seg in wrapped.iter().flatten() {
+                lines.push(Line::from(format!("  {seg}")));
+            }
+            if let Some(msg) = copied {
+                lines.push(Line::from(""));
+                for seg in theme::wrap(msg, inner) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {seg}"),
+                        Style::default().fg(theme::ONLINE),
+                    )));
+                }
+            }
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("  [任意键]关闭", Style::default().fg(theme::DIM))));
+            lines.push(Line::from(Span::styled(
+                if copy.is_some() { "  [y]复制到剪贴板  [任意键]关闭" } else { "  [任意键]关闭" },
+                Style::default().fg(theme::DIM),
+            )));
             f.render_widget(
-                Paragraph::new(lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!(" {title} "))
-                            .border_style(Style::default().fg(theme::ACCENT)),
-                    )
-                    .alignment(Alignment::Left)
-                    .wrap(Wrap { trim: false }),
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!(" {title} "))
+                        .border_style(Style::default().fg(theme::ACCENT)),
+                ),
                 rect,
             );
         }
     }
 }
 
+/// 表单底部那行按键提示。做成常量是为了能把它的宽度算进弹窗宽度 ——
+/// 它比大多数字段都长,不算进去就会被切成「[Esc]取」。
+const FORM_HINT: &str = "[Tab/↑↓]切换  [←→]改选项  [空格]开关  [Enter]确定  [Esc]取消";
+const PICKER_HINT: &str = "[↑↓/jk]移动  [空格]勾选  [a]全选/全不选  [Enter]保存  [Esc]取消";
+
 fn render_form(f: &mut Frame, area: Rect, form: &Form) {
     let shown = form.shown();
-    let notes = (form.note)(&form.fields);
 
-    // 高度按**实际内容**算。写死行数的话,加一个字段就会被静默裁掉 ——
-    // 表单里少一行的表现是「那个字段填不了」,而不是「界面短了一点」。
-    let h = shown.len() as u16 * 3
-        + notes.len() as u16
-        + u16::from(form.head.is_some()) * 2
+    // 标签列按**最长的可见标签**对齐,所有取值就落在同一竖线上。
+    // 夹上下限:太窄挤在一起,太宽会把取值推到屏幕右边。
+    let label_w = shown
+        .iter()
+        .map(|i| theme::cols(&form.fields[*i].label))
+        .max()
+        .unwrap_or(16)
+        .clamp(14, 34);
+
+    let raw_notes = (form.note)(&form.fields);
+    // 宽度按**内容**给,不按百分比:百分比在宽屏上会拉出一个空荡荡的大框,
+    // 而窄一点的框会把说明和按键提示切掉。三样都要塞得进去:
+    // 字段行、说明行、底部按键提示。
+    let widest_note = raw_notes.iter().map(|n| theme::cols(n.trim())).max().unwrap_or(0);
+    let w = (label_w as u16 + 44)
+        .max(widest_note as u16 + 8)
+        .max(theme::cols(FORM_HINT) as u16 + 4)
+        .clamp(50, 84)
+        .min(area.width.max(1));
+    // 左右边框 + 续行的缩进。说明区**自己折行**,交给 ratatui 的 Wrap 的话行数
+    // 算不进下面的高度,底下几条会被静默裁掉(theme::wrap 的文档里有原委)。
+    let inner = (w as usize).saturating_sub(6);
+
+    let head: Vec<String> =
+        form.head.as_deref().map(|h| theme::wrap(h, inner)).unwrap_or_default();
+    let notes: Vec<Vec<String>> =
+        raw_notes.iter().map(|n| theme::wrap(n.trim(), inner)).collect();
+    let note_lines: usize = notes.iter().map(|n| n.len()).sum();
+
+    // 每个字段**两行**:标签 + 取值一行,再空一行。
+    // 以前提示单独占第三行,八九个字段就把弹窗撑到快满屏 —— 视线要跨过两行
+    // 才能从一个输入框走到下一个,读起来是散的。提示现在并进标签或落到底部。
+    //
+    // 末尾 +3 = 上下边框 2 + 按键提示 1。字段那一段自带尾随空行,不用再留。
+    let h = shown.len() as u16 * 2
+        + note_lines as u16
+        + head.len() as u16
+        + u16::from(!head.is_empty())
         + u16::from(form.error.is_some())
-        + 4;
-    let rect = centered(area, 66, 70, 46, h.max(9));
+        + 3;
+
+    let rect = centered(area, 0, 0, w, h.max(7));
     f.render_widget(Clear, rect);
 
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(head) = &form.head {
+    for (i, seg) in head.iter().enumerate() {
         lines.push(Line::from(Span::styled(
-            format!("  {head}"),
+            format!("{}{seg}", if i == 0 { "  " } else { "    " }),
             Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
         )));
+    }
+    if !head.is_empty() {
         lines.push(Line::from(""));
     }
 
     for i in shown {
         let fld = &form.fields[i];
         let focused = i == form.focus;
-        let marker = if focused { "▸ " } else { "  " };
+        // 聚焦的取值用反白底,和旧项目 `tui/forms.rs` 是同一套观感 ——
+        // 只靠一个箭头标记的话,在一屏九个字段里很难一眼看出焦点在哪。
+        let value_style = if focused {
+            Style::default().fg(Color::Black).bg(theme::ACCENT)
+        } else if fld.is_on() {
+            Style::default().fg(theme::ONLINE)
+        } else {
+            Style::default()
+        };
         let label_style = if focused {
             Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().add_modifier(Modifier::BOLD)
+            Style::default().fg(theme::ACCENT)
         };
 
         let value: Vec<Span> = match &fld.kind {
@@ -507,57 +604,67 @@ fn render_form(f: &mut Frame, area: Rect, form: &Form) {
                 let arrow = if focused { theme::ACCENT } else { theme::DIM };
                 vec![
                     Span::styled("◀ ", Style::default().fg(arrow)),
-                    Span::styled(
-                        fld.value(),
-                        Style::default().fg(if fld.is_on() { theme::ONLINE } else { Color::Reset }),
-                    ),
+                    Span::styled(fld.value(), value_style),
                     Span::styled(" ▶", Style::default().fg(arrow)),
                 ]
             }
             FieldKind::Text { value } => {
-                let mut v = vec![Span::raw(value.clone())];
-                if focused {
-                    v.push(Span::styled("█", Style::default().fg(theme::ACCENT)));
-                }
-                v
+                let cursor = if focused { "_" } else { "" };
+                vec![Span::styled(format!(" {value}{cursor}  "), value_style)]
             }
         };
 
         let mut row = vec![
-            Span::styled(marker, Style::default().fg(theme::ACCENT)),
-            Span::styled(format!("{}: ", fld.label), label_style),
+            Span::styled(if focused { " ▸ " } else { "   " }, Style::default().fg(theme::ACCENT)),
+            Span::styled(theme::pad(&fld.label, label_w), label_style),
+            Span::raw(" "),
         ];
         row.extend(value);
         lines.push(Line::from(row));
-        lines.push(Line::from(Span::styled(
-            format!("    {}", fld.hint),
-            Style::default().fg(theme::DIM),
-        )));
         lines.push(Line::from(""));
     }
 
-    for n in &notes {
-        lines.push(Line::from(Span::styled(format!("  {n}"), Style::default().fg(theme::DIM))));
+    for note in &notes {
+        for (i, seg) in note.iter().enumerate() {
+            // 续行多缩进两格,免得和下一条说明的开头长得一样。
+            lines.push(Line::from(Span::styled(
+                format!("{}{seg}", if i == 0 { "  " } else { "    " }),
+                Style::default().fg(theme::DIM),
+            )));
+        }
     }
     if let Some(e) = &form.error {
         lines.push(Line::from(Span::styled(format!("  ! {e}"), Style::default().fg(Color::Red))));
     }
     lines.push(Line::from(Span::styled(
-        "  [Tab/↑↓]切换字段  [←→]改选项  [空格]开关  [Enter]确定  [Esc]取消",
+        format!("  {FORM_HINT}"),
         Style::default().fg(theme::DIM),
     )));
 
     f.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", form.title)))
-            .wrap(Wrap { trim: false }),
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", form.title))),
         rect,
     );
 }
 
 fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
-    let h = p.items.len().max(1) as u16 + 7;
-    let rect = centered(area, 66, 70, 46, h.min(area.height.max(1)));
+    // 宽度按最长的一项给,高度按实际条数给。用百分比的话,
+    // 一个只有一行的多选框会在高屏幕上撑成一个大空框。
+    let widest = p
+        .items
+        .iter()
+        .map(|i| theme::cols(&i.label).min(24) + theme::cols(&i.note) + 10)
+        .max()
+        .unwrap_or(0);
+    let w = (widest as u16)
+        .max(theme::cols(&p.head) as u16 + 6)
+        .max(theme::cols(PICKER_HINT) as u16 + 4)
+        .clamp(50, 92)
+        .min(area.width.max(1));
+    // 标题 1 + 空行 1 + 条目 n + 空行 1 + 提示 1 + 上下边框 2。
+    let h = (p.items.len().max(1) as u16 + 6).min(area.height.max(1));
+    let rect = centered(area, 0, 0, w, h);
     f.render_widget(Clear, rect);
 
     let mut lines: Vec<Line> = vec![
@@ -595,14 +702,13 @@ fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [↑↓/jk]移动  [空格]勾选  [a]全选/全不选  [Enter]保存  [Esc]取消",
+        format!("  {PICKER_HINT}"),
         Style::default().fg(theme::DIM),
     )));
 
     f.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", p.title)))
-            .wrap(Wrap { trim: false }),
+            .block(Block::default().borders(Borders::ALL).title(format!(" {} ", p.title))),
         rect,
     );
 }
@@ -659,10 +765,10 @@ mod tests {
         Form::new(
             "t",
             vec![
-                Field::text("tag", "Tag", "", ""),
-                Field::select("proto", "协议", vec!["a".into(), "b".into(), "c".into()], 0, ""),
-                Field::text("sni", "SNI", "", ""),
-                Field::toggle("v6", "IPv6", false, ""),
+                Field::text("tag", "Tag", ""),
+                Field::select("proto", "协议", vec!["a".into(), "b".into(), "c".into()], 0),
+                Field::text("sni", "SNI", ""),
+                Field::toggle("v6", "IPv6", false),
             ],
             Box::new(|f| Ok(Action::DeleteUser { name: val(f, "tag") })),
         )
@@ -767,7 +873,7 @@ mod tests {
     fn failed_validation_keeps_the_form_open() {
         let mut m = Modal::Form(Form::new(
             "t",
-            vec![Field::text("name", "名称", "", "")],
+            vec![Field::text("name", "名称", "")],
             Box::new(|f| {
                 if val(f, "name").is_empty() {
                     Err("名称不能为空".into())

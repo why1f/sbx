@@ -11,6 +11,7 @@
 mod cluster;
 mod config;
 mod db;
+mod install;
 mod model;
 mod secrets;
 mod service;
@@ -184,21 +185,28 @@ async fn main() -> Result<()> {
             // 刻意用 println! 而不是 tracing —— 凭据不该进日志(§11.3)。
             println!("已添加被控服务器 #{id}:{name}");
             println!();
-            println!("连接 token(**只显示这一次**,请立刻保存):");
-            println!("    {token}");
+            println!("在被控机上跑这一条(root):");
             println!();
-            println!("在被控服务器上写入 /etc/sbx/agent.toml:");
-            println!("    server      = \"wss://<主控地址>:18443/ws\"");
-            println!("    token       = \"{token}\"");
-            println!("    fingerprint = \"<主控证书指纹,见 sbx fingerprint>\"");
+            // 命令**顶格单独一行**:它是要被鼠标选中复制走的东西,
+            // 前面加缩进会让「双击选中整行」把缩进也带上。
+            println!("{}", install::command(&cfg, &install::default_host(&cfg), Some(&token)));
+            println!();
+            for line in install::notes(&install::default_host(&cfg), true) {
+                println!("{line}");
+            }
+            println!();
+            println!("(TUI 里 [2] 服务管理页按 [a] 也能拿到同一条,并且可以按 [y] 复制。)");
         }
         Cmd::AgentRotate { id } => {
             if db::agent_repo::get(&pool, id).await?.is_none() {
                 anyhow::bail!("没有 id 为 {id} 的被控服务器");
             }
             let token = db::agent_repo::rotate_token(&pool, id).await?;
-            println!("已轮换 #{id} 的 token(旧 token 立即失效;在线连接下次重连时生效):");
-            println!("    {token}");
+            println!("已轮换 #{id} 的 token(旧 token 立即失效;在线连接下次重连时生效)。");
+            println!();
+            println!("在那台被控机上重跑这一条,旧配置会自动备份成 agent.toml.bak:");
+            println!();
+            println!("{}", install::command(&cfg, &install::default_host(&cfg), Some(&token)));
         }
         Cmd::AgentRemove { id, yes } => {
             let Some(agent) = db::agent_repo::get(&pool, id).await? else {

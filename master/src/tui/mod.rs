@@ -11,6 +11,7 @@
 //! 在线 agent 由 daemon 在下次握手或下发时同步(§4.1)。所以每个写操作之后
 //! 状态栏都会说明「什么时候生效」,免得人对着「改了但没变」发懵。
 
+mod clip;
 mod data;
 mod forms;
 mod modal;
@@ -26,6 +27,7 @@ use sqlx::SqlitePool;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::install;
 use data::SpeedTracker;
 use modal::{Action, Modal, Outcome};
 
@@ -34,10 +36,6 @@ const PAGES: [&str; 4] = ["概览", "服务管理", "节点", "用户"];
 const TICK: Duration = Duration::from_millis(1000);
 /// 概览页显示多少条事件。取够填满面板即可,查历史该用 `sqlite3`。
 const EVENT_LIMIT: i64 = 20;
-
-/// 一键安装脚本的地址。TUI 生成的接入命令要用它 ——
-/// 与 README / CHANGELOG 里那条是同一个 URL,改了要一起改。
-const INSTALL_URL: &str = "https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -358,7 +356,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
 
         Page::Agents => match k.code {
             KeyCode::Char('a') => {
-                let host = default_host(&app.cfg);
+                let host = install::default_host(&app.cfg);
                 app.modal = Some(forms::agent_add(&host));
             }
             KeyCode::Char('E') => match app.selected_agent() {
@@ -368,7 +366,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             KeyCode::Char('i') => match app.selected_agent() {
                 Some(a) => {
                     let (id, name) = (a.id, a.name.clone());
-                    return Some(Action::ShowInstall { id, name, host: default_host(&app.cfg) });
+                    return Some(Action::ShowInstall { id, name, host: install::default_host(&app.cfg) });
                 }
                 None => app.fail("没有选中任何被控服务器"),
             },
@@ -382,7 +380,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                             "已建立的连接不会被立刻踢掉,下次重连时才生效(§8.1)。".into(),
                             "新 token 只会显示这一次 —— 连同一条可以直接跑的重装命令。".into(),
                         ],
-                        Action::RotateToken { id, name, host: default_host(&app.cfg) },
+                        Action::RotateToken { id, name, host: install::default_host(&app.cfg) },
                     ));
                 } else {
                     app.fail("没有选中任何被控服务器");
@@ -513,9 +511,9 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
         Form::new(
             "编辑被控服务器",
             vec![
-                Field::text("name", "名称", &a.name, "须唯一"),
-                Field::text("quota", "网卡月配额 GB", &quota, "0 = 不限。这是**机器**进出总量,不是用户计费用量"),
-                Field::text("reset", "配额重置日", &reset, "1-31,每月这天把网卡周期用量清零;留空 = 不重置"),
+                Field::text("name", "名称 *必填", &a.name),
+                Field::text("quota", "网卡月配额 GB (0 = 不限)", &quota),
+                Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", &reset),
             ],
             Box::new(move |f| {
                 let name = val(f, "name");
@@ -534,11 +532,32 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                 })
             }),
         )
-        .head(format!("#{} {}(IP 由 agent 自探上报,在这里改会被下一次上报覆盖)", a.id, a.name))
+        .head(format!("#{} {}(IP 由 agent 自探上报,改了会被下一次上报覆盖)", a.id, a.name))
         .with_note(Box::new(|_| {
-            vec!["网卡配额只影响界面上的进度条与告警,不会限制 agent 转发流量。".into()]
+            vec![
+                "网卡配额是**机器**进出总量的口径(§6.4),不是用户计费用量。".into(),
+                "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
+            ]
         })),
     )
+}
+
+/// 接入命令的信息框:命令自己一行,底下是说明,`y` 复制整条。
+///
+/// 命令**单独占一行**放在最上面,而不是混在说明里:它是这个框存在的唯一理由,
+/// 而且是那条要被复制走的东西 —— 终端不支持 OSC 52 时人得用鼠标去选它。
+fn install_modal(
+    cfg: &Config,
+    title: &str,
+    host: &str,
+    token: Option<&str>,
+    tail: Vec<String>,
+) -> Modal {
+    let cmd = install::command(cfg, host, token);
+    let mut body = vec![cmd.clone(), String::new()];
+    body.extend(install::notes(host, token.is_some()));
+    body.extend(tail);
+    Modal::info_copyable(title, body, cmd)
 }
 
 /// 执行一个写操作。**所有错误都落到状态栏,不中断 TUI** ——
@@ -559,9 +578,12 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         Action::AddAgent { name, host } => {
             let (id, token) = agent_repo::create(&app.pool, name, now).await?;
             // token 明文只在这里出现这一次。库里只有 hash 与前 8 位(§8.1)。
-            app.modal = Some(Modal::info(
+            app.modal = Some(install_modal(
+                &app.cfg,
                 &format!("agent #{id} {name} —— 在被控机上跑这一条"),
-                install_body(&app.cfg, host, Some(&token)),
+                host,
+                Some(&token),
+                Vec::new(),
             ));
             Ok(format!("已新增 agent #{id} {name}"))
         }
@@ -572,19 +594,29 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         }
 
         Action::ShowInstall { id, name, host } => {
-            app.modal = Some(Modal::info(
+            app.modal = Some(install_modal(
+                &app.cfg,
                 &format!("agent #{id} {name} 的接入命令"),
-                install_body(&app.cfg, host, None),
+                host,
+                None,
+                Vec::new(),
             ));
             Ok(String::new())
         }
 
         Action::RotateToken { id, name, host } => {
             let token = agent_repo::rotate_token(&app.pool, *id).await?;
-            let mut body = install_body(&app.cfg, host, Some(&token));
-            body.push(String::new());
-            body.push("旧 token 已失效。在线连接不会被立刻踢掉,下次重连时生效。".into());
-            app.modal = Some(Modal::info(&format!("{name} 的新 token"), body));
+            app.modal = Some(install_modal(
+                &app.cfg,
+                &format!("{name} 的新 token —— 在那台机器上重跑这一条"),
+                host,
+                Some(&token),
+                vec![
+                    String::new(),
+                    "旧 token 已失效。在线连接不会被立刻踢掉,下次重连时生效。".into(),
+                    "被控机上原有的 agent.toml 会自动备份成 agent.toml.bak。".into(),
+                ],
+            ));
             Ok(format!("已轮换 {name} 的 token"))
         }
 
@@ -702,179 +734,93 @@ fn parse_quota(gb: &str) -> Result<i64> {
     Ok((v * 1_073_741_824.0) as i64)
 }
 
-// ─────────────────────────── 一键接入命令 ───────────────────────────
-
-/// 被控机回连主控用的默认地址。
-///
-/// 主控只知道自己 `listen` 在 `0.0.0.0:18443`,不知道对外该用哪个地址,
-/// 所以拿订阅的 `public_base` 的主机名当**猜测**填进表单 —— 多数部署里
-/// 订阅和 WS 就在同一台机器上。猜错了人可以直接改,总比让人从零开始打强。
-fn default_host(cfg: &Config) -> String {
-    let base = cfg.subscription.public_base.trim();
-    if base.is_empty() {
-        return String::new();
-    }
-    let rest = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
-    let hostport = rest.split('/').next().unwrap_or(rest);
-    // `[::1]:8080` → `[::1]`;`example.com:8080` → `example.com`。
-    match hostport.strip_prefix('[') {
-        Some(r) => r.split_once(']').map(|(h, _)| format!("[{h}]")).unwrap_or_else(|| hostport.into()),
-        None => hostport.split(':').next().unwrap_or(hostport).to_string(),
-    }
-}
-
-/// 从 `0.0.0.0:18443` 里取出端口。取不到就用默认值 —— 这个字符串只是拼给人看的
-/// 提示,解析失败不该让「新增 agent」整个失败。
-fn port_of(listen: &str) -> String {
-    listen.rsplit_once(':').map(|(_, p)| p.to_string()).unwrap_or_else(|| "18443".into())
-}
-
-/// IPv6 字面量在 URL 里必须带方括号,否则那些冒号会被当成端口分隔符。
-fn url_host(host: &str) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    }
-}
-
-/// 拼出被控机上的一条命令。`token` 为 `None` 时给占位符 ——
-/// 明文早就没了(§8.1),这种情况只能提示去轮换一个新的。
-fn install_command(cfg: &Config, host: &str, token: Option<&str>) -> String {
-    let scheme = if cfg.cluster.tls { "wss" } else { "ws" };
-    let host = if host.trim().is_empty() { "<主控地址>" } else { host.trim() };
-    let server = format!("{scheme}://{}:{}/ws", url_host(host), port_of(&cfg.cluster.listen));
-    let token = token.unwrap_or("<token 已经看不到了,按 [r] 轮换一个新的>");
-
-    let auth = if cfg.cluster.tls {
-        // 指纹取不到(还没生成证书)时也要把命令给全,只是那一格是占位符 ——
-        // 少给一段的话人会以为命令就该长这样,连上之后才发现 TOFU 没生效。
-        let fp = crate::tls::fingerprint(&cfg.cluster.cert_path)
-            .unwrap_or_else(|_| "<先跑一次 sbx daemon 生成证书,再按 i 取这条命令>".into());
-        format!("SBX_FINGERPRINT='{fp}' ")
-    } else {
-        // cluster.tls = false:没有证书可钉,agent 侧必须显式 insecure。
-        "SBX_INSECURE=1 ".into()
-    };
-
-    format!("curl -fsSL {INSTALL_URL} | SBX_SERVER='{server}' SBX_TOKEN='{token}' {auth}bash")
-}
-
-fn install_body(cfg: &Config, host: &str, token: Option<&str>) -> Vec<String> {
-    let mut body = vec![
-        install_command(cfg, host, token),
-        String::new(),
-        "整条复制到被控机上跑(root)。脚本会装好 sbx-agent、写 /etc/sbx/agent.toml(0600)、".into(),
-        "并 enable --now sbx-agent。以后重跑同一条命令就是升级。".into(),
-    ];
-    if host.trim().is_empty() {
-        body.push(String::new());
-        body.push("⚠ 主控地址是空的,命令里留了 <主控地址> 占位符 —— 换成被控机能连到的 IP 或域名。".into());
-    }
-    if token.is_some() {
-        body.push(String::new());
-        body.push("⚠ token 明文只显示这一次,关掉就再也拿不回来了(库里只有 hash)。".into());
-        body.push("  这条命令带着 token,别贴进聊天记录或工单里。丢了就按 [r] 轮换一个新的。".into());
-    }
-    body
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    /// 接入命令的信息框:命令必须**自己占一行**排在最前面。
+    /// 它是这个框存在的唯一理由,也是终端不支持 OSC 52 时要用鼠标去选的那一行。
     #[test]
-    fn port_of_handles_ipv4_ipv6_and_garbage() {
-        assert_eq!(port_of("0.0.0.0:18443"), "18443");
-        assert_eq!(port_of("[::]:9443"), "9443");
-        assert_eq!(port_of("nonsense"), "18443");
+    fn install_modal_puts_the_command_on_its_own_first_line() {
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        let m = install_modal(&cfg, "t", "203.0.113.8", Some("tok"), Vec::new());
+        let Modal::Info { body, copy, .. } = &m else { panic!("应当是信息框") };
+        assert!(body[0].starts_with("curl -fsSL "), "第一行就该是命令: {:?}", body[0]);
+        assert_eq!(copy.as_deref(), Some(body[0].as_str()), "按 y 复制的就该是那一行");
+        assert!(body.iter().any(|l| l.contains("只显示这一次")), "带 token 时要有警告");
     }
 
-    /// 从订阅地址里猜主控主机名。猜错了人可以改,但不能猜出一个带端口或带路径的东西 ——
-    /// 那会拼出 `wss://example.com:8080:18443/ws` 这种一眼看不出错在哪的地址。
-    #[test]
-    fn default_host_extracts_just_the_hostname() {
+    /// 按 y 之后弹窗**不关**,并且给一句如实的回执 ——
+    /// OSC 52 没有回执,关掉的话人根本不知道刚才那一下有没有生效。
+    #[tokio::test]
+    async fn copying_keeps_the_modal_open_and_says_what_happened() {
         let mut cfg = Config::default();
-        for (base, want) in [
-            ("https://sub.example.com", "sub.example.com"),
-            ("https://sub.example.com/", "sub.example.com"),
-            ("https://sub.example.com:8443/x", "sub.example.com"),
-            ("http://203.0.113.8:8080", "203.0.113.8"),
-            ("https://[2001:db8::1]:8443", "[2001:db8::1]"),
-            ("", ""),
-        ] {
-            cfg.subscription.public_base = base.into();
-            assert_eq!(default_host(&cfg), want, "public_base = {base}");
+        cfg.cluster.tls = false;
+        let mut a = app();
+        a.modal = Some(install_modal(&cfg, "t", "203.0.113.8", Some("tok"), Vec::new()));
+        assert!(on_key(&mut a, key('y')).is_none());
+        let Some(Modal::Info { copied, .. }) = &a.modal else { panic!("弹窗不该关掉") };
+        let msg = copied.as_deref().unwrap_or_default();
+        assert!(msg.contains("OSC 52"), "回执要说清用的是什么机制:{msg}");
+        assert!(msg.contains("不支持"), "要说清可能不生效:{msg}");
+
+        // 其它键仍然是关闭。
+        on_key(&mut a, key('x'));
+        assert!(a.modal.is_none());
+    }
+
+    /// 没什么可复制的信息框(订阅地址那种)按 y 就是关掉,不能卡住。
+    #[tokio::test]
+    async fn a_plain_info_box_closes_on_any_key() {
+        let mut a = app();
+        a.modal = Some(Modal::info("t", vec!["x".into()]));
+        on_key(&mut a, key('y'));
+        assert!(a.modal.is_none());
+    }
+
+
+    /// 接入命令的信息框长什么样,给人看一眼:
+    ///
+    /// ```sh
+    /// cargo test tui::tests::preview_install_modal -- --nocapture
+    /// ```
+    #[test]
+    fn preview_install_modal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut cfg = Config::default();
+        cfg.cluster.tls = false;
+        let mut m = install_modal(
+            &cfg,
+            "agent #1 tokyo-1 —— 在被控机上跑这一条",
+            "203.0.113.8",
+            Some("Zm9vYmFyYmF6cXV1eDEyMzQ1Njc4OWFiY2RlZg"),
+            Vec::new(),
+        );
+        for label in ["未复制", "按过 y 之后"] {
+            let mut term = Terminal::new(TestBackend::new(116, 26)).unwrap();
+            term.draw(|f| modal::render(f, f.area(), &m)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let out: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .filter(|l| !l.is_empty())
+                .collect();
+            println!("── 接入命令({label})──\n{}\n", out.join("\n"));
+            if let Modal::Info { copied, .. } = &mut m {
+                *copied = Some(
+                    "已发给终端(OSC 52)。终端不支持的话这一下不会有任何效果 —— \
+                     那就用鼠标选中复制,或者在主控上跑 sbx agent-add 从普通终端里复制。"
+                        .into(),
+                );
+            }
         }
-    }
-
-    /// IPv6 主控地址必须带方括号,否则 `wss://2001:db8::1:18443/ws` 里
-    /// 哪个冒号是端口分隔符谁也说不清 —— agent 侧会解析失败。
-    #[test]
-    fn ipv6_master_address_is_bracketed() {
-        let mut cfg = Config::default();
-        cfg.cluster.tls = false;
-        cfg.cluster.listen = "[::]:18443".into();
-        let cmd = install_command(&cfg, "2001:db8::1", Some("tok"));
-        assert!(cmd.contains("ws://[2001:db8::1]:18443/ws"), "{cmd}");
-        // 已经带方括号的不要再套一层。
-        let cmd = install_command(&cfg, "[2001:db8::1]", Some("tok"));
-        assert!(cmd.contains("ws://[2001:db8::1]:18443/ws"), "{cmd}");
-    }
-
-    /// 明文模式下没有证书可钉,命令里必须显式给 `SBX_INSECURE=1` ——
-    /// 少了它 agent 会因为「配了 ws:// 却没说明为什么不校验」而拒绝启动。
-    #[test]
-    fn plaintext_mode_tells_the_agent_to_skip_verification() {
-        let mut cfg = Config::default();
-        cfg.cluster.tls = false;
-        let cmd = install_command(&cfg, "203.0.113.8", Some("tok"));
-        assert!(cmd.contains("SBX_INSECURE=1"), "{cmd}");
-        assert!(cmd.contains("ws://203.0.113.8"), "{cmd}");
-        assert!(!cmd.contains("wss://"), "明文模式不该给 wss: {cmd}");
-        assert!(!cmd.contains("SBX_FINGERPRINT"), "没有证书就不该有指纹: {cmd}");
-    }
-
-    /// 主控地址没填时留占位符,并且**明确说出来** ——
-    /// 直接给一条拼错的命令,人会照抄然后对着连不上发懵。
-    #[test]
-    fn missing_host_is_called_out_not_silently_wrong() {
-        let mut cfg = Config::default();
-        cfg.cluster.tls = false;
-        let body = install_body(&cfg, "", Some("tok")).join("\n");
-        assert!(body.contains("<主控地址>"), "{body}");
-        assert!(body.contains("主控地址是空的"), "{body}");
-    }
-
-    /// 重新查看接入命令时 token 是取不到的(库里只有 hash),
-    /// 必须给一句「怎么才能拿到」而不是一个看起来能用的空值。
-    #[test]
-    fn reshown_command_admits_the_token_is_gone() {
-        let mut cfg = Config::default();
-        cfg.cluster.tls = false;
-        let cmd = install_command(&cfg, "203.0.113.8", None);
-        assert!(cmd.contains("轮换"), "{cmd}");
-        let body = install_body(&cfg, "203.0.113.8", None).join("\n");
-        assert!(!body.contains("只显示这一次"), "没有 token 时不该说这句: {body}");
-    }
-
-    /// 接入命令必须是**一整行**。分行的命令从终端里复制会带上换行,
-    /// 粘到另一个 shell 里就变成好几条互相看不见对方的命令 ——
-    /// 而这条命令的全部价值就是「整条复制过去跑」。
-    #[test]
-    fn install_command_is_a_single_copyable_line() {
-        let mut cfg = Config::default();
-        cfg.cluster.tls = false;
-        let cmd = install_command(&cfg, "203.0.113.8", Some("tok"));
-        assert!(!cmd.contains('\n'), "{cmd}");
-        assert!(cmd.starts_with("curl -fsSL "), "{cmd}");
-        // 环境变量赋值必须落在 `| ` 之后、`bash` 之前 —— `curl … | VAR=x bash`
-        // 是一条合法的 POSIX 简单命令,而 `VAR=x curl … | bash` 会把变量给了 curl。
-        let (_, after_pipe) = cmd.split_once("| ").expect("要有管道");
-        assert!(after_pipe.starts_with("SBX_SERVER="), "{cmd}");
-        assert!(after_pipe.ends_with(" bash"), "{cmd}");
-        // 值都用单引号包起来:token 是随机串,理论上可以出现 shell 元字符。
-        assert!(cmd.contains("SBX_TOKEN='tok'"), "{cmd}");
     }
 
     fn app() -> App {

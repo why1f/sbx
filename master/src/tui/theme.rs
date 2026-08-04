@@ -162,6 +162,55 @@ pub fn pad(s: &str, w: usize) -> String {
     out
 }
 
+/// 按显示宽度折行,每行都不超过 `width` 列。
+///
+/// **为什么不交给 ratatui 的 `Wrap`。** 两个原因,都不是审美问题:
+///   1. 它折出来的行数**算不进我们自己的高度计算**,于是弹窗底下几行被静默裁掉
+///      —— 表现是「说明只有半句」。
+///   2. 它的续行顶到最左边,和下一条说明的起始位置一样,读起来像另起了一条。
+///
+/// 优先在空格处断,断不了就硬断:中文没有空格,一律等空格会让一整段挤成一行。
+pub fn wrap(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut line = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = char_cols(c);
+        // `used > 0` 是必须的:一个宽字符比整行还宽时,不加这条会空推无数行。
+        if used > 0 && used + w > width {
+            // 回退到最后一个空格断行,免得把一个英文单词劈成两半。
+            // 只在尾巴不长时回退 —— 否则一行只剩几个字,反而更难读。
+            match line.rfind(' ') {
+                Some(i) if i + 1 < line.len() && cols(&line[i + 1..]) <= 16 => {
+                    let tail = line[i + 1..].to_string();
+                    line.truncate(i);
+                    out.push(std::mem::take(&mut line));
+                    used = cols(&tail);
+                    line = tail;
+                }
+                _ => {
+                    out.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+            }
+            // 回退到空格之后可能**还是**放不下(尾巴本身就快占满一行了),
+            // 那就再断一次。少了这一下会折出一行比 width 还宽的东西,
+            // 而那正是这个函数存在的理由。
+            if used > 0 && used + w > width {
+                out.push(std::mem::take(&mut line));
+                used = 0;
+            }
+        }
+        line.push(c);
+        used += w;
+    }
+    out.push(line);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,9 +294,53 @@ mod tests {
         assert_eq!(cols(&pad("x", 0)), 0);
     }
 
+    /// 折行的每一行都不能超宽 —— 超了 `Paragraph` 会再折一次,
+    /// 而那一次的行数算不进弹窗高度,底下就被裁掉了。
     #[test]
-    fn rate_rejects_nonsense_values() {
-        assert_eq!(rate(f64::NAN), "--");
+    fn wrap_never_exceeds_the_width() {
+        let texts = [
+            "Tag:同一台机器内唯一;也是 (用户, tag) 记账口径的一半(§7.1),建好之后不能改。",
+            "reality:密钥对与 short_id 建节点时自动生成;server_name 同时是握手目标",
+            "curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | SBX_SERVER='wss://203.0.113.8:18443/ws' bash",
+            "短",
+            "",
+        ];
+        for t in texts {
+            for w in [1usize, 2, 10, 30, 60, 200] {
+                for line in wrap(t, w) {
+                    assert!(cols(&line) <= w.max(1) || cols(&line) <= 2, "宽度 {w} 折出了 {line:?}");
+                }
+            }
+        }
+    }
+
+    /// 折完再拼回去必须还是原文(除了断行处那个被吃掉的空格)。
+    /// 丢字的折行比不折行糟糕得多 —— 少一句提示看得出来,少两个字看不出来。
+    #[test]
+    fn wrap_preserves_the_text() {
+        let t = "中转:地址留空 = 不启用;只填地址则端口沿用监听端口;订阅按中转地址导出。";
+        let joined: String = wrap(t, 24).join("");
+        assert_eq!(joined.replace(' ', ""), t.replace(' ', ""));
+    }
+
+    #[test]
+    fn wrap_prefers_breaking_at_spaces() {
+        let lines = wrap("alpha beta gamma delta", 12);
+        assert!(lines.iter().all(|l| !l.starts_with(' ')), "{lines:?}");
+        // 不该把单词劈开
+        assert!(lines.iter().all(|l| l.split(' ').all(|w| "alpha beta gamma delta".contains(w))));
+    }
+
+    /// 一个宽字符比整行还窄时不能空转 —— 早先的写法会推无数个空行然后 OOM。
+    #[test]
+    fn wrap_survives_widths_narrower_than_one_char() {
+        assert!(wrap("中文", 1).len() <= 4);
+        assert_eq!(wrap("", 10), vec![String::new()]);
+        assert_eq!(wrap("abc", 0), vec![String::new()]);
+    }
+
+    #[test]
+    fn rate_rejects_nonsense_values() {        assert_eq!(rate(f64::NAN), "--");
         assert_eq!(rate(-1.0), "--");
         assert!(rate(1024.0).ends_with("/s"));
     }
