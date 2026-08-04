@@ -187,6 +187,24 @@ should_install() {
 #
 # 临时文件必须和目标**同目录**:跨文件系统的 mv 不是原子的,会退化成 copy,
 # 中途断电就留下一个截断的可执行文件。
+# 下载一个文件,失败重试几次。
+#
+# `curl --retry` 默认**只重试传输层错误和 5xx,不管 404**。而刚发布的 release
+# 在 CDN 上有几秒的传播窗口,那期间同一个地址会间歇性返 404 ——
+# 表现是「刚发的版本装不上」,而过一分钟又好了。
+# `--retry-all-errors` 能覆盖这种,但它要 curl 7.71+;被控机上可能是更老的版本,
+# 传了会直接报「不认识的参数」。所以退回最朴素的办法:自己睡一下再试。
+download() {
+    _u="$1"; _o="$2"
+    _n=0
+    while :; do
+        curl -fsSL --retry 3 -o "$_o" "$_u" && return 0
+        _n=$((_n + 1))
+        [ "$_n" -ge 3 ] && return 1
+        sleep 3
+    done
+}
+
 fetch_verify_install() {
     _url="$1"; _sum_url="$2"; _dest="$3"
     _tmp="$_dest.new.$$"
@@ -194,8 +212,8 @@ fetch_verify_install() {
     # 无论从哪条路径退出都别留垃圾。
     trap 'rm -f "$_tmp" "$_sum"' EXIT INT TERM
 
-    curl -fsSL --retry 3 -o "$_tmp" "$_url" || die "下载失败: $_url"
-    if curl -fsSL --retry 3 -o "$_sum" "$_sum_url" 2>/dev/null; then
+    download "$_url" "$_tmp" || die "下载失败: $_url"
+    if download "$_sum_url" "$_sum"; then
         # .sha256 里记的是发布时的文件名,和我们的临时名对不上,
         # 所以只取哈希值自己比,不用 `sha256sum -c`。
         _want=$(awk '{print $1}' "$_sum")
@@ -286,7 +304,7 @@ write_agent_config() {
 fetch_asset() {
     _url="$1"; _dest="$2"; _what="$3"
     _asset_tmp="$_dest.new.$$"
-    if curl -fsSL --retry 3 -o "$_asset_tmp" "$_url" && [ -s "$_asset_tmp" ]; then
+    if download "$_url" "$_asset_tmp" && [ -s "$_asset_tmp" ]; then
         mv -f "$_asset_tmp" "$_dest"
         return 0
     fi
