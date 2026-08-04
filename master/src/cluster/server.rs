@@ -229,7 +229,7 @@ async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, age
                 }
             }
             Err(e) => {
-                // 组装阶段就失败(例如节点用了尚未实现的协议),根本没发出去。
+                // 组装阶段就失败(节点缺必填参数、或协议名本版本读不懂),根本没发出去。
                 tracing::error!(agent_id, error = %e, "组装配置失败,未下发");
                 let now = chrono::Local::now().timestamp();
                 let _ = crate::db::agent_repo::log_event(
@@ -900,12 +900,22 @@ mod tests {
         assert!(next.is_err(), "revision 一致时不该收到任何补齐消息");
     }
 
-    /// 组装配置失败(节点用了未实现的协议)时应记审计,且**不断开连接**。
+    /// 组装配置失败时应记审计,且**不断开连接**。
+    ///
+    /// 触发方式是把一个已建好的节点的 protocol 改成本版本不认识的字符串。
+    /// 这不是杜撰的场景:节点行由更新版本的主控写进去、或者有人手改过库,
+    /// 都会长成这样。`build_inbound` 对 `Protocol::Unknown` 是**硬拒绝**
+    /// (不给未知协议兜底 inbound —— 否则一个打错的协议名会静默生成一个
+    /// 开放的直连入站),所以这个触发条件是设计上永久成立的。
+    ///
+    /// 早先这里用的是「trojan + 空参数」,靠的其实是缺 cert_pem/key_pem 而不是
+    /// 注释里写的「trojan 尚未实现」—— 八个协议早就都实现了。那种写法的问题是:
+    /// 哪天给 trojan 加了自签证书兜底,这条测试会在无人察觉的情况下
+    /// 不再测它声称要测的东西。
     #[tokio::test]
     async fn config_build_failure_is_audited_and_does_not_kill_the_connection() {
         let (url, pool) = spawn_server().await;
         let (agent_id, token) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
-        // trojan 的配置生成尚未实现 → build_agent_config 会失败
         crate::db::node_repo::add_node(
             &pool,
             agent_id,
@@ -916,6 +926,13 @@ mod tests {
         )
         .await
         .unwrap();
+        // add_node 会挡 Protocol::Unknown(建节点时本就该挡),所以绕开它直接改库,
+        // 模拟「库里已经躺着一个本版本读不懂的节点」。
+        sqlx::query("UPDATE nodes SET protocol = 'wireguard-plus' WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let mut ws = connect(&url).await;
         assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
@@ -928,6 +945,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 1, "组装失败应写审计记录");
+
+        // 钉死**为什么**失败。少了这一条,将来任何一个别的组装错误
+        // (缺参数、端口冲突……)都能让这条测试继续绿,而「未知协议不给兜底
+        // inbound」这条保证就没人盯着了。
+        let detail: String = sqlx::query_scalar(
+            "SELECT message FROM agent_events WHERE kind = 'config_build_failed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            detail.contains("无法识别"),
+            "审计详情该说清是协议读不懂,实际:{detail}"
+        );
 
         // 连接仍然可用:agent 还是 online
         let a = crate::db::agent_repo::get(&pool, agent_id).await.unwrap().unwrap();
