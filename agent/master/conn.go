@@ -651,18 +651,33 @@ func parseFingerprint(fp string) ([]byte, error) {
 // 自己 exec 要处理已打开的 fd、信号处理器、以及「新版本起不来时谁来兜底」,
 // 而 supervisor 天生就干这个。Restart=always 是部署的前提(§11.2)。
 func (c *Conn) upgrade(p AgentUpgrade) error {
-	want, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(p.SHA256)))
-	if err != nil || len(want) != sha256.Size {
-		return fmt.Errorf("agent.upgrade 的 sha256 非法")
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("定位当前可执行文件: %w", err)
 	}
-	// 解一次符号链接:很多部署把 /usr/local/bin/sbx-agent 指向带版本号的实际文件,
-	// 覆盖软链本身会把版本管理搞乱。
+	return replaceExecutable(resolveExecutable(exe), p.URL, p.SHA256)
+}
+
+// resolveExecutable 解一次符号链接:很多部署把 /usr/local/bin/sbx-agent 指向
+// 带版本号的实际文件,覆盖软链本身会把版本管理搞乱 —— 目录里会多出一个普通文件,
+// 而下次 systemd 起的还是同一个路径,从外面看不出区别。
+// 解不开(不是软链、或者断链)就原样返回,交给后面的 rename 去报错。
+func resolveExecutable(exe string) string {
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
+		return resolved
+	}
+	return exe
+}
+
+// replaceExecutable 把 exe 换成 url 指向的内容,前提是下载下来的 sha256 等于 wantHex。
+//
+// 从 upgrade 里拆出来是为了**能测**:upgrade 拿的是 os.Executable(),
+// 在 go test 里那就是测试二进制自己 —— 覆盖它验证不了任何东西,
+// 只会把正在跑的这轮测试搞坏。拆开之后 exe 是个参数,测试传临时目录里的假文件。
+func replaceExecutable(exe, url, wantHex string) error {
+	want, err := hex.DecodeString(strings.ToLower(strings.TrimSpace(wantHex)))
+	if err != nil || len(want) != sha256.Size {
+		return fmt.Errorf("agent.upgrade 的 sha256 非法")
 	}
 
 	// 临时文件必须和目标**同目录** —— 跨文件系统 rename 不是原子的。
@@ -674,15 +689,15 @@ func (c *Conn) upgrade(p AgentUpgrade) error {
 	defer os.Remove(tmpName) // rename 成功后是 no-op
 
 	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Get(p.URL)
+	resp, err := client.Get(url)
 	if err != nil {
 		tmp.Close()
-		return fmt.Errorf("下载 %s: %w", p.URL, err)
+		return fmt.Errorf("下载 %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		tmp.Close()
-		return fmt.Errorf("下载 %s: HTTP %d", p.URL, resp.StatusCode)
+		return fmt.Errorf("下载 %s: HTTP %d", url, resp.StatusCode)
 	}
 
 	h := sha256.New()
