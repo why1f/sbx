@@ -17,6 +17,16 @@ pub const DIM: Color = Color::Rgb(0x7a, 0x7a, 0x7a);
 pub const TRACK: Color = Color::Rgb(0x3a, 0x3a, 0x3a);
 pub const ACCENT: Color = Color::Rgb(0xf5, 0xc4, 0x51);
 
+/// 表单里聚焦那一格的底色。
+///
+/// **不用 ACCENT 做底。** 黄底配深色前景在很多终端配色下会被主题改掉前景色,
+/// 结果是黄底浅字,对比度反而比不选中还低。深灰蓝底 + 原色前景在任何配色下
+/// 都是「亮一块」,不依赖终端把 `Color::Black` 渲染成真的黑。
+pub const SELECT_BG: Color = Color::Rgb(0x2d, 0x3a, 0x4e);
+/// 表格里选中行的底色。比 `SELECT_BG` 淡一点 —— 那是「光标在这一行」,
+/// 不是「正在编辑这一格」,两者不该一样强。
+pub const ROW_BG: Color = Color::Rgb(0x2a, 0x2a, 0x2a);
+
 /// 进度条的颜色停靠点:绿 → 黄 → 橙 → 红(§8.2)。
 ///
 /// 位置是「用了百分之多少」,颜色在相邻停靠点之间线性插值。

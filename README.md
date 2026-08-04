@@ -52,12 +52,12 @@ GPL 的传染范围是「衍生作品」,而网络通信不构成链接。
 | CI / release(§11.1) | ✅ 已完成,`.github/workflows/` + `packaging/` |
 | 八协议配置生成(§9.1) | ✅ 已完成,golden 由 Rust 生成、**由真 sing-box 校验** |
 | 订阅导出(§10) | ✅ 已完成,base64 链接 + Clash YAML + `/sub/:token` HTTP 服务 |
-| TUI(§8) | ✅ 已完成,概览 / 服务管理 / 节点 / 用户 四页,数字键直达 |
+| TUI(§8) | ✅ 已完成,仪表盘 / 服务管理 / 节点 / 用户 / 设置 五页,数字键直达 |
 | 流量统计页(`stats_html`) | ✅ 已完成,浏览器打开订阅地址即是它 |
 | Telegram 通知(§9.1) | ✅ 已完成,单实例租约 + 阈值告警去重 + 定时播报 |
 | §13.2 / §13.3 端到端 | ✅ **已在真实 ARM Linux 上跑通**(1 主控 + 2 agent + 真流量) |
 
-Rust 侧 352 个测试通过(`cargo test`),
+Rust 侧 382 个测试通过(`cargo test`),
 Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 **含 `-race`**,已在 Linux ARM 上跑过)。
 
@@ -122,7 +122,7 @@ curl -fsSL .../install.sh | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' S
 ## 已经能跑的东西
 
 ```sh
-cargo test                      # 352 个测试
+cargo test                      # 382 个测试
 cargo build --release           # 产物 target/release/sbx
 
 # 建库 + 加一台被控服务器 + 启动主控
@@ -138,17 +138,19 @@ cargo build --release           # 产物 target/release/sbx
 ./target/release/sbx --config c.toml user-sub alice          # 订阅地址
 ./target/release/sbx --config c.toml user-sub alice --links  # 连同分享链接
 
-# 或者直接开界面(§8):概览 / 服务管理 / 节点 / 用户 四页,按 1-4 直达
+# 或者直接开界面(§8):仪表盘 / 服务管理 / 节点 / 用户 / 设置 五页,按 1-5 直达
 ./target/release/sbx --config c.toml tui
 ```
 
-TUI 里能做的事:
+TUI 里能做的事(`R` 随时立刻刷新):
 
 | 页 | 键 |
 |---|---|
+| 仪表盘 | 只读:集群概况、上下行盲文折线图、用量 Top、各机器 CPU/内存/配额 |
 | 服务管理 | `[a]` 新增(给出一键接入命令) `[E]` 编辑配额 `[i]` 再看一次接入命令 `[r]` 轮换 token `[d]` 删除 |
-| 节点 | `[a]` 新增 `[E]` 编辑 `[d]` 删除 |
-| 用户 | `[a]` 新增 `[E]` 编辑计费 `[n]` 分配节点(多选) `[t]` 启/停 `[s]` 订阅 `[d]` 删除 |
+| 节点 | `[a]` 新增 `[E]` 编辑 `[Enter]` 这个节点上各用户的用量 `[d]` 删除 |
+| 用户 | `[a]` 新增 `[E]` 编辑计费 `[Enter]` 这个用户在各节点的用量 `[n]` 分配节点(多选) `[t]` 启/停 `[s]` 订阅 `[d]` 删除 |
+| 设置 | `[Enter]` 改这一项。改的是配置文件本身,注释与排版都保留;**改完要重启 daemon** |
 
 节点表单里协议和所属机器是 `←/→` 选的,不是手打;`server_name` / `path` 只在
 用得上它们的协议下出现。编辑节点时 tag 与协议不可改 —— 改 tag 会让历史流量和新流量

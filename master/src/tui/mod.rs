@@ -1,7 +1,7 @@
 //! TUI 主循环与应用状态(DESIGN.md §8)。
 //!
-//! 四个页面:概览、服务管理(agents,两行式)、节点、用户。
-//! 页签前面的序号就是**能直接按的键**:`1`-`4` 直达,Tab 循环。
+//! 五个页面:仪表盘、服务管理(agents,两行式)、节点、用户、设置。
+//! 页签里的序号就是**能直接按的键**:`1`-`5` 直达,Tab 循环。
 //!
 //! **它是一个独立进程,不是 daemon 的一部分。** `sbx tui` 与 `sbx daemon` 各跑各的,
 //! 之间只通过 SQLite 交换状态。这带来一个直接后果:TUI 看不到 daemon 内存里的
@@ -16,6 +16,7 @@ mod data;
 mod forms;
 mod modal;
 mod pages;
+mod settings;
 mod theme;
 
 use anyhow::{Context, Result};
@@ -31,11 +32,9 @@ use crate::install;
 use data::SpeedTracker;
 use modal::{Action, Modal, Outcome};
 
-const PAGES: [&str; 4] = ["概览", "服务管理", "节点", "用户"];
+const PAGES: [&str; 5] = ["仪表盘", "服务管理", "节点", "用户", "设置"];
 /// 刷新间隔。1 秒足够跟上 30 秒一次的上报,又不会让 SQLite 被空转拖累。
 const TICK: Duration = Duration::from_millis(1000);
-/// 概览页显示多少条事件。取够填满面板即可,查历史该用 `sqlite3`。
-const EVENT_LIMIT: i64 = 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -43,6 +42,7 @@ enum Page {
     Agents = 1,
     Nodes = 2,
     Users = 3,
+    Settings = 4,
 }
 
 impl Page {
@@ -51,6 +51,7 @@ impl Page {
             1 => Page::Agents,
             2 => Page::Nodes,
             3 => Page::Users,
+            4 => Page::Settings,
             _ => Page::Dashboard,
         }
     }
@@ -59,14 +60,20 @@ impl Page {
 struct App {
     pool: SqlitePool,
     cfg: Config,
+    /// 配置文件路径。设置页要就地改它(`config::set_value`)。
+    cfg_path: String,
     page: Page,
-    sel: [usize; 4],
+    sel: [usize; 5],
     agents: Vec<data::AgentRow>,
     nodes: Vec<data::NodeRow>,
     users: Vec<data::UserRow>,
-    events: Vec<data::EventRow>,
     speed: SpeedTracker,
     modal: Option<Modal>,
+    /// 打开着的用量明细(节点 → 各用户 / 用户 → 各节点)。
+    ///
+    /// 与 `modal` 分开是因为它**是只读的、且数据要异步查**:走 `Modal` 的话
+    /// 得让弹窗持有一个 pool,而弹窗那一层现在是纯渲染 + 纯按键,没有 IO。
+    overlay: Option<Overlay>,
     /// 一次性消息(某个操作的结果)。为 `None` 时状态栏显示当前页的快捷键
     /// 与选中项摘要 —— 那是**常驻**信息,不该被上一次操作的回执长期占着。
     status: Option<String>,
@@ -75,18 +82,19 @@ struct App {
 }
 
 impl App {
-    fn new(pool: SqlitePool, cfg: Config) -> Self {
+    fn new(pool: SqlitePool, cfg: Config, cfg_path: String) -> Self {
         Self {
             pool,
             cfg,
+            cfg_path,
             page: Page::Dashboard,
-            sel: [0; 4],
+            sel: [0; 5],
             agents: Vec::new(),
             nodes: Vec::new(),
             users: Vec::new(),
-            events: Vec::new(),
             speed: SpeedTracker::default(),
             modal: None,
+            overlay: None,
             status: None,
             status_is_error: false,
             quit: false,
@@ -99,11 +107,12 @@ impl App {
 
     fn len(&self) -> usize {
         match self.page {
-            // 概览页没有可选中的行,上下键在这里就该什么都不做。
+            // 仪表盘没有可选中的行,上下键在这里就该什么都不做。
             Page::Dashboard => 0,
             Page::Agents => self.agents.len(),
             Page::Nodes => self.nodes.len(),
             Page::Users => self.users.len(),
+            Page::Settings => settings::all(&self.cfg).len(),
         }
     }
 
@@ -125,9 +134,9 @@ impl App {
         if let Some(msg) = &self.status {
             return msg.clone();
         }
-        let common = "[1-4]切页  [↑↓/jk]选择  [q]退出";
+        let common = "[1-5]切页  [↑↓/jk]选择  [R]刷新  [q]退出";
         match self.page {
-            Page::Dashboard => format!("{common}  │  概览是只读的;要动手请去 2/3/4 页"),
+            Page::Dashboard => format!("{common}  │  仪表盘是只读的;要动手请去 2/3/4 页"),
             Page::Agents => {
                 let sel = match self.selected_agent() {
                     Some(a) => format!(
@@ -143,25 +152,29 @@ impl App {
                     Some(n) => format!("  │  #{} {} · {} 个用户在用", n.id, n.tag, n.user_count),
                     None => "  │  还没有节点,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [Enter]用量明细  [d]删除{sel}")
             }
             Page::Users => {
                 let sel = match self.selected_user() {
                     Some(u) => format!("  │  #{} {}", u.id, u.name),
                     None => "  │  还没有用户,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [n]分配节点  [t]启/停  [s]订阅  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [Enter]用量明细  [n]分配节点  [t]启/停  [s]订阅  [d]删除{sel}")
+            }
+            Page::Settings => {
+                format!("{common}  [Enter]改这一项  │  改完要重启 daemon:systemctl restart sbx")
             }
         }
     }
 
     async fn refresh(&mut self) -> Result<()> {
-        self.agents = data::load_agents(&self.pool, &mut self.speed).await?;
+        let now = chrono::Local::now().timestamp();
+        self.agents = data::load_agents(&self.pool, &mut self.speed, now).await?;
         self.nodes = data::load_nodes(&self.pool).await?;
         self.users = data::load_users(&self.pool).await?;
-        self.events = data::load_events(&self.pool, EVENT_LIMIT).await?;
         // 删掉最后一行之后光标会落在表外,下一帧渲染就会读到不存在的下标。
-        let lens = [0, self.agents.len(), self.nodes.len(), self.users.len()];
+        let lens =
+            [0, self.agents.len(), self.nodes.len(), self.users.len(), settings::all(&self.cfg).len()];
         for (i, len) in lens.iter().enumerate() {
             if self.sel[i] >= *len {
                 self.sel[i] = len.saturating_sub(1);
@@ -183,10 +196,27 @@ impl App {
     fn sub_base(&self) -> &str {
         &self.cfg.subscription.public_base
     }
+
+    /// 重新读一次配置文件。设置页写完之后要调 —— 否则页面上还是旧值,
+    /// 人会以为没保存成功,然后再改一遍。
+    fn reload_config(&mut self) {
+        if let Ok(text) = std::fs::read_to_string(&self.cfg_path) {
+            if let Ok(c) = Config::parse(&text) {
+                self.cfg = c;
+            }
+        }
+    }
+}
+
+/// 一张只读的用量明细表。
+struct Overlay {
+    title: String,
+    head: String,
+    rows: Vec<data::BreakdownRow>,
 }
 
 /// 进入 TUI。返回时终端一定已经恢复原状(正常退出、出错、panic 三条路都覆盖)。
-pub async fn run(pool: SqlitePool, cfg: Config) -> Result<()> {
+pub async fn run(pool: SqlitePool, cfg: Config, cfg_path: String) -> Result<()> {
     // panic 时也要把终端恢复回去。少了这一步,一次 panic 会让用户的终端
     // 卡在 raw mode + alternate screen —— 看起来像整个 shell 挂了。
     let default_hook = std::panic::take_hook();
@@ -200,7 +230,7 @@ pub async fn run(pool: SqlitePool, cfg: Config) -> Result<()> {
     crossterm::execute!(stdout, EnterAlternateScreen)?;
     let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = event_loop(&mut term, App::new(pool, cfg)).await;
+    let result = event_loop(&mut term, App::new(pool, cfg, cfg_path)).await;
 
     restore_terminal()?;
     let _ = term.show_cursor();
@@ -278,15 +308,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             &app.agents,
             &app.nodes,
             &app.users,
-            &app.events,
+            app.speed.history(),
             now,
         ),
         Page::Agents => pages::agents(f, chunks[1], &app.agents, app.sel[1], now),
         Page::Nodes => pages::nodes(f, chunks[1], &app.nodes, app.sel[2]),
         Page::Users => pages::users(f, chunks[1], &app.users, app.sel[3], app.sub_base(), now),
+        Page::Settings => pages::settings(f, chunks[1], &settings::all(&app.cfg), app.sel[4]),
     }
     modal::status_bar(f, chunks[2], &app.status_line(), app.status_is_error);
 
+    if let Some(o) = &app.overlay {
+        pages::breakdown(f, f.area(), &o.title, &o.head, &o.rows);
+    }
     if let Some(m) = &app.modal {
         modal::render(f, f.area(), m);
     }
@@ -311,20 +345,30 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             }
         };
     }
+    // 明细表是只读的,任意键关掉。放在页面快捷键**之前** ——
+    // 否则在它开着的时候按 d 会去删掉后面那张表里选中的东西。
+    if app.overlay.is_some() {
+        app.overlay = None;
+        return None;
+    }
     // 上一次操作的回执只留到下一次按键为止,之后让位给常驻的快捷键提示。
     app.status = None;
 
     match k.code {
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
-        // 数字直达。四页里跳来跳去时,Tab 要按三下才到得了最后一页,
-        // 而人心里想的是「去第 4 页」。
+        // 数字直达。五页里跳来跳去时,Tab 要按四下才到得了最后一页,
+        // 而人心里想的是「去第 5 页」。
         //
         // 页签上印的序号是 `i + 1`,所以这里要减 1 —— 按 3 去的是第三个页签(节点),
         // 不是下标 3 的那一页。
-        KeyCode::Char(c @ '1'..='4') => {
+        KeyCode::Char(c @ '1'..='5') => {
             app.page = Page::from_index(c as usize - '1' as usize);
         }
+        // 常规刷新是每秒一次,但有些东西(改完配置、另一个进程动了库)
+        // 要立刻看到结果。`R` 是大写的:小写 r 在服务管理页是「轮换 token」,
+        // 那是一个不可撤销的动作,不能和刷新只差一个 Shift 却又长得像。
+        KeyCode::Char('R') => return Some(Action::Refresh),
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
             app.page = Page::from_index((app.page as usize + 1) % PAGES.len());
         }
@@ -355,10 +399,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
         Page::Dashboard => {}
 
         Page::Agents => match k.code {
-            KeyCode::Char('a') => {
-                let host = install::default_host(&app.cfg);
-                app.modal = Some(forms::agent_add(&host));
-            }
+            KeyCode::Char('a') => app.modal = Some(forms::agent_add()),
             KeyCode::Char('E') => match app.selected_agent() {
                 Some(a) => app.modal = Some(agent_edit(a)),
                 None => app.fail("没有选中任何被控服务器"),
@@ -366,7 +407,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             KeyCode::Char('i') => match app.selected_agent() {
                 Some(a) => {
                     let (id, name) = (a.id, a.name.clone());
-                    return Some(Action::ShowInstall { id, name, host: install::default_host(&app.cfg) });
+                    return Some(Action::ShowInstall { id, name });
                 }
                 None => app.fail("没有选中任何被控服务器"),
             },
@@ -380,7 +421,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                             "已建立的连接不会被立刻踢掉,下次重连时才生效(§8.1)。".into(),
                             "新 token 只会显示这一次 —— 连同一条可以直接跑的重装命令。".into(),
                         ],
-                        Action::RotateToken { id, name, host: install::default_host(&app.cfg) },
+                        Action::RotateToken { id, name },
                     ));
                 } else {
                     app.fail("没有选中任何被控服务器");
@@ -418,6 +459,18 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                 Some(n) => app.modal = Some(forms::node_edit(n)),
                 None => app.fail("没有选中任何节点"),
             },
+            // 「这个节点上都有谁、各跑了多少」。这是排查「某台机器流量异常」
+            // 时的第一个问题,而在此之前只能去用户页一个个看。
+            KeyCode::Enter | KeyCode::Char('v') => match app.selected_node() {
+                Some(n) => {
+                    return Some(Action::ShowNodeUsers {
+                        id: n.id,
+                        tag: n.tag.clone(),
+                        agent: n.agent_name.clone(),
+                    })
+                }
+                None => app.fail("没有选中任何节点"),
+            },
             KeyCode::Char('d') => {
                 if let Some(n) = app.selected_node() {
                     let (id, tag, users) = (n.id, n.tag.clone(), n.user_count);
@@ -440,6 +493,12 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             KeyCode::Char('a') => app.modal = Some(forms::user_add()),
             KeyCode::Char('E') => match app.selected_user() {
                 Some(u) => app.modal = Some(forms::user_edit(u)),
+                None => app.fail("没有选中任何用户"),
+            },
+            // 「这个用户在哪几个节点上、各跑了多少」。跨 agent 的用户
+            // 在列表里只看得到一个合计,分不出是哪台机器在承载。
+            KeyCode::Enter | KeyCode::Char('v') => match app.selected_user() {
+                Some(u) => return Some(Action::ShowUserNodes { id: u.id, name: u.name.clone() }),
                 None => app.fail("没有选中任何用户"),
             },
             // 一个键切换启停,而不是启用/停用各一个键:人看着那一行的状态按,
@@ -492,6 +551,26 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             }
             _ => {}
         },
+
+        Page::Settings => {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Char('E')) {
+                let items = settings::all(&app.cfg);
+                let Some(item) = items.into_iter().nth(app.sel[Page::Settings as usize]) else {
+                    app.fail("没有选中任何设置项");
+                    return None;
+                };
+                // 布尔项按一下就切,不弹框 —— 为一个 true/false 开表单太重了。
+                if let settings::Kind::Bool(_) = item.kind {
+                    return Some(Action::SetConfig {
+                        section: item.section,
+                        key: item.key,
+                        value: item.to_toml("").unwrap_or_else(|_| "false".into()),
+                        label: item.label.clone(),
+                    });
+                }
+                app.modal = Some(forms::setting_edit(item));
+            }
+        }
     }
     None
 }
@@ -546,16 +625,12 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
 ///
 /// 命令**单独占一行**放在最上面,而不是混在说明里:它是这个框存在的唯一理由,
 /// 而且是那条要被复制走的东西 —— 终端不支持 OSC 52 时人得用鼠标去选它。
-fn install_modal(
-    cfg: &Config,
-    title: &str,
-    host: &str,
-    token: Option<&str>,
-    tail: Vec<String>,
-) -> Modal {
-    let cmd = install::command(cfg, host, token);
+fn install_modal(cfg: &Config, title: &str, token: Option<&str>, tail: Vec<String>) -> Modal {
+    // 主控地址在这里定,不问人:配了订阅域名就用域名,否则探本机出口地址。
+    let host = install::resolve_host(cfg);
+    let cmd = install::command(cfg, &host, token);
     let mut body = vec![cmd.clone(), String::new()];
-    body.extend(install::notes(host, token.is_some()));
+    body.extend(install::notes(&host, token.is_some()));
     body.extend(tail);
     Modal::info_copyable(title, body, cmd)
 }
@@ -575,13 +650,16 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
     let now = chrono::Local::now().timestamp();
 
     match action {
-        Action::AddAgent { name, host } => {
+        Action::AddAgent { name, quota_bytes, reset_day } => {
             let (id, token) = agent_repo::create(&app.pool, name, now).await?;
+            // 配额与重置日在建的时候就填进去,免得建完还要再进一次编辑框。
+            if quota_bytes.is_some() || reset_day.is_some() {
+                agent_repo::update_settings(&app.pool, id, name, *quota_bytes, *reset_day).await?;
+            }
             // token 明文只在这里出现这一次。库里只有 hash 与前 8 位(§8.1)。
             app.modal = Some(install_modal(
                 &app.cfg,
                 &format!("agent #{id} {name} —— 在被控机上跑这一条"),
-                host,
                 Some(&token),
                 Vec::new(),
             ));
@@ -593,23 +671,21 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已保存 agent #{id} {name} 的设置(只影响主控侧的记账口径)"))
         }
 
-        Action::ShowInstall { id, name, host } => {
+        Action::ShowInstall { id, name } => {
             app.modal = Some(install_modal(
                 &app.cfg,
                 &format!("agent #{id} {name} 的接入命令"),
-                host,
                 None,
                 Vec::new(),
             ));
             Ok(String::new())
         }
 
-        Action::RotateToken { id, name, host } => {
+        Action::RotateToken { id, name } => {
             let token = agent_repo::rotate_token(&app.pool, *id).await?;
             app.modal = Some(install_modal(
                 &app.cfg,
                 &format!("{name} 的新 token —— 在那台机器上重跑这一条"),
-                host,
                 Some(&token),
                 vec![
                     String::new(),
@@ -711,6 +787,38 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已删除用户 {name}"))
         }
 
+        Action::SetConfig { section, key, value, label } => {
+            crate::config::set_value(&app.cfg_path, section, key, value)?;
+            // 立刻重读:不重读的话页面上还是旧值,人会以为没保存成功再改一遍。
+            app.reload_config();
+            Ok(format!("已保存「{label}」到 {}(重启 daemon 生效)", app.cfg_path))
+        }
+
+        Action::ShowNodeUsers { id, tag, agent } => {
+            let rows = data::node_breakdown(&app.pool, *id).await?;
+            let n = rows.len();
+            app.overlay = Some(Overlay {
+                title: format!("节点 {tag} 上的用户"),
+                head: format!("{tag}(在 {agent} 上)· {n} 个用户"),
+                rows,
+            });
+            Ok(String::new())
+        }
+
+        Action::ShowUserNodes { id, name } => {
+            let rows = data::user_breakdown(&app.pool, *id).await?;
+            let n = rows.len();
+            app.overlay = Some(Overlay {
+                title: format!("{name} 的节点用量"),
+                head: format!("{name} · {n} 个节点"),
+                rows,
+            });
+            Ok(String::new())
+        }
+
+        // 刷新本身在主循环里做(每个动作之后都会 refresh 一次),这里只给回执。
+        Action::Refresh => Ok("已刷新".into()),
+
         Action::SetUserNodes { user_id, user, node_ids } => {
             let affected = node_repo::set_user_nodes(&app.pool, *user_id, node_ids).await?;
             if affected.is_empty() {
@@ -743,7 +851,7 @@ mod tests {
     fn install_modal_puts_the_command_on_its_own_first_line() {
         let mut cfg = Config::default();
         cfg.cluster.tls = false;
-        let m = install_modal(&cfg, "t", "203.0.113.8", Some("tok"), Vec::new());
+        let m = install_modal(&cfg, "t", Some("tok"), Vec::new());
         let Modal::Info { body, copy, .. } = &m else { panic!("应当是信息框") };
         assert!(body[0].starts_with("curl -fsSL "), "第一行就该是命令: {:?}", body[0]);
         assert_eq!(copy.as_deref(), Some(body[0].as_str()), "按 y 复制的就该是那一行");
@@ -757,7 +865,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.cluster.tls = false;
         let mut a = app();
-        a.modal = Some(install_modal(&cfg, "t", "203.0.113.8", Some("tok"), Vec::new()));
+        a.modal = Some(install_modal(&cfg, "t", Some("tok"), Vec::new()));
         assert!(on_key(&mut a, key('y')).is_none());
         let Some(Modal::Info { copied, .. }) = &a.modal else { panic!("弹窗不该关掉") };
         let msg = copied.as_deref().unwrap_or_default();
@@ -791,10 +899,10 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.cluster.tls = false;
+        cfg.subscription.public_base = "https://sub.example.com".into();
         let mut m = install_modal(
             &cfg,
             "agent #1 tokyo-1 —— 在被控机上跑这一条",
-            "203.0.113.8",
             Some("Zm9vYmFyYmF6cXV1eDEyMzQ1Njc4OWFiY2RlZg"),
             Vec::new(),
         );
@@ -823,10 +931,123 @@ mod tests {
         }
     }
 
+    /// 明细表开着时,页面快捷键必须被吃掉。
+    ///
+    /// 这一条守的是一个会丢数据的错:明细表盖在节点表上,那时按 `d`
+    /// 会去删掉**后面那张表里选中的节点**,而人以为自己只是在关一个只读的框。
+    #[tokio::test]
+    async fn an_open_breakdown_swallows_page_shortcuts() {
+        let mut a = app();
+        a.page = Page::Nodes;
+        a.nodes = vec![stub_node(7, "n7")];
+        a.overlay = Some(Overlay { title: "t".into(), head: "h".into(), rows: vec![] });
+
+        assert!(on_key(&mut a, key('d')).is_none(), "不该产生删除动作");
+        assert!(a.modal.is_none(), "也不该弹出确认框");
+        assert!(a.overlay.is_none(), "任意键关掉明细表");
+
+        // 关掉之后快捷键恢复正常。
+        assert!(on_key(&mut a, key('d')).is_none());
+        assert!(matches!(a.modal, Some(Modal::Confirm { .. })), "这次才该弹确认框");
+    }
+
+    /// 节点页和用户页的 Enter 各自打开自己方向的明细。
+    #[tokio::test]
+    async fn enter_opens_the_right_breakdown() {
+        let mut a = app();
+        a.page = Page::Nodes;
+        a.nodes = vec![stub_node(7, "n7")];
+        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::ShowNodeUsers { id: 7, .. })), "节点页要看各用户");
+
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::ShowUserNodes { id: 1, .. })), "用户页要看各节点");
+    }
+
+    /// `R` 是大写的:小写 `r` 在服务管理页是「轮换 token」,
+    /// 那是一个不可撤销的动作,不能和刷新只差一个 Shift 却又长得像。
+    #[tokio::test]
+    async fn refresh_is_uppercase_only() {
+        let mut a = app();
+        a.page = Page::Agents;
+        a.agents = vec![stub_agent(1)];
+        assert!(matches!(on_key(&mut a, key('R')), Some(Action::Refresh)));
+
+        let act = on_key(&mut a, key('r'));
+        assert!(act.is_none());
+        assert!(matches!(a.modal, Some(Modal::Confirm { .. })), "小写 r 仍是轮换 token 的确认框");
+    }
+
+    /// 设置页:布尔项按一下就切,不弹框。
+    #[tokio::test]
+    async fn a_boolean_setting_flips_without_a_form() {
+        let mut a = app();
+        a.page = Page::Settings;
+        // 第一个布尔项是「订阅服务」(下标 2)。
+        a.sel[Page::Settings as usize] = 2;
+        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Action::SetConfig { section, key, value, .. }) = act else {
+            panic!("应当直接产生一个写配置的动作,而不是弹表单")
+        };
+        assert_eq!((section, key), ("subscription", "enabled"));
+        assert_eq!(value, "false", "默认是开,按一下该变关");
+        assert!(a.modal.is_none());
+    }
+
+    /// 非布尔项开一个单字段表单,并且**凭据不预填**(§11.3)。
+    #[tokio::test]
+    async fn a_secret_setting_opens_an_empty_form() {
+        let mut a = app();
+        a.cfg.telegram.bot_token = "1234567890:AAHsecret".into();
+        a.page = Page::Settings;
+        let items = settings::all(&a.cfg);
+        a.sel[Page::Settings as usize] =
+            items.iter().position(|s| s.key == "bot_token").unwrap();
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Some(Modal::Form(form)) = &a.modal else { panic!("应当开一个表单") };
+        assert_eq!(form.fields[0].value(), "", "不该把旧凭据铺在输入框里");
+    }
+
+    /// 设置页写的是**真的文件**,并且写完立刻重读 ——
+    /// 不重读的话页面上还是旧值,人会以为没保存成功再改一遍。
+    #[tokio::test]
+    async fn saving_a_setting_writes_the_file_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("sbx-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# 别把我删了\n[cluster]\ntls = true\n").unwrap();
+
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let mut a = App::new(pool, Config::default(), path.to_string_lossy().into_owned());
+
+        let msg = perform_inner(
+            &mut a,
+            &Action::SetConfig {
+                section: "subscription",
+                key: "public_base",
+                value: "\"https://sub.example.com\"".into(),
+                label: "订阅对外地址".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("重启 daemon"), "{msg}");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 别把我删了"), "注释被抹掉了:\n{text}");
+        assert!(text.contains("public_base = \"https://sub.example.com\""), "{text}");
+        // 内存里的那份也要更新。
+        assert_eq!(a.cfg.subscription.public_base, "https://sub.example.com");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn app() -> App {
         // 只用来测按键与选择逻辑,不碰数据库。
         let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
-        App::new(pool, Config::default())
+        App::new(pool, Config::default(), "sbx-test.toml".into())
     }
 
     fn key(c: char) -> KeyEvent {
@@ -834,10 +1055,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_cycles_through_all_four_pages() {
+    async fn tab_cycles_through_all_five_pages() {
         let mut a = app();
         assert!(a.page == Page::Dashboard);
-        for want in [Page::Agents, Page::Nodes, Page::Users, Page::Dashboard] {
+        for want in [Page::Agents, Page::Nodes, Page::Users, Page::Settings, Page::Dashboard] {
             on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
             assert!(a.page == want, "Tab 顺序不对");
         }
@@ -847,14 +1068,18 @@ mod tests {
     #[tokio::test]
     async fn number_keys_jump_straight_to_a_page() {
         let mut a = app();
-        for (c, want) in
-            [('3', Page::Nodes), ('1', Page::Dashboard), ('4', Page::Users), ('2', Page::Agents)]
-        {
+        for (c, want) in [
+            ('3', Page::Nodes),
+            ('1', Page::Dashboard),
+            ('5', Page::Settings),
+            ('4', Page::Users),
+            ('2', Page::Agents),
+        ] {
             on_key(&mut a, key(c));
             assert!(a.page == want, "按 {c} 应当到对应的页");
         }
-        // 5 不是页码,不该有任何反应(也不该被当成别的快捷键)。
-        on_key(&mut a, key('5'));
+        // 6 不是页码,不该有任何反应(也不该被当成别的快捷键)。
+        on_key(&mut a, key('6'));
         assert!(a.page == Page::Agents);
     }
 
@@ -1081,7 +1306,7 @@ mod tests {
         let uid = crate::db::node_repo::add_user(&pool, "alice", 100 * 1_073_741_824, 0).await.unwrap();
         crate::db::node_repo::assign_node(&pool, uid, node_id).await.unwrap();
 
-        let mut app = App::new(pool, Config::default());
+        let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
         app.refresh().await.expect("刷新不该失败");
 
         assert_eq!(app.agents.len(), 1);
@@ -1102,13 +1327,18 @@ mod tests {
         assert_eq!(app.users[0].name, "alice");
         assert_eq!(app.users[0].node_ids, vec![node_id]);
 
-        assert_eq!(app.events.len(), 1, "事件表要读得出来(概览页要用)");
-        assert_eq!(app.events[0].agent_name.as_deref(), Some("tokyo-1"));
+        // 用量明细两个方向都要查得出来(节点页 / 用户页的 Enter)。
+        let by_node = data::node_breakdown(&app.pool, node_id).await.unwrap();
+        assert_eq!(by_node.len(), 1);
+        assert_eq!(by_node[0].label, "alice");
+        let by_user = data::user_breakdown(&app.pool, uid).await.unwrap();
+        assert_eq!(by_user.len(), 1);
+        assert!(by_user[0].label.starts_with("tokyo-reality @ tokyo-1"), "{}", by_user[0].label);
 
         // 四个页面都要能画出来。ratatui 越界写入是直接 panic 的,
         // 所以「画得出来」本身就是一条有效断言。
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
-        for page in [Page::Dashboard, Page::Agents, Page::Nodes, Page::Users] {
+        for page in [Page::Dashboard, Page::Agents, Page::Nodes, Page::Users, Page::Settings] {
             app.page = page;
             term.draw(|f| draw(f, &app)).unwrap();
         }
@@ -1140,7 +1370,7 @@ mod tests {
         .await
         .unwrap();
 
-        let mut app = App::new(pool, Config::default());
+        let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
         app.refresh().await.unwrap();
 
         let msg = perform_inner(
@@ -1191,7 +1421,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let mut app = App::new(pool, Config::default());
+        let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
         app.refresh().await.unwrap();
         perform_inner(
             &mut app,

@@ -13,13 +13,31 @@ use crate::config::Config;
 /// 一键安装脚本的地址。与 README / CHANGELOG 里那条是同一个 URL,改了要一起改。
 pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh";
 
-/// 被控机回连主控用的默认地址。
+/// 被控机回连主控用的地址,**自动定**,不再让人手填。
 ///
-/// 主控只知道自己 `listen` 在 `0.0.0.0:18443`,不知道对外该用哪个地址,
-/// 所以拿订阅的 `public_base` 的主机名当**猜测** —— 多数部署里订阅和 WS
-/// 就在同一台机器上。猜错了人可以直接改,总比让人从零开始打强。
-pub fn default_host(cfg: &Config) -> String {
-    let base = cfg.subscription.public_base.trim();
+/// 优先级,理由都在后面:
+///   1. `subscription.public_base` 的主机名 —— 配了订阅域名就用域名。
+///      域名比 IP 好:换机器不用重发接入命令,而且证书/TLS 那一套才说得通。
+///   2. 本机的公网出口 IP(向外发一个 UDP「连接」,读本地端点,**不发包**)。
+///   3. 第一个非回环的本机地址 —— 内网部署时这个才是对的。
+///   4. 都拿不到就给占位符,并在提示里说清要换掉。
+///
+/// 探测是**纯本地**的:`UdpSocket::connect` 到一个公网地址只是让内核选一条路由,
+/// 不产生任何流量、不依赖外部服务、不会卡住。代价是拿到的是**出口网卡地址** ——
+/// 在 NAT 后面的机器上它是内网地址,那时人得自己去设置页填 `public_base`。
+/// 这比去请求一个 ipify 之类的外部服务好:那会在无外网的内网部署里卡住十几秒,
+/// 而且给 TUI 引入一个网络依赖。
+pub fn resolve_host(cfg: &Config) -> String {
+    let from_sub = host_of(&cfg.subscription.public_base);
+    if !from_sub.is_empty() {
+        return from_sub;
+    }
+    outbound_ip().unwrap_or_else(|| "<主控地址>".into())
+}
+
+/// 从 `https://sub.example.com:8443/x` 里取出 `sub.example.com`。
+fn host_of(base: &str) -> String {
+    let base = base.trim();
     if base.is_empty() {
         return String::new();
     }
@@ -30,6 +48,29 @@ pub fn default_host(cfg: &Config) -> String {
         Some(r) => r.split_once(']').map(|(h, _)| format!("[{h}]")).unwrap_or_else(|| hostport.into()),
         None => hostport.split(':').next().unwrap_or(hostport).to_string(),
     }
+}
+
+/// 本机的出口地址。**不发包**,只让内核按路由表选一个本地端点。
+fn outbound_ip() -> Option<String> {
+    // 两个目标各试一次:先 IPv4,再 IPv6。只有 IPv6 的机器上前者会失败。
+    for target in ["1.1.1.1:53", "[2606:4700:4700::1111]:53"] {
+        let bind = if target.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" };
+        if let Ok(sock) = std::net::UdpSocket::bind(bind) {
+            if sock.connect(target).is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    let ip = addr.ip();
+                    if !ip.is_loopback() && !ip.is_unspecified() {
+                        return Some(match ip {
+                            std::net::IpAddr::V4(v4) => v4.to_string(),
+                            // URL 里要方括号,交给 url_host 统一处理,这里给裸地址。
+                            std::net::IpAddr::V6(v6) => v6.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 从 `0.0.0.0:18443` 里取出端口。取不到就用默认值 —— 这个字符串只是拼给人看的
@@ -75,9 +116,18 @@ pub fn notes(host: &str, has_token: bool) -> Vec<String> {
         "整条复制到被控机上跑(root)。脚本会装好 sbx-agent、写 /etc/sbx/agent.toml(0600)、".into(),
         "并 enable --now sbx-agent。以后重跑同一条命令就是升级。".into(),
     ];
-    if host.trim().is_empty() {
+    if host.trim().is_empty() || host.starts_with('<') {
         out.push(String::new());
-        out.push("⚠ 主控地址是空的,命令里留了 <主控地址> 占位符 —— 换成被控机能连到的 IP 或域名。".into());
+        out.push("⚠ 没能定出主控地址,命令里留了占位符。去「设置」页填上订阅对外地址,".into());
+        out.push("  或者直接把 <主控地址> 换成被控机能连到的 IP / 域名。".into());
+    } else if !host.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '[') {
+        // 域名:顺带说一句它比 IP 好在哪 —— 换机器时不用重发接入命令。
+        out.push(String::new());
+        out.push(format!("主控地址取自订阅域名({host})。换机器时只要域名不变,被控端不用重配。"));
+    } else {
+        out.push(String::new());
+        out.push(format!("主控地址是自动探到的出口地址({host})。"));
+        out.push("这台机器在 NAT 后面的话它会是内网地址 —— 去「设置」页填订阅对外地址即可覆盖。".into());
     }
     if has_token {
         out.push(String::new());
@@ -98,11 +148,10 @@ mod tests {
         assert_eq!(port_of("nonsense"), "18443");
     }
 
-    /// 从订阅地址里猜主控主机名。猜错了人可以改,但不能猜出一个带端口或带路径的东西 ——
+    /// 从订阅地址里取主控主机名。不能取出一个带端口或带路径的东西 ——
     /// 那会拼出 `wss://example.com:8080:18443/ws` 这种一眼看不出错在哪的地址。
     #[test]
-    fn default_host_extracts_just_the_hostname() {
-        let mut cfg = Config::default();
+    fn host_of_extracts_just_the_hostname() {
         for (base, want) in [
             ("https://sub.example.com", "sub.example.com"),
             ("https://sub.example.com/", "sub.example.com"),
@@ -111,9 +160,26 @@ mod tests {
             ("https://[2001:db8::1]:8443", "[2001:db8::1]"),
             ("", ""),
         ] {
-            cfg.subscription.public_base = base.into();
-            assert_eq!(default_host(&cfg), want, "public_base = {base}");
+            assert_eq!(host_of(base), want, "public_base = {base}");
         }
+    }
+
+    /// 配了订阅域名就用域名 —— 域名比自动探到的 IP 好:换机器时被控端不用重配。
+    #[test]
+    fn a_subscription_domain_wins_over_the_probed_ip() {
+        let mut cfg = Config::default();
+        cfg.subscription.public_base = "https://sub.example.com".into();
+        assert_eq!(resolve_host(&cfg), "sub.example.com");
+    }
+
+    /// 没配订阅域名时自动探。探不到也不能返回空串 ——
+    /// 空串会拼出 `wss://:18443/ws`,那是一条看起来像对的错命令。
+    #[test]
+    fn without_a_domain_it_falls_back_to_something_visible() {
+        let cfg = Config::default();
+        let host = resolve_host(&cfg);
+        assert!(!host.is_empty());
+        assert!(!host.contains('/') && !host.contains("://"), "只该是主机名: {host}");
     }
 
     /// IPv6 主控地址必须带方括号,否则 `wss://2001:db8::1:18443/ws` 里
@@ -151,7 +217,19 @@ mod tests {
         cfg.cluster.tls = false;
         let cmd = command(&cfg, "", Some("tok"));
         assert!(cmd.contains("<主控地址>"), "{cmd}");
-        assert!(notes("", true).join("\n").contains("主控地址是空的"));
+        // 空串和占位符都要走「说出来」那条路。
+        for h in ["", "<主控地址>"] {
+            assert!(notes(h, true).join("\n").contains("没能定出主控地址"), "host={h:?}");
+        }
+    }
+
+    /// 域名与自动探到的 IP 要给**不同**的提示:前者说「换机器不用重配」,
+    /// 后者要提醒「NAT 后面会探成内网地址」。给同一句话等于两边都没说清。
+    #[test]
+    fn the_note_explains_where_the_host_came_from() {
+        assert!(notes("sub.example.com", false).join("\n").contains("订阅域名"));
+        assert!(notes("203.0.113.8", false).join("\n").contains("NAT"));
+        assert!(notes("[2001:db8::1]", false).join("\n").contains("NAT"), "IPv6 也算自动探的");
     }
 
     /// 重新查看接入命令时 token 是取不到的(库里只有 hash),

@@ -165,7 +165,22 @@ pub async fn ingest_sysinfo(
         None => (None, 0, 0),
     };
 
-    let d = delta::compute_pair(last_boot, last_rx, last_tx, &r.boot_id, r.nic.rx, r.nic.tx);
+    // **第一次见到这台 agent 时只建基线,不入账。**
+    //
+    // 通用的 epoch 规则(§5.2)是「epoch 变了 → delta = new」,那对**用户流量**是对的:
+    // agent 的 tracker 从进程启动才开始数,new 就是这段时间真实发生的量。
+    // 但网卡计数读的是 `/proc/net/dev`,它从**机器开机**就在数 —— 一台已经跑了
+    // 三个月的机器接进来,第一次上报会把这三个月的流量整个搬进本周期用量,
+    // 界面上立刻显示「1.49 GB」甚至几百 GB,而这台机器在本集群里其实一个字节都没跑。
+    //
+    // 注意这**不影响 boot_id 变更**那条路:机器重启后计数器确实是从 0 开始的,
+    // 那时 delta = new 才是对的。区别只在「有没有基线」,不在「epoch 变没变」。
+    let first_contact = prev.is_none();
+    let d = if first_contact {
+        delta::PairDelta { up: 0, down: 0, epoch_changed: false }
+    } else {
+        delta::compute_pair(last_boot, last_rx, last_tx, &r.boot_id, r.nic.rx, r.nic.tx)
+    };
 
     sqlx::query(
         "INSERT INTO agent_nic_traffic
@@ -473,8 +488,46 @@ mod tests {
             .unwrap()
     }
 
-    /// 主机指标要落到 `agents` 上,并且**每次覆盖**成最新的一份。
+    /// 第一次见到一台 agent 时**只建基线,不入账**。
     ///
+    /// 这条守的是一个很难事后发现的错:网卡计数读的是 `/proc/net/dev`,
+    /// 从**机器开机**就在数。一台已经跑了三个月的机器接进来,若照通用 epoch 规则
+    /// 「epoch 变了 → delta = new」办,第一次上报就会把那三个月整个搬进本周期用量 ——
+    /// 界面上凭空多出几十上百 GB,而这台机器在本集群里一个字节都还没跑。
+    #[tokio::test]
+    async fn the_first_report_only_records_a_baseline() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+
+        // 一台开机三个月的机器:网卡上已经有 500 GB。
+        let huge = 500 * 1_073_741_824;
+        let o = ingest_sysinfo(&p, a, &sysinfo("boot-1", huge, huge), 1_000).await.unwrap();
+        assert_eq!((o.rx_delta, o.tx_delta), (0, 0), "首次上报不该入账");
+        assert!(!o.epoch_changed, "首次上报不是「计数器重置」,不该刷审计记录");
+        assert_eq!(nic(&p, a).await, (0, 0), "本周期用量应当从 0 开始");
+
+        // 之后正常做差。
+        ingest_sysinfo(&p, a, &sysinfo("boot-1", huge + 300, huge + 700), 1_030).await.unwrap();
+        assert_eq!(nic(&p, a).await, (300, 700));
+    }
+
+    /// 但机器**重启**时 delta = new 仍然是对的 —— 那时计数器确实从 0 开始了。
+    /// 区别在「有没有基线」,不在「epoch 变没变」,这两条不能混。
+    #[tokio::test]
+    async fn a_reboot_still_counts_the_whole_counter() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        ingest_sysinfo(&p, a, &sysinfo("boot-1", 1_000, 1_000), 10).await.unwrap();
+        ingest_sysinfo(&p, a, &sysinfo("boot-1", 1_500, 1_500), 40).await.unwrap();
+        assert_eq!(nic(&p, a).await, (500, 500));
+
+        // 重启:计数器归零后又跑了 200/300。
+        let o = ingest_sysinfo(&p, a, &sysinfo("boot-2", 200, 300), 70).await.unwrap();
+        assert!(o.epoch_changed, "重启要留痕(§5.4)");
+        assert_eq!(nic(&p, a).await, (700, 800), "重启后的量要接着累加");
+    }
+
+    /// 主机指标要落到 `agents` 上,并且**每次覆盖**成最新的一份。    ///
     /// 这几个值以前是被直接扔掉的:`sysinfo.report` 每 30 秒把 CPU / 内存 / load
     /// 送到主控,入库时只取了 nic 那一段 —— 于是概览页想显示「哪台机器忙成什么样」
     /// 时无米下锅,而数据其实早就在线上了。
@@ -523,14 +576,15 @@ mod tests {
         let p = pool().await;
         let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
 
+        // 第一次只建基线(见 the_first_report_only_records_a_baseline)。
         let o1 = ingest_sysinfo(&p, a, &sysinfo("boot-1", 1_000, 2_000), 10).await.unwrap();
-        assert_eq!((o1.rx_delta, o1.tx_delta), (1_000, 2_000));
+        assert_eq!((o1.rx_delta, o1.tx_delta), (0, 0));
         assert!(!o1.epoch_changed);
 
         let o2 = ingest_sysinfo(&p, a, &sysinfo("boot-1", 1_500, 2_200), 40).await.unwrap();
         // 增量供内存里算网速用(§8.2),不落库
         assert_eq!((o2.rx_delta, o2.tx_delta), (500, 200));
-        assert_eq!(nic(&p, a).await, (1_500, 2_200));
+        assert_eq!(nic(&p, a).await, (500, 200));
     }
 
     /// 机器重启:boot_id 变化 + 计数器清零(§5.2 / §6.4)。
@@ -539,11 +593,15 @@ mod tests {
         let p = pool().await;
         let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
 
+        // 建基线,再正常跑一段:重启前本周期已经有 (400, 300)。
         ingest_sysinfo(&p, a, &sysinfo("boot-1", 900_000, 800_000), 10).await.unwrap();
-        let o = ingest_sysinfo(&p, a, &sysinfo("boot-2", 1_024, 2_048), 20).await.unwrap();
+        ingest_sysinfo(&p, a, &sysinfo("boot-1", 900_400, 800_300), 20).await.unwrap();
+        assert_eq!(nic(&p, a).await, (400, 300));
+
+        let o = ingest_sysinfo(&p, a, &sysinfo("boot-2", 1_024, 2_048), 30).await.unwrap();
 
         assert!(o.epoch_changed, "boot_id 变化必须可见");
-        assert_eq!(nic(&p, a).await, (901_024, 802_048), "重启前的量不能丢");
+        assert_eq!(nic(&p, a).await, (1_424, 2_348), "重启前的量不能丢");
 
         let n: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE kind = 'nic_counter_reset'")

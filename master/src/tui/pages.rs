@@ -16,12 +16,14 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Wrap},
     Frame,
 };
+use std::collections::VecDeque;
 
-use super::data::{AgentRow, EventRow, NodeRow, UserRow};
+use super::data::{AgentRow, BreakdownRow, NodeRow, UserRow};
 use super::forms;
 use super::theme;
 
@@ -38,7 +40,7 @@ fn header(cols: &[&str]) -> Row<'static> {
 
 fn row_style(selected: bool) -> Style {
     if selected {
-        Style::default().bg(Color::Rgb(0x2a, 0x2a, 0x2a)).add_modifier(Modifier::BOLD)
+        Style::default().bg(theme::ROW_BG).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     }
@@ -71,38 +73,41 @@ fn pick<T: Copy + PartialEq>(total: u16, all: &[T], width: fn(T) -> u16, drop_or
     cols
 }
 
-// ─────────────────────────── 概览 ───────────────────────────
+// ─────────────────────────── 仪表盘 ───────────────────────────
 
-/// 概览页。回答的是打开界面第一秒想知道的三件事:
-/// 有没有机器掉线、流量烧到哪儿了、刚才发生过什么。
+/// 仪表盘。三块,从上到下按「多久看一次」排:
 ///
-/// 最后那一项(最近事件)是刻意放进来的:数字不对时第一个该看的就是它 ——
-/// 计数器重置、配额自动停用、配置下发失败都记在 `agent_events` 里,
-/// 而在此之前这张表只能靠 `sqlite3` 手查。
+///   1. 概况 —— 一眼扫,回答「有没有东西挂了」;
+///   2. 网速折线(盲文点阵)—— 趋势,回答「现在忙不忙、什么时候忙」;
+///   3. 用量 Top / 各机器 —— 明细,回答「谁在烧、烧在哪台」。
+///
+/// 折线图在矮终端上整块让掉:一条挤成两行的曲线不如把地方给下面的条形和数字。
 pub fn dashboard(
     f: &mut Frame,
     area: Rect,
     agents: &[AgentRow],
     nodes: &[NodeRow],
     users: &[UserRow],
-    events: &[EventRow],
+    history: &VecDeque<(f64, f64)>,
     now: i64,
 ) {
+    let chart_h = if area.height >= 24 { 9 } else { 0 };
     let c = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(6), Constraint::Length(8)])
+        .constraints([Constraint::Length(6), Constraint::Length(chart_h), Constraint::Min(4)])
         .split(area);
 
     summary(f, c[0], agents, nodes, users);
+    if chart_h > 0 {
+        net_charts(f, c[1], history);
+    }
 
     let mid = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(c[1]);
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(c[2]);
     top_users(f, mid[0], users, now);
     agent_quotas(f, mid[1], agents, now);
-
-    recent_events(f, c[2], events);
 }
 
 fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], users: &[UserRow]) {
@@ -119,54 +124,128 @@ fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], us
     let known = agents.iter().filter(|a| a.up_per_sec.is_some()).count();
     let up: f64 = agents.iter().filter_map(|a| a.up_per_sec).sum();
     let down: f64 = agents.iter().filter_map(|a| a.down_per_sec).sum();
-    let speed = if known == 0 {
-        Span::styled("↑ --   ↓ --", Style::default().fg(theme::DIM))
+    let speed: Vec<Span> = if known == 0 {
+        vec![Span::styled("↑ --   ↓ --", Style::default().fg(theme::DIM))]
     } else {
-        Span::styled(
-            format!("↑ {}   ↓ {}", theme::rate(up), theme::rate(down)),
-            Style::default().fg(theme::UP),
-        )
+        vec![
+            Span::styled(format!("↑ {}", theme::rate(up)), Style::default().fg(theme::UP)),
+            Span::raw("   "),
+            Span::styled(format!("↓ {}", theme::rate(down)), Style::default().fg(theme::DOWN)),
+        ]
     };
 
-    let nic: i64 = agents.iter().map(|a| a.used()).sum();
+    let nic_up: i64 = agents.iter().map(|a| a.cycle_rx).sum();
+    let nic_down: i64 = agents.iter().map(|a| a.cycle_tx).sum();
     let billed: i64 = users.iter().map(|u| u.used()).sum();
 
-    let lines = vec![
-        Line::from(vec![
-            Span::raw("  被控服务器  "),
-            Span::styled(
-                format!("{:<5}", agents.len()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("● 在线 {online}   "), Style::default().fg(theme::ONLINE)),
-            Span::styled(format!("● 离线 {offline}   "), Style::default().fg(theme::OFFLINE)),
-            Span::styled(format!("○ 从未连接 {never}"), Style::default().fg(theme::NEVER)),
-        ]),
-        Line::from(vec![
-            Span::raw("  节点 / 用户  "),
-            Span::styled(
-                format!("{} 个 · {} 人   ", nodes.len(), users.len()),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("启用 {enabled}   "), Style::default().fg(theme::ONLINE)),
-            Span::styled(format!("自动停用 {auto_off}   "), Style::default().fg(theme::NEVER)),
-            Span::styled(format!("手动停用 {manual_off}"), Style::default().fg(theme::OFFLINE)),
-        ]),
-        Line::from(vec![Span::raw("  当前网速    "), speed]),
-        Line::from(vec![
-            Span::raw("  本周期用量  "),
-            Span::styled(format!("网卡 {}   ", theme::bytes(nic)), Style::default().fg(theme::DOWN)),
-            Span::styled(format!("计费 {}", theme::bytes(billed)), Style::default().fg(theme::ACCENT)),
-            // 两个数字口径不同,不写清楚会被当成对不上的 bug(§6.4 / §7.2)。
-            Span::styled(
-                "   (网卡 = 机器进出总量;计费 = 各用户用量 × 倍率)",
-                Style::default().fg(theme::DIM),
-            ),
-        ]),
+    let mut head = vec![
+        Span::raw("  被控服务器  "),
+        Span::styled(format!("{:<5}", agents.len()), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("● 在线 {online}   "), Style::default().fg(theme::ONLINE)),
+        Span::styled(format!("● 离线 {offline}   "), Style::default().fg(theme::OFFLINE)),
+    ];
+    // 「从未连接」为 0 时不占地方 —— 一排 0 会把真正要看的数字挤走。
+    if never > 0 {
+        head.push(Span::styled(format!("○ 从未连接 {never}"), Style::default().fg(theme::NEVER)));
+    }
+
+    let mut line2 = vec![
+        Span::raw("  节点 / 用户  "),
+        Span::styled(
+            format!("{} 个 · {} 人   ", nodes.len(), users.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("启用 {enabled}   "), Style::default().fg(theme::ONLINE)),
+    ];
+    if auto_off > 0 {
+        line2.push(Span::styled(format!("自动停用 {auto_off}   "), Style::default().fg(theme::NEVER)));
+    }
+    if manual_off > 0 {
+        line2.push(Span::styled(format!("手动停用 {manual_off}"), Style::default().fg(theme::OFFLINE)));
+    }
+
+    let mut speed_line = vec![Span::raw("  当前网速    ")];
+    speed_line.extend(speed);
+
+    let usage = vec![
+        Span::raw("  本周期用量  "),
+        Span::styled("网卡 ", Style::default().fg(theme::DIM)),
+        Span::styled(format!("↑ {}", theme::bytes(nic_up)), Style::default().fg(theme::UP)),
+        Span::raw(" "),
+        Span::styled(format!("↓ {}", theme::bytes(nic_down)), Style::default().fg(theme::DOWN)),
+        Span::styled("   计费 ", Style::default().fg(theme::DIM)),
+        Span::styled(theme::bytes(billed), Style::default().fg(theme::ACCENT)),
+        // 两个数字口径不同,不写清楚会被当成对不上的 bug(§6.4 / §7.2)。
+        Span::styled("   (网卡 = 整机进出;计费 = 用户用量 × 倍率)", Style::default().fg(theme::DIM)),
     ];
 
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 概况 ")),
+        Paragraph::new(vec![
+            Line::from(head),
+            Line::from(line2),
+            Line::from(speed_line),
+            Line::from(usage),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" 概况 ")),
+        area,
+    );
+}
+
+/// 上下行两张盲文点阵折线图。
+///
+/// 一个点 = **一轮上报**(30s),不是一次刷新 —— 每次刷新都记的话,一轮上报会被
+/// 复制成 30 个一样的点,横轴的含义就从「时间」变成了「刷新次数」(data.rs::observe)。
+///
+/// 纵轴上限取历史最大值的 1.2 倍,保底 1 KB:固定上限会让小流量时的曲线永远贴着底,
+/// 而那时人恰恰想看的是「有没有波动」。
+fn net_charts(f: &mut Frame, area: Rect, history: &VecDeque<(f64, f64)>) {
+    let cc = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    let up: Vec<(f64, f64)> = history.iter().enumerate().map(|(i, (u, _))| (i as f64, *u)).collect();
+    let down: Vec<(f64, f64)> =
+        history.iter().enumerate().map(|(i, (_, d))| (i as f64, *d)).collect();
+    let cur_up = history.back().map(|(u, _)| *u).unwrap_or(0.0);
+    let cur_down = history.back().map(|(_, d)| *d).unwrap_or(0.0);
+
+    net_chart(f, cc[0], &up, theme::UP, format!(" ↑ 上行  {} ", theme::rate(cur_up)));
+    net_chart(f, cc[1], &down, theme::DOWN, format!(" ↓ 下行  {} ", theme::rate(cur_down)));
+}
+
+fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title: String) {
+    if data.len() < 2 {
+        // 一个点画不成线。直接说「在攒数据」,而不是画一张空图让人以为坏了。
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  还在攒数据(每 30 秒一个点)",
+                Style::default().fg(theme::DIM),
+            )))
+            .block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
+        return;
+    }
+    let y_max = data.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max).max(1024.0) * 1.2;
+    let x_max = (data.len() - 1) as f64;
+
+    let datasets = vec![Dataset::default()
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(color))
+        .data(data)];
+    f.render_widget(
+        Chart::new(datasets)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .x_axis(Axis::default().bounds([0.0, x_max]))
+            .y_axis(
+                Axis::default()
+                    .bounds([0.0, y_max])
+                    // 纵轴只标顶:标满会把本来就窄的图挤没。
+                    .labels::<Vec<Line>>(vec![Line::from(""), Line::from(theme::rate(y_max))])
+                    .style(Style::default().fg(theme::DIM)),
+            ),
         area,
     );
 }
@@ -175,7 +254,7 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
     let mut top: Vec<&UserRow> = users.iter().collect();
     top.sort_by_key(|u| std::cmp::Reverse(u.used()));
     let rows = area.height.saturating_sub(2) as usize;
-    let bar_w = (area.width.saturating_sub(40)).clamp(0, 18) as usize;
+    let bar_w = (area.width.saturating_sub(46)).clamp(0, 16) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
     if top.is_empty() {
@@ -186,11 +265,12 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
     }
     for u in top.into_iter().take(rows) {
         let mut spans = vec![
+            Span::styled(format!("  {}", theme::pad(&u.name, 12)), Style::default().fg(state_color(u))),
+            Span::styled(format!("↑{:>9} ", theme::bytes(u.cycle_up)), Style::default().fg(theme::UP)),
             Span::styled(
-                format!("  {}", theme::pad(&u.name, 14)),
-                Style::default().fg(state_color(u)),
+                format!("↓{:>9} ", theme::bytes(u.cycle_down)),
+                Style::default().fg(theme::DOWN),
             ),
-            Span::raw(format!("{:>10}  ", theme::bytes(u.used()))),
         ];
         match u.quota_ratio() {
             Some(r) => {
@@ -203,14 +283,24 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
                 ));
             }
             // 不限流量的行**不画条**:一根满条读起来是「用完了」,正好相反(§8.2)。
-            None => spans.push(Span::styled(" 不限流量", Style::default().fg(theme::DIM))),
+            None => spans.push(Span::styled(" 不限", Style::default().fg(theme::DIM))),
         }
         if let Some(ts) = u.expire_at {
             let d = forms::days_until(ts, now);
-            if d < 0 {
-                spans.push(Span::styled("  已过期", Style::default().fg(Color::Red)));
+            let tail = if d < 0 {
+                Some(("  已过期".to_string(), Color::Red))
             } else if d <= 7 {
-                spans.push(Span::styled(format!("  {d} 天后到期"), Style::default().fg(theme::NEVER)));
+                Some((format!("  {d} 天后到期"), theme::NEVER))
+            } else {
+                None
+            };
+            // 放得下才接上去。让 `Paragraph` 去截会切出「3」这种半截提示 ——
+            // 比不显示更糟:它看起来像一个数字,而不是被切掉的一句话。
+            if let Some((text, color)) = tail {
+                let used: usize = spans.iter().map(|s| theme::cols(&s.content)).sum();
+                if used + theme::cols(&text) + 2 <= area.width as usize {
+                    spans.push(Span::styled(text, Style::default().fg(color)));
+                }
             }
         }
         lines.push(Line::from(spans));
@@ -320,61 +410,8 @@ fn uptime_label(secs: i64) -> String {
     }
 }
 
-/// 事件类型 →(中文名, 颜色)。库里的 kind 是英文标识,直接显示等于让人去猜。
-fn event_style(kind: &str) -> (&'static str, Color) {
-    match kind {
-        "auth_failed" => ("认证失败", Color::Red),
-        "config_apply_failed" => ("下发失败", Color::Red),
-        "config_build_failed" => ("组装失败", Color::Red),
-        "user_auto_disabled" => ("自动停用", theme::NEVER),
-        "user_auto_enabled" => ("自动恢复", theme::ONLINE),
-        "user_cycle_reset" => ("周期重置", theme::ONLINE),
-        "counter_reset" => ("计数器重置", theme::DOWN),
-        "nic_counter_reset" => ("网卡计数重置", theme::DOWN),
-        "box_event" => ("agent 事件", theme::DIM),
-        other => {
-            // 认不出来的 kind 也要显示出来,不能吃掉整行:
-            // 新加的事件类型忘了在这里登记时,至少还能看到它发生了。
-            let _ = other;
-            ("事件", theme::DIM)
-        }
-    }
-}
 
-fn recent_events(f: &mut Frame, area: Rect, events: &[EventRow]) {
-    let rows = area.height.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
-    if events.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  还没有事件。上线/掉线、计数器重置、配额自动停用都会记在这里。",
-            Style::default().fg(theme::DIM),
-        )));
-    }
-    for e in events.iter().take(rows) {
-        let (label, color) = event_style(&e.kind);
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {}  ", short_time(e.at)), Style::default().fg(theme::DIM)),
-            Span::styled(theme::pad(label, 13), Style::default().fg(color)),
-            Span::styled(
-                theme::pad(e.agent_name.as_deref().unwrap_or("—"), 13),
-                Style::default().fg(theme::DIM),
-            ),
-            Span::raw(e.message.clone()),
-        ]));
-    }
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" 最近事件 "))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
-}
 
-fn short_time(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "??".into())
-}
 
 fn state_color(u: &UserRow) -> Color {
     match (u.enabled, u.auto_disabled) {
@@ -969,11 +1006,15 @@ fn user_detail(u: Option<&UserRow>, sub_base: &str) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("  #", Style::default().fg(theme::DIM)),
             Span::styled(u.id.to_string(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" {} · ", u.name)),
+            Span::styled(format!("↑ {}", theme::bytes(u.cycle_up)), Style::default().fg(theme::UP)),
+            Span::raw("  "),
+            Span::styled(
+                format!("↓ {}", theme::bytes(u.cycle_down)),
+                Style::default().fg(theme::DOWN),
+            ),
             Span::raw(format!(
-                " {} · 上行 {} · 下行 {} · 倍率 {:.1}x · 已分配 {} 个节点",
-                u.name,
-                theme::bytes(u.cycle_up),
-                theme::bytes(u.cycle_down),
+                "  · 倍率 {:.1}x · 已分配 {} 个节点",
                 u.traffic_multiplier,
                 u.node_count()
             )),
@@ -983,6 +1024,135 @@ fn user_detail(u: Option<&UserRow>, sub_base: &str) -> Vec<Line<'static>> {
             Span::styled(sub, Style::default().fg(theme::ACCENT)),
         ]),
     ]
+}
+
+// ─────────────────────────── 设置 ───────────────────────────
+
+pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], selected: usize) {
+    let c = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+
+    // 常驻提醒。daemon 启动时读一次配置就不再看,而「改了但没变」
+    // 是这个页面最容易造出来的困惑 —— 所以这句话不能藏在某一项的说明里。
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  改完要重启 daemon 才生效:", Style::default().fg(theme::NEVER)),
+            Span::styled(
+                "systemctl restart sbx",
+                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("    (改的是配置文件本身,注释与排版都保留)", Style::default().fg(theme::DIM)),
+        ]))
+        .block(Block::default().borders(Borders::ALL).title(" 设置 ")),
+        c[0],
+    );
+
+    let rows: Vec<Row> = items
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let value_style = match s.kind {
+                super::settings::Kind::Bool(true) => Style::default().fg(theme::ONLINE),
+                super::settings::Kind::Bool(false) => Style::default().fg(theme::OFFLINE),
+                super::settings::Kind::Secret => Style::default().fg(theme::NEVER),
+                _ => Style::default().fg(theme::ACCENT),
+            };
+            let shown = if s.shown.trim().is_empty() { "(未设置)".to_string() } else { s.shown.clone() };
+            Row::new(vec![
+                Cell::from(theme::truncate(&s.label, 25)),
+                Cell::from(Span::styled(theme::truncate(&shown, 29), value_style)),
+                Cell::from(Span::styled(s.note.clone(), Style::default().fg(theme::DIM))),
+                Cell::from(""),
+            ])
+            .style(row_style(i == selected))
+        })
+        .collect();
+
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(26),
+                Constraint::Length(30),
+                Constraint::Min(20),
+                Constraint::Length(0),
+            ],
+        )
+        .header(header(&["项", "当前值", "说明", ""]))
+        .block(Block::default().borders(Borders::ALL).title(" 配置项 ")),
+        c[1],
+    );
+}
+
+// ─────────────────────────── 用量明细(二级页面)───────────────────────────
+
+/// 「某节点上各用户」/「某用户在各节点」的明细弹窗。
+///
+/// 两个方向共用一个渲染:它们查的是 `user_traffic` 的同一张表,只是分组的那一维不同。
+/// 表里同时给**本周期**和**累计**:本周期是计费口径(会被月重置清零),
+/// 累计是从建账起的总量 —— 只给其中一个,总会有人拿它去回答另一个问题。
+pub fn breakdown(f: &mut Frame, area: Rect, title: &str, head: &str, rows: &[BreakdownRow]) {
+    let w = 92.min(area.width.max(1));
+    let h = (rows.len().max(1) as u16 + 6).min(area.height.max(1));
+    let rect = super::modal::centered(area, 0, 0, w, h);
+    f.render_widget(ratatui::widgets::Clear, rect);
+
+    let total: i64 = rows.iter().map(|r| r.cycle()).sum();
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("  {head}"),
+            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  还没有分配关系。分配了但没跑过流量的也会显示在这里(全 0)。",
+            Style::default().fg(theme::DIM),
+        )));
+    }
+    for r in rows {
+        // 条形按**占这次明细总量的比例**画,不是按配额:这里回答的问题是
+        // 「这些量里谁占大头」,而配额比例在列表页已经有了。
+        let share = if total > 0 { r.cycle() as f64 / total as f64 } else { 0.0 };
+        let bar = if w >= 80 { theme::gradient_bar(share, 10) } else { Vec::new() };
+        let mut spans = vec![
+            Span::raw("  "),
+            Span::raw(theme::pad(&r.label, 22)),
+            Span::styled(format!("↑{:>9} ", theme::bytes(r.cycle_up)), Style::default().fg(theme::UP)),
+            Span::styled(
+                format!("↓{:>9}  ", theme::bytes(r.cycle_down)),
+                Style::default().fg(theme::DOWN),
+            ),
+        ];
+        spans.extend(bar);
+        spans.push(Span::styled(
+            format!(" {:>3.0}%  ", share * 100.0),
+            Style::default().fg(theme::gradient_at(share)),
+        ));
+        spans.push(Span::styled(
+            format!("累计 {}  {}", theme::bytes(r.total_up + r.total_down), r.note),
+            Style::default().fg(theme::DIM),
+        ));
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  本周期合计 {}    [任意键]关闭", theme::bytes(total)),
+        Style::default().fg(theme::DIM),
+    )));
+
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} "))
+                .border_style(Style::default().fg(theme::ACCENT)),
+        ),
+        rect,
+    );
 }
 
 #[cfg(test)]
@@ -1160,9 +1330,14 @@ mod tests {
             draw_to_string(w, h, |f| agents(f, f.area(), &[agent(Some(1000), Some(1))], 0, NOW));
             draw_to_string(w, h, |f| nodes(f, f.area(), &[node()], 0));
             draw_to_string(w, h, |f| users(f, f.area(), &[user()], 0, "https://x.example", NOW));
+            let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
             draw_to_string(w, h, |f| {
-                dashboard(f, f.area(), &[agent(None, None)], &[node()], &[user()], &[], NOW)
+                dashboard(f, f.area(), &[agent(None, None)], &[node()], &[user()], &hist, NOW)
             });
+            draw_to_string(w, h, |f| {
+                settings(f, f.area(), &crate::tui::settings::all(&crate::config::Config::default()), 0)
+            });
+            draw_to_string(w, h, |f| breakdown(f, f.area(), "t", "h", &[]));
         }
     }
 
@@ -1359,25 +1534,46 @@ mod tests {
         offline.id = 2;
         offline.name = "osaka-2".into();
         offline.status = "offline".into();
-        let events = vec![EventRow {
-            at: NOW,
-            agent_name: Some("tokyo-1".into()),
-            kind: "counter_reset".into(),
-            message: "计数器重置,按全量入账".into(),
-        }];
-        let out = draw_to_string(120, 24, |f| {
-            dashboard(f, f.area(), &[agent(Some(1000), Some(1)), offline], &[node()], &[user()], &events, NOW)
+        let hist: VecDeque<(f64, f64)> =
+            (0..40).map(|i| (1000.0 * (i % 7) as f64, 800.0 * (i % 5) as f64)).collect();
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &[agent(Some(1000), Some(1)), offline], &[node()], &[user()], &hist, NOW)
         });
         assert!(has_cjk(&out, "在线 1"), "{out}");
         assert!(has_cjk(&out, "离线 1"), "{out}");
         assert!(out.contains("alice"), "用量 Top 里要有用户:\n{out}");
-        assert!(has_cjk(&out, "计数器重置"), "最近事件要显示中文类型:\n{out}");
+        assert!(has_cjk(&out, "上行") && has_cjk(&out, "下行"), "要有上下行两张图:\n{out}");
+        // 盲文点阵:曲线画出来的字符落在 U+2800 区段。
+        assert!(out.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)), "折线没画出来:\n{out}");
     }
 
-    /// 空库时概览页要给出「下一步按什么」,而不是四个空框。
+    /// 点数不够时不画空图,直接说「在攒数据」——
+    /// 一张空坐标系看起来像坏了,而它其实只是还没到第二次上报。
+    #[test]
+    fn a_chart_with_one_point_says_it_is_collecting() {
+        let hist: VecDeque<(f64, f64)> = VecDeque::from(vec![(1.0, 2.0)]);
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &[agent(None, None)], &[], &[], &hist, NOW)
+        });
+        assert!(has_cjk(&out, "还在攒数据"), "{out}");
+    }
+
+    /// 矮终端上整块让掉折线图 —— 一条挤成两行的曲线不如把地方给下面的数字。
+    #[test]
+    fn a_short_terminal_drops_the_chart_not_the_numbers() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        let out = draw_to_string(120, 18, |f| {
+            dashboard(f, f.area(), &[agent(None, None)], &[node()], &[user()], &hist, NOW)
+        });
+        assert!(!has_cjk(&out, "上行  "), "矮屏不该画折线图:\n{out}");
+        assert!(out.contains("alice"), "但明细必须留着:\n{out}");
+    }
+
+    /// 空库时仪表盘要给出「下一步按什么」,而不是几个空框。
     #[test]
     fn empty_dashboard_tells_you_what_to_do_next() {
-        let out = draw_to_string(120, 24, |f| dashboard(f, f.area(), &[], &[], &[], &[], NOW));
+        let empty: VecDeque<(f64, f64)> = VecDeque::new();
+        let out = draw_to_string(120, 30, |f| dashboard(f, f.area(), &[], &[], &[], &empty, NOW));
         assert!(has_cjk(&out, "按 [2] 去服务管理页"), "{out}");
         assert!(has_cjk(&out, "按 [4] 去用户页"), "{out}");
     }
@@ -1470,31 +1666,64 @@ mod tests {
                 sub_token: "tok2".into(),
             },
         ];
-        let events = vec![
-            EventRow {
-                at: NOW,
-                agent_name: Some("tokyo-1".into()),
-                kind: "counter_reset".into(),
-                message: "agent 重启,计数器归零,本次按全量入账".into(),
-            },
-            EventRow {
-                at: NOW - 300,
-                agent_name: None,
-                kind: "user_auto_disabled".into(),
-                message: "用户 bob 配额用尽,已自动停用".into(),
-            },
-        ];
+        // 造一段像样的历史:两个不同周期的正弦,看起来像真的流量。
+        let hist: VecDeque<(f64, f64)> = (0..60)
+            .map(|i| {
+                let t = i as f64;
+                (
+                    900_000.0 * (1.0 + (t / 7.0).sin()) + 50_000.0,
+                    1_800_000.0 * (1.0 + (t / 11.0).cos()) + 80_000.0,
+                )
+            })
+            .collect();
 
         println!(
-            "\n── 概览 ──\n{}\n",
-            draw_to_string(120, 24, |f| dashboard(
+            "\n── 仪表盘 ──\n{}\n",
+            draw_to_string(120, 30, |f| dashboard(
                 f,
                 f.area(),
                 &agents_rows,
                 &node_rows,
                 &user_rows,
-                &events,
+                &hist,
                 NOW
+            ))
+        );
+        println!(
+            "── 设置 ──\n{}\n",
+            draw_to_string(120, 18, |f| settings(
+                f,
+                f.area(),
+                &crate::tui::settings::all(&crate::config::Config::default()),
+                2
+            ))
+        );
+        let bd = vec![
+            BreakdownRow {
+                label: "alice".into(),
+                note: "启用".into(),
+                cycle_up: 20 * 1_073_741_824,
+                cycle_down: 55 * 1_073_741_824,
+                total_up: 120 * 1_073_741_824,
+                total_down: 300 * 1_073_741_824,
+            },
+            BreakdownRow {
+                label: "bob".into(),
+                note: "自动停用".into(),
+                cycle_up: 3 * 1_073_741_824,
+                cycle_down: 1_073_741_824,
+                total_up: 9 * 1_073_741_824,
+                total_down: 4 * 1_073_741_824,
+            },
+        ];
+        println!(
+            "── 节点用量明细 ──\n{}\n",
+            draw_to_string(120, 12, |f| breakdown(
+                f,
+                f.area(),
+                "节点 tokyo-reality 上的用户",
+                "tokyo-reality(在 tokyo-1 上)· 2 个用户",
+                &bd
             ))
         );
         println!("── 服务管理 ──\n{}\n", draw_to_string(120, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW)));

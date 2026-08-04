@@ -23,10 +23,10 @@
 //! 明文关掉就再也拿不回来了(§8.1)。所以它必须**显式**告诉人这件事。
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -37,19 +37,31 @@ use crate::model::node::Protocol;
 /// 实际执行在主循环里统一做,这样每个动作的错误处理和刷新时机只有一处。
 #[derive(Debug, Clone)]
 pub enum Action {
-    AddAgent { name: String, host: String },
-    EditAgent {
-        id: i64,
+    AddAgent {
         name: String,
         /// `None` = 不限流量。0 和 NULL 在界面上是同一件事,库里统一存 NULL。
         quota_bytes: Option<i64>,
         reset_day: Option<i64>,
     },
-    RotateToken { id: i64, name: String, host: String },
+    EditAgent {
+        id: i64,
+        name: String,
+        quota_bytes: Option<i64>,
+        reset_day: Option<i64>,
+    },
+    RotateToken { id: i64, name: String },
     DeleteAgent { id: i64, name: String },
     /// 重新打印接入命令。**token 位置是占位符** —— 明文早就没了(§8.1),
     /// 这条只用来提醒「命令长什么样、缺的那段要去哪儿拿」。
-    ShowInstall { id: i64, name: String, host: String },
+    ShowInstall { id: i64, name: String },
+    /// 改一个配置项。`value` 已经是 TOML 字面量(字符串带引号)。
+    SetConfig { section: &'static str, key: &'static str, value: String, label: String },
+    /// 打开「这个节点上各用户用了多少」。
+    ShowNodeUsers { id: i64, tag: String, agent: String },
+    /// 打开「这个用户在各节点上用了多少」。
+    ShowUserNodes { id: i64, name: String },
+    /// 立刻刷一遍。常规刷新是每秒一次,但改完配置或另一个进程动了库时要马上看到。
+    Refresh,
     AddNode(NodeDraft),
     EditNode { id: i64, draft: NodeDraft },
     DeleteNode { id: i64, tag: String },
@@ -586,7 +598,10 @@ fn render_form(f: &mut Frame, area: Rect, form: &Form) {
         // 聚焦的取值用反白底,和旧项目 `tui/forms.rs` 是同一套观感 ——
         // 只靠一个箭头标记的话,在一屏九个字段里很难一眼看出焦点在哪。
         let value_style = if focused {
-            Style::default().fg(Color::Black).bg(theme::ACCENT)
+            // 深灰蓝底 + 原色前景。**不用黄底深字** —— 很多终端配色会把
+            // `Color::Black` 渲染成一个偏亮的灰,结果是黄底浅字,
+            // 对比度反而比不选中还低(theme::SELECT_BG 的注释里有原委)。
+            Style::default().bg(theme::SELECT_BG).add_modifier(Modifier::BOLD)
         } else if fld.is_on() {
             Style::default().fg(theme::ONLINE)
         } else {
@@ -725,31 +740,21 @@ pub fn status_bar(f: &mut Frame, area: Rect, text: &str, is_error: bool) {
 
 /// 顶部页签。
 ///
-/// 每个页签前面带序号,并且那个序号就是**能直接按的键**(§8.2)。
-/// 只有 Tab 循环的话,从第一页跳到第四页要按三下,而人心里想的是「去第 4 页」。
+/// 样式照旧项目 `tui/widgets/tab_bar.rs`:`名字[序号]`,用 ratatui 的 `Tabs`
+/// 加一条下边框把页签区和内容区分开。序号就是**能直接按的键**(§8.2)——
+/// 只有 Tab 循环的话,从第一页跳到第五页要按四下,而人心里想的是「去第 5 页」。
 pub fn tabs(f: &mut Frame, area: Rect, titles: &[&str], selected: usize) {
-    let mut spans = vec![Span::raw(" ")];
-    for (i, t) in titles.iter().enumerate() {
-        let active = i == selected;
-        let (num_style, text_style) = if active {
-            (
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
-        } else {
-            (Style::default().fg(theme::TRACK), Style::default().fg(theme::DIM))
-        };
-        spans.push(Span::styled(format!(" {}", i + 1), num_style));
-        spans.push(Span::styled(format!(" {t} "), text_style));
-        if i + 1 < titles.len() {
-            spans.push(Span::styled("│", Style::default().fg(theme::TRACK)));
-        }
-    }
-    let layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0)])
-        .split(area);
-    f.render_widget(Paragraph::new(Line::from(spans)), layout[0]);
+    let items: Vec<Line> =
+        titles.iter().enumerate().map(|(i, t)| Line::from(format!(" {t}[{}] ", i + 1))).collect();
+    f.render_widget(
+        Tabs::new(items)
+            .select(selected)
+            .divider("│")
+            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::TRACK)))
+            .highlight_style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+            .style(Style::default().fg(theme::DIM)),
+        area,
+    );
 }
 
 #[cfg(test)]

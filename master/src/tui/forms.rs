@@ -60,26 +60,42 @@ fn protocol_names() -> Vec<String> {
 /// 多问一个「主控地址」是为了能直接吐出一条**可以整条复制**的接入命令:
 /// 主控只知道自己 `listen` 在 `0.0.0.0:18443`,不知道被控机该往哪个地址回连
 /// (公网 IP、内网 IP、还是一个域名),这件事只有人知道。
-pub fn agent_add(default_host: &str) -> Modal {
+/// 新增被控服务器。
+///
+/// **不问主控地址** —— 那不用人告诉:配了订阅域名就用域名(TLS 也才说得通),
+/// 否则自动探本机出口地址(`install::resolve_host`)。探错了去「设置」页
+/// 填订阅对外地址覆盖,比在每次新增时重打一遍强。
+pub fn agent_add() -> Modal {
     Modal::Form(
         Form::new(
             "新增被控服务器",
             vec![
                 Field::text("name", "名称 *必填", ""),
-                Field::text("host", "主控地址 (IP 或域名,不含端口)", default_host),
+                Field::text("quota", "网卡月配额 GB (0 = 不限)", "0"),
+                Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", ""),
             ],
             Box::new(|f| {
                 let name = val(f, "name");
                 if name.is_empty() {
                     return Err("名称不能为空".into());
                 }
-                Ok(Action::AddAgent { name, host: val(f, "host") })
+                let gb: f64 = val(f, "quota").parse().map_err(|_| "配额要是一个数字(0 = 不限)")?;
+                if gb < 0.0 {
+                    return Err("配额不能是负数".into());
+                }
+                Ok(Action::AddAgent {
+                    name,
+                    quota_bytes: if gb > 0.0 { Some((gb * 1_073_741_824.0) as i64) } else { None },
+                    reset_day: parse_reset_day(&val(f, "reset"))?,
+                })
             }),
         )
         .with_note(Box::new(|_| {
             vec![
                 "名称只是给人看的标识(例 tokyo-1),须唯一。".into(),
-                "主控地址是被控机回连用的,留空则命令里给一个占位符。".into(),
+                "网卡配额是**这台机器**进出总量的口径(§6.4),不是用户计费用量;".into(),
+                "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
+                "确定之后会给出一条填好 token 的接入命令,复制到被控机上跑即可。".into(),
             ]
         })),
     )
@@ -333,6 +349,40 @@ pub fn assign_nodes(u: &UserRow, nodes: &[NodeRow]) -> Modal {
     ))
 }
 
+/// 改一个配置项。一个字段的小表单 —— 布尔项走不到这里(按一下就切了)。
+pub fn setting_edit(item: crate::tui::settings::Setting) -> Modal {
+    let section = item.section;
+    let key = item.key;
+    let label = item.label.clone();
+    let note = item.note.clone();
+    let title = format!("设置 · {}", item.label);
+    let prefill = item.edit_value();
+
+    Modal::Form(
+        Form::new(
+            &title,
+            vec![Field::text("v", &item.label, &prefill)],
+            Box::new(move |f| {
+                let value = item.to_toml(&val(f, "v"))?;
+                Ok(Action::SetConfig {
+                    section,
+                    key,
+                    value,
+                    label: label.clone(),
+                })
+            }),
+        )
+        .head(format!("{section}.{key}"))
+        .with_note(Box::new(move |_| {
+            vec![
+                note.clone(),
+                "改的是配置文件本身,注释与排版都保留。".into(),
+                "daemon 启动时才读配置 —— 改完记得 systemctl restart sbx。".into(),
+            ]
+        })),
+    )
+}
+
 // ─────────────────────────── 日期 ───────────────────────────
 
 /// `YYYY-MM-DD` → 那一天**结束时**的时间戳(本地时区 23:59:59)。
@@ -576,8 +626,17 @@ mod preview {
             ("编辑节点", node_edit(&node)),
             ("新增用户", user_add()),
             ("编辑用户", user_edit(&user)),
-            ("新增被控服务器", agent_add("203.0.113.8")),
+            ("新增被控服务器", agent_add()),
             ("分配节点", assign_nodes(&user, std::slice::from_ref(&node))),
+            (
+                "改设置",
+                setting_edit(
+                    crate::tui::settings::all(&crate::config::Config::default())
+                        .into_iter()
+                        .next()
+                        .unwrap(),
+                ),
+            ),
         ] {
             let mut term = Terminal::new(TestBackend::new(116, 30)).unwrap();
             term.draw(|f| modal::render(f, f.area(), &m)).unwrap();
