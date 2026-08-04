@@ -251,12 +251,28 @@ async fn stats_view(pool: &SqlitePool, user_id: i64, name: &str) -> Result<crate
 ///
 /// 流量取**周期内**用量并乘以倍率 —— 与 §6.3 的配额判定同一个口径,
 /// 否则客户端显示的百分比和实际被停用的时机对不上。
+///
+/// **例外:绑了网卡的用户**(§10.3)。这时上下行换成所绑机器的**网卡**用量之和,
+/// 别的一概不变。这是给管理员自己用的:VPS 厂商按网卡计费,而用户流量是
+/// sing-box 记的账,两者天生对不上(§6.4 / §7.2);绑一下就能用任意一个代理客户端
+/// 看到「这几台机器这个月烧了多少」,不用 ssh 上去查。
+///
+/// 注意它**只改这个响应头**:订阅内容、用户自己的计费与停用判定、界面上的用户用量
+/// 全都走原来的路。这一点很要紧 —— 一个只影响「显示」的功能不该能把人停掉。
 async fn usage_header(pool: &SqlitePool, user_id: i64) -> Result<String> {
     let (quota, mult, expire_at): (i64, f64, Option<i64>) =
         sqlx::query_as("SELECT quota_bytes, traffic_multiplier, expire_at FROM users WHERE id = ?")
             .bind(user_id)
             .fetch_one(pool)
             .await?;
+
+    if let Some((upload, download, total)) = nic_usage(pool, user_id).await? {
+        return Ok(format!(
+            "upload={upload}; download={download}; total={total}; expire={}",
+            expire_at.unwrap_or(0)
+        ));
+    }
+
     let (up, down): (i64, i64) =
         sqlx::query_as("SELECT cycle_up, cycle_down FROM user_traffic_total WHERE user_id = ?")
             .bind(user_id)
@@ -275,9 +291,193 @@ async fn usage_header(pool: &SqlitePool, user_id: i64) -> Result<String> {
     ))
 }
 
+/// 绑定的网卡用量之和。没绑就是 `None`,调用方照原路走。
+///
+/// 配额的取法值得说一句:**只要有一台没设配额,总量就报 0(不限)**。
+/// 把设了配额的几台加起来当上限,会给出一个「看起来精确但根本不是上限」的数字 ——
+/// 那比不给更糟,因为客户端会拿它算百分比。
+async fn nic_usage(pool: &SqlitePool, user_id: i64) -> Result<Option<(u64, u64, u64)>> {
+    let rows: Vec<(i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT COALESCE(t.cycle_rx, 0), COALESCE(t.cycle_tx, 0), a.nic_quota_bytes
+           FROM user_nic_bindings b
+           JOIN agents a ON a.id = b.agent_id
+           LEFT JOIN agent_nic_traffic t ON t.agent_id = b.agent_id
+          WHERE b.user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut up: u64 = 0;
+    let mut down: u64 = 0;
+    let mut quota: u64 = 0;
+    let mut all_capped = true;
+    for (rx, tx, q) in rows {
+        up = up.saturating_add(rx.max(0) as u64);
+        down = down.saturating_add(tx.max(0) as u64);
+        match q.filter(|v| *v > 0) {
+            Some(v) => quota = quota.saturating_add(v as u64),
+            None => all_capped = false,
+        }
+    }
+    Ok(Some((up, down, if all_capped { quota } else { 0 })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn nic_pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("sbx-sub-{}.db", uuid::Uuid::new_v4()));
+        crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap()
+    }
+
+    /// 建一个用户 + 一台 agent(带网卡用量),返回 `(user_id, agent_id)`。
+    async fn fixture(p: &SqlitePool, quota: Option<i64>, rx: i64, tx: i64) -> (i64, i64) {
+        let (aid, _) = crate::db::agent_repo::create(p, &format!("a{rx}"), 0).await.unwrap();
+        crate::db::agent_repo::update_settings(p, aid, &format!("a{rx}"), quota, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_nic_traffic
+               (agent_id, boot_id, last_rx, last_tx, cycle_rx, cycle_tx, cycle_start, updated_at)
+             VALUES (?, 'b', 0, 0, ?, ?, 0, 0)",
+        )
+        .bind(aid)
+        .bind(rx)
+        .bind(tx)
+        .execute(p)
+        .await
+        .unwrap();
+        let uid = crate::db::node_repo::add_user(p, &format!("u{rx}"), 0, 0).await.unwrap();
+        (uid, aid)
+    }
+
+    /// 没绑网卡时照旧:报用户自己的用量 × 倍率。
+    #[tokio::test]
+    async fn without_a_binding_the_header_reports_the_users_own_usage() {
+        let p = nic_pool().await;
+        let (uid, _) = fixture(&p, None, 1_000, 2_000).await;
+        sqlx::query("UPDATE users SET quota_bytes = 500, traffic_multiplier = 2.0 WHERE id = ?")
+            .bind(uid)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let h = usage_header(&p, uid).await.unwrap();
+        // 没有任何 user_traffic 行 → 0;倍率乘上去仍是 0。
+        assert!(h.contains("upload=0"), "{h}");
+        assert!(h.contains("total=500"), "{h}");
+    }
+
+    /// 绑了网卡:上下行换成那几台机器的网卡用量之和(§10.3)。
+    ///
+    /// **不乘倍率** —— 网卡流量是厂商的账,倍率是给用户计费用的,
+    /// 两者混在一起会给出一个哪边都对不上的数字。
+    #[tokio::test]
+    async fn a_binding_replaces_the_numbers_with_nic_usage() {
+        let p = nic_pool().await;
+        let (uid, a1) = fixture(&p, Some(100), 1_000, 2_000).await;
+        let (_, a2) = fixture(&p, Some(400), 30, 40).await;
+        sqlx::query("UPDATE users SET traffic_multiplier = 2.0 WHERE id = ?")
+            .bind(uid)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        crate::db::node_repo::set_user_nics(&p, uid, &[a1, a2]).await.unwrap();
+        let h = usage_header(&p, uid).await.unwrap();
+        assert!(h.contains("upload=1030"), "两台的 rx 之和,且不乘倍率: {h}");
+        assert!(h.contains("download=2040"), "{h}");
+        assert!(h.contains("total=500"), "两台配额之和: {h}");
+    }
+
+    /// **只要有一台没设配额,总量就报 0(不限)。**
+    /// 把设了配额的几台加起来当上限,会给出一个「看起来精确但根本不是上限」的数字 ——
+    /// 那比不给更糟,因为客户端会拿它算百分比。
+    #[tokio::test]
+    async fn one_uncapped_machine_makes_the_total_unlimited() {
+        let p = nic_pool().await;
+        let (uid, a1) = fixture(&p, Some(100), 1_000, 0).await;
+        let (_, a2) = fixture(&p, None, 5, 0).await;
+
+        crate::db::node_repo::set_user_nics(&p, uid, &[a1, a2]).await.unwrap();
+        let h = usage_header(&p, uid).await.unwrap();
+        assert!(h.contains("total=0"), "有一台不限就该整体报不限: {h}");
+        assert!(h.contains("upload=1005"), "{h}");
+    }
+
+    /// 解绑之后必须**立刻**回到原来的口径 —— 空列表是一个正当操作。
+    #[tokio::test]
+    async fn unbinding_restores_the_normal_header() {
+        let p = nic_pool().await;
+        let (uid, a1) = fixture(&p, Some(100), 1_000, 2_000).await;
+        crate::db::node_repo::set_user_nics(&p, uid, &[a1]).await.unwrap();
+        assert!(usage_header(&p, uid).await.unwrap().contains("upload=1000"));
+
+        crate::db::node_repo::set_user_nics(&p, uid, &[]).await.unwrap();
+        let h = usage_header(&p, uid).await.unwrap();
+        assert!(h.contains("upload=0"), "解绑后回到用户自己的用量: {h}");
+    }
+
+    /// 绑定**不影响停用判定**。这一条守的是一个不该有的耦合:
+    /// 一个只改响应头的功能,不该能把人停掉,也不该影响配额判定。
+    #[tokio::test]
+    async fn a_binding_never_touches_the_users_own_accounting() {
+        let p = nic_pool().await;
+        let (uid, a1) = fixture(&p, Some(1), 9_999_999_999, 0).await;
+        sqlx::query("UPDATE users SET quota_bytes = 1000 WHERE id = ?")
+            .bind(uid)
+            .execute(&p)
+            .await
+            .unwrap();
+        crate::db::node_repo::set_user_nics(&p, uid, &[a1]).await.unwrap();
+
+        // 网卡爆表,但用户自己的账一分没动 —— 巡检看的是后者。
+        let (up, down): (i64, i64) = sqlx::query_as(
+            "SELECT COALESCE(cycle_up,0), COALESCE(cycle_down,0)
+               FROM user_traffic_total WHERE user_id = ?",
+        )
+        .bind(uid)
+        .fetch_optional(&p)
+        .await
+        .unwrap()
+        .unwrap_or((0, 0));
+        assert_eq!((up, down), (0, 0));
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert!(enabled, "绑网卡不该把人停掉");
+    }
+
+    /// 绑一台**从没上报过**的机器:网卡表里没有行,该报 0 而不是查不出来。
+    #[tokio::test]
+    async fn a_machine_that_never_reported_counts_as_zero() {
+        let p = nic_pool().await;
+        let (uid, _) = fixture(&p, None, 1, 1).await;
+        let (aid, _) = crate::db::agent_repo::create(&p, "never", 0).await.unwrap();
+        crate::db::node_repo::set_user_nics(&p, uid, &[aid]).await.unwrap();
+
+        let h = usage_header(&p, uid).await.unwrap();
+        assert!(h.contains("upload=0") && h.contains("download=0"), "{h}");
+    }
+
+    /// 绑一个不存在的 agent 要给一句认得出的话,不是 sqlx 的外键原文。
+    #[tokio::test]
+    async fn binding_a_missing_agent_errors_clearly() {
+        let p = nic_pool().await;
+        let (uid, _) = fixture(&p, None, 1, 1).await;
+        let err = crate::db::node_repo::set_user_nics(&p, uid, &[999])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("999"), "{err}");
+    }
 
     #[test]
     fn explicit_type_beats_user_agent() {

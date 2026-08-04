@@ -77,6 +77,9 @@ pub enum Action {
     SetUserEnabled { name: String, enabled: bool },
     DeleteUser { name: String },
     SetUserNodes { user_id: i64, user: String, node_ids: Vec<i64> },
+    /// 把用户订阅响应头里的流量换成这几台机器的网卡用量之和(§10.3)。
+    /// 空列表 = 解绑,改回按用户自己的用量报。
+    SetUserNics { user_id: i64, user: String, agent_ids: Vec<i64> },
 }
 
 /// 节点表单填出来的东西。密钥材料**不在这里** —— 新增时由 `secrets::fill` 生成,

@@ -16,23 +16,64 @@ pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/why1f/sbx/main/
 /// 被控机回连主控用的地址,**自动定**,不再让人手填。
 ///
 /// 优先级,理由都在后面:
-///   1. `subscription.public_base` 的主机名 —— 配了订阅域名就用域名。
-///      域名比 IP 好:换机器不用重发接入命令,而且证书/TLS 那一套才说得通。
-///   2. 本机的公网出口 IP(向外发一个 UDP「连接」,读本地端点,**不发包**)。
-///   3. 第一个非回环的本机地址 —— 内网部署时这个才是对的。
-///   4. 都拿不到就给占位符,并在提示里说清要换掉。
+///   1. `cluster.public_host` —— 人明确指定过就用它,不再猜。
+///   2. `subscription.public_base` 的主机名 —— 配了订阅域名就用域名。
+///      域名比 IP 好:换机器不用重发接入命令,而且 TLS 那一套才说得通。
+///   3. **探到的公网 IP**(`probed`,由调用方提前在后台探好传进来)。
+///   4. 本机出口地址 —— 内网部署时这个才是对的。
+///   5. 都拿不到就给占位符,并在提示里说清要换掉。
 ///
-/// 探测是**纯本地**的:`UdpSocket::connect` 到一个公网地址只是让内核选一条路由,
-/// 不产生任何流量、不依赖外部服务、不会卡住。代价是拿到的是**出口网卡地址** ——
-/// 在 NAT 后面的机器上它是内网地址,那时人得自己去设置页填 `public_base`。
-/// 这比去请求一个 ipify 之类的外部服务好:那会在无外网的内网部署里卡住十几秒,
-/// 而且给 TUI 引入一个网络依赖。
-pub fn resolve_host(cfg: &Config) -> String {
+/// 第 3 和第 4 的次序不能反。云主机上网卡拿到的是**厂商给的内网地址**
+/// (Oracle / 阿里云 / AWS 都是 NAT 到公网 IP),`UdpSocket::connect` 读出来的
+/// 正是那个内网地址 —— 拿它当主控地址,被控机根本连不上。所以必须先问外面
+/// 「你看到我是谁」,拿不到才退回本机视角。
+pub fn resolve_host(cfg: &Config, probed: Option<&str>) -> String {
+    let pinned = cfg.cluster.public_host.trim();
+    if !pinned.is_empty() {
+        return pinned.to_string();
+    }
     let from_sub = host_of(&cfg.subscription.public_base);
     if !from_sub.is_empty() {
         return from_sub;
     }
+    if let Some(ip) = probed.map(str::trim).filter(|s| !s.is_empty()) {
+        return ip.to_string();
+    }
     outbound_ip().unwrap_or_else(|| "<主控地址>".into())
+}
+
+/// 自探要打的地址。与 agent 侧 `sysinfo.PublicIPs` 用的是同一组 ——
+/// 两边看到的应当是同一个网络视角。
+const V4_ENDPOINTS: [&str; 2] = ["https://api4.ipify.org", "https://ifconfig.me/ip"];
+
+/// 探测总预算。探不到就退回本机视角,不该把界面卡住。
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// 问外面「你看到我是谁」。
+///
+/// 这一步是必须的,不能用本机网卡地址代替:云主机的网卡拿到的是厂商给的内网地址,
+/// 公网 IP 在厂商的 NAT 上。用内网地址拼出来的接入命令,被控机连不上,
+/// 而报错是「连接超时」—— 一个指向网络问题、其实是地址错了的错误。
+pub async fn probe_public_ip() -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_BUDGET)
+        .user_agent(concat!("sbx/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+    for url in V4_ENDPOINTS {
+        let Ok(resp) = client.get(url).send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(body) = resp.text().await else { continue };
+        let ip = body.trim();
+        // 校验一下再用:这些服务偶尔会返回一段 HTML 错误页,
+        // 那东西塞进命令里会变成一条谁也看不懂的 URL。
+        if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Some(ip.to_string());
+        }
+    }
+    None
 }
 
 /// 从 `https://sub.example.com:8443/x` 里取出 `sub.example.com`。
@@ -51,6 +92,8 @@ fn host_of(base: &str) -> String {
 }
 
 /// 本机的出口地址。**不发包**,只让内核按路由表选一个本地端点。
+///
+/// 只在探公网失败时才用得到(见 `resolve_host` 的次序说明)。
 fn outbound_ip() -> Option<String> {
     // 两个目标各试一次:先 IPv4,再 IPv6。只有 IPv6 的机器上前者会失败。
     for target in ["1.1.1.1:53", "[2606:4700:4700::1111]:53"] {
@@ -164,22 +207,44 @@ mod tests {
         }
     }
 
-    /// 配了订阅域名就用域名 —— 域名比自动探到的 IP 好:换机器时被控端不用重配。
+    /// 主控地址的取值次序。**探到的公网 IP 必须排在本机出口地址前面** ——
+    /// 云主机的网卡拿到的是厂商给的内网地址(Oracle / 阿里云 / AWS 都是 NAT),
+    /// 拿它当主控地址,被控机根本连不上,而报错是「连接超时」:
+    /// 一个指向网络问题、其实是地址错了的错误。
     #[test]
-    fn a_subscription_domain_wins_over_the_probed_ip() {
+    fn the_host_resolution_order_puts_the_public_ip_before_the_local_one() {
         let mut cfg = Config::default();
+
+        // 什么都没配 → 用探到的公网 IP,而不是本机出口地址。
+        assert_eq!(resolve_host(&cfg, Some("203.0.113.8")), "203.0.113.8");
+
+        // 有订阅域名 → 域名优先(换机器时被控端不用重配)。
         cfg.subscription.public_base = "https://sub.example.com".into();
-        assert_eq!(resolve_host(&cfg), "sub.example.com");
+        assert_eq!(resolve_host(&cfg, Some("203.0.113.8")), "sub.example.com");
+
+        // 人明确指定过 → 谁都不猜了。
+        cfg.cluster.public_host = "master.example.net".into();
+        assert_eq!(resolve_host(&cfg, Some("203.0.113.8")), "master.example.net");
     }
 
-    /// 没配订阅域名时自动探。探不到也不能返回空串 ——
-    /// 空串会拼出 `wss://:18443/ws`,那是一条看起来像对的错命令。
+    /// 探不到也不能返回空串 —— 空串会拼出 `wss://:18443/ws`,
+    /// 那是一条看起来像对的错命令。
     #[test]
-    fn without_a_domain_it_falls_back_to_something_visible() {
+    fn without_anything_it_falls_back_to_something_visible() {
         let cfg = Config::default();
-        let host = resolve_host(&cfg);
+        let host = resolve_host(&cfg, None);
         assert!(!host.is_empty());
         assert!(!host.contains('/') && !host.contains("://"), "只该是主机名: {host}");
+    }
+
+    /// 探测服务偶尔返回一段 HTML 错误页。那东西塞进命令里会变成
+    /// 一条谁也看不懂的 URL,所以拿到之后必须校验是不是一个 IP。
+    #[test]
+    fn a_probed_value_is_used_verbatim_only_when_it_looks_like_a_host() {
+        let cfg = Config::default();
+        // 空白视同没探到。
+        assert_ne!(resolve_host(&cfg, Some("   ")), "   ");
+        assert_ne!(resolve_host(&cfg, Some("")), "");
     }
 
     /// IPv6 主控地址必须带方括号,否则 `wss://2001:db8::1:18443/ws` 里

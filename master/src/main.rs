@@ -187,11 +187,14 @@ async fn main() -> Result<()> {
             println!();
             println!("在被控机上跑这一条(root):");
             println!();
+            // CLI 是一次性命令,同步等一下探测没问题(TUI 那边是后台探的,
+            // 因为那里卡几秒会冻住界面)。
+            let host = install::resolve_host(&cfg, install::probe_public_ip().await.as_deref());
             // 命令**顶格单独一行**:它是要被鼠标选中复制走的东西,
             // 前面加缩进会让「双击选中整行」把缩进也带上。
-            println!("{}", install::command(&cfg, &install::resolve_host(&cfg), Some(&token)));
+            println!("{}", install::command(&cfg, &host, Some(&token)));
             println!();
-            for line in install::notes(&install::resolve_host(&cfg), true) {
+            for line in install::notes(&host, true) {
                 println!("{line}");
             }
             println!();
@@ -206,7 +209,8 @@ async fn main() -> Result<()> {
             println!();
             println!("在那台被控机上重跑这一条,旧配置会自动备份成 agent.toml.bak:");
             println!();
-            println!("{}", install::command(&cfg, &install::resolve_host(&cfg), Some(&token)));
+            let host = install::resolve_host(&cfg, install::probe_public_ip().await.as_deref());
+            println!("{}", install::command(&cfg, &host, Some(&token)));
         }
         Cmd::AgentRemove { id, yes } => {
             let Some(agent) = db::agent_repo::get(&pool, id).await? else {

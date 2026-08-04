@@ -829,22 +829,25 @@ enum UCol {
     Expire,
     Mult,
     Nodes,
+    /// 订阅是否改报网卡流量(§10.3)。
+    Nic,
 }
 
 fn ucol_width(c: UCol) -> u16 {
     match c {
-        UCol::Name => 13,
+        UCol::Name => 12,
         UCol::State => 11,
-        UCol::Up => 10,
-        UCol::Down => 10,
+        UCol::Up => 9,
+        UCol::Down => 9,
         UCol::Usage => 20,
-        UCol::Bar => 10,
+        UCol::Bar => 8,
         UCol::Reset => 6,
         // 「2025-12-04 3天」按终端列宽算 14(中文占两格),留一格余量。
         // 少一格的表现是「天」被切掉,而那正是这一列多出来的那点信息。
         UCol::Expire => 15,
-        UCol::Mult => 6,
-        UCol::Nodes => 5,
+        UCol::Mult => 5,
+        UCol::Nodes => 4,
+        UCol::Nic => 8,
     }
 }
 
@@ -860,10 +863,11 @@ fn ucol_title(c: UCol) -> &'static str {
         UCol::Expire => "到期",
         UCol::Mult => "倍率",
         UCol::Nodes => "节点",
+        UCol::Nic => "订阅口径",
     }
 }
 
-const UCOL_ALL: [UCol; 10] = [
+const UCOL_ALL: [UCol; 11] = [
     UCol::Name,
     UCol::State,
     UCol::Up,
@@ -874,15 +878,21 @@ const UCOL_ALL: [UCol; 10] = [
     UCol::Expire,
     UCol::Mult,
     UCol::Nodes,
+    UCol::Nic,
 ];
 /// 砍列顺序。倍率最先走(多数部署一直是 1.0),上下行拆分次之 ——
-/// 它们的和已经在「用量」列里了。**进度条排在到期之后**:到期是信息,条只是图形。
-const UCOL_DROP: [UCol; 6] = [UCol::Mult, UCol::Reset, UCol::Up, UCol::Down, UCol::Bar, UCol::Expire];
+/// 它们的和已经在「用量」列里了。**「订阅口径」排得很靠后**:它标的是
+/// 「客户端里看到的数字和这张表不一样」,丢了它就没人知道为什么对不上。
+const UCOL_DROP: [UCol; 7] =
+    [UCol::Mult, UCol::Reset, UCol::Up, UCol::Down, UCol::Bar, UCol::Nic, UCol::Expire];
 
 pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_base: &str, now: i64) {
+    // 绑了网卡的用户详情多一行(要说清「订阅报的不是这个数」)。
+    // 常态仍然是 4 行 —— 固定给 5 行会在矮终端上白白吃掉一行表格。
+    let detail_h = if rows.get(selected).is_some_and(|u| !u.nic_agent_ids.is_empty()) { 5 } else { 4 };
     let c = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(4)])
+        .constraints([Constraint::Min(3), Constraint::Length(detail_h)])
         .split(area);
 
     let cols = pick(c[0].width, &UCOL_ALL, ucol_width, &UCOL_DROP);
@@ -903,7 +913,7 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
             let cells: Vec<Cell> = cols
                 .iter()
                 .map(|col| match col {
-                    UCol::Name => Cell::from(theme::truncate(&u.name, 13)),                    UCol::State => {
+                    UCol::Name => Cell::from(theme::truncate(&u.name, 11)),                    UCol::State => {
                         Cell::from(Span::styled(mark.to_string(), Style::default().fg(color)))
                     }
                     UCol::Up => Cell::from(Span::styled(
@@ -943,6 +953,18 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
                             Cell::from(Span::styled("0", Style::default().fg(theme::NEVER)))
                         } else {
                             Cell::from(n.to_string())
+                        }
+                    }
+                    // 绑了网卡的用户,**订阅里报的数字和这张表里的不一样**(§10.3)。
+                    // 不标出来的话,那是一条永远查不明白的「客户端和后台对不上」。
+                    UCol::Nic => {
+                        if u.nic_agent_ids.is_empty() {
+                            Cell::from(Span::styled("—", Style::default().fg(theme::DIM)))
+                        } else {
+                            Cell::from(Span::styled(
+                                format!("网卡×{}", u.nic_agent_ids.len()),
+                                Style::default().fg(theme::DOWN),
+                            ))
                         }
                     }
                 })
@@ -1002,7 +1024,7 @@ fn user_detail(u: Option<&UserRow>, sub_base: &str) -> Vec<Line<'static>> {
     } else {
         format!("{}/sub/{}", sub_base.trim_end_matches('/'), u.sub_token)
     };
-    vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("  #", Style::default().fg(theme::DIM)),
             Span::styled(u.id.to_string(), Style::default().add_modifier(Modifier::BOLD)),
@@ -1023,7 +1045,18 @@ fn user_detail(u: Option<&UserRow>, sub_base: &str) -> Vec<Line<'static>> {
             Span::raw("  订阅: "),
             Span::styled(sub, Style::default().fg(theme::ACCENT)),
         ]),
-    ]
+    ];
+    // 绑了网卡就必须说 —— 客户端里显示的流量和上面那一行数字不是一回事。
+    if !u.nic_agent_ids.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  订阅响应头报的是 {} 台机器的网卡用量之和,不是上面这个用户用量(§10.3)",
+                u.nic_agent_ids.len()
+            ),
+            Style::default().fg(theme::DOWN),
+        )));
+    }
+    lines
 }
 
 // ─────────────────────────── 设置 ───────────────────────────
@@ -1233,6 +1266,7 @@ mod tests {
             expire_at: Some(NOW + 86_400 * 40),
             reset_day: Some(22),
             node_ids: vec![1, 2],
+            nic_agent_ids: vec![],
             sub_token: "tok".into(),
         }
     }
@@ -1412,7 +1446,7 @@ mod tests {
     fn user_page_distinguishes_auto_from_manual_disable() {
         let base = UserRow { enabled: false, auto_disabled: true, quota_bytes: 0, ..user() };
         let render =
-            |u: UserRow| draw_to_string(120, 8, move |f| users(f, f.area(), &[u], 0, "", NOW));
+            |u: UserRow| draw_to_string(120, 10, move |f| users(f, f.area(), &[u], 0, "", NOW));
 
         assert!(has_cjk(&render(base.clone()), "自动停用"));
         assert!(has_cjk(&render(UserRow { auto_disabled: false, ..base.clone() }), "手动停用"));
@@ -1423,15 +1457,15 @@ mod tests {
     #[test]
     fn expiry_within_a_week_is_called_out() {
         let soon = UserRow { expire_at: Some(NOW + 86_400 * 3), ..user() };
-        let out = draw_to_string(120, 8, |f| users(f, f.area(), &[soon], 0, "", NOW));
+        let out = draw_to_string(120, 10, |f| users(f, f.area(), &[soon], 0, "", NOW));
         assert!(has_cjk(&out, "3天"), "快到期应当显示还剩几天:\n{out}");
 
         let gone = UserRow { expire_at: Some(NOW - 10), ..user() };
-        let out = draw_to_string(120, 8, |f| users(f, f.area(), &[gone], 0, "", NOW));
+        let out = draw_to_string(120, 10, |f| users(f, f.area(), &[gone], 0, "", NOW));
         assert!(has_cjk(&out, "已过期"), "{out}");
 
         let forever = UserRow { expire_at: None, ..user() };
-        let out = draw_to_string(120, 8, |f| users(f, f.area(), &[forever], 0, "", NOW));
+        let out = draw_to_string(120, 10, |f| users(f, f.area(), &[forever], 0, "", NOW));
         assert!(has_cjk(&out, "永久"), "{out}");
     }
 
@@ -1439,14 +1473,14 @@ mod tests {
     #[test]
     fn users_without_nodes_are_visible() {
         let u = UserRow { node_ids: vec![], ..user() };
-        let out = draw_to_string(120, 8, |f| users(f, f.area(), &[u], 0, "", NOW));
+        let out = draw_to_string(120, 10, |f| users(f, f.area(), &[u], 0, "", NOW));
         assert!(has_cjk(&out, "已分配 0 个节点"), "详情里要说清楚:\n{out}");
     }
 
     /// 详情面板给的是订阅地址,**不是**任何凭据。
     #[test]
     fn user_detail_shows_the_subscription_url() {
-        let out = draw_to_string(120, 8, |f| {
+        let out = draw_to_string(120, 10, |f| {
             users(f, f.area(), &[user()], 0, "https://sub.example.com/", NOW)
         });
         assert!(out.contains("https://sub.example.com/sub/tok"), "{out}");
@@ -1663,6 +1697,7 @@ mod tests {
                 expire_at: Some(NOW + 86_400 * 3),
                 reset_day: None,
                 node_ids: vec![],
+                nic_agent_ids: vec![1],
                 sub_token: "tok2".into(),
             },
         ];

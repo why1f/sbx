@@ -350,6 +350,46 @@ pub async fn set_user_nodes(
     Ok(out)
 }
 
+/// 把某个用户绑定的**网卡流量来源**整体替换成 `agent_ids`。
+///
+/// **不推进任何 revision。** 这张表不进 sing-box 配置 —— 绑定关系只被订阅那一条路
+/// 读(`sub_server::usage_header`),agent 根本不需要知道它。为它推进 revision
+/// 等于「改一个只影响响应头的东西 = 全网重建一次 box」。
+///
+/// 语义见 `005_user_nic_bindings.sql`:绑定之后只有订阅响应头里的流量数字变成
+/// 这些机器的网卡用量之和,订阅内容与用户自己的计费流量都不受影响。
+pub async fn set_user_nics(pool: &SqlitePool, user_id: i64, agent_ids: &[i64]) -> Result<usize> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM user_nic_bindings WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    for aid in agent_ids {
+        // 存在性显式检查:外键在 SQLite 里要 `PRAGMA foreign_keys=ON` 才生效
+        // (init_pool 里开了),但报错文案是「FOREIGN KEY constraint failed」,
+        // 对着那句话没人知道是哪个 id 错了。
+        let ok: Option<i64> = sqlx::query_scalar("SELECT id FROM agents WHERE id = ?")
+            .bind(aid)
+            .fetch_optional(&mut *tx)
+            .await?;
+        ok.ok_or_else(|| anyhow::anyhow!("没有 id 为 {aid} 的被控服务器"))?;
+        sqlx::query("INSERT OR IGNORE INTO user_nic_bindings (user_id, agent_id) VALUES (?, ?)")
+            .bind(user_id)
+            .bind(aid)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(agent_ids.len())
+}
+
+/// 每个用户绑了哪几台机器的网卡。一次查完,给 TUI 的列表用。
+pub async fn user_nic_bindings(pool: &SqlitePool) -> Result<Vec<(i64, i64)>> {
+    Ok(sqlx::query_as("SELECT user_id, agent_id FROM user_nic_bindings ORDER BY agent_id")
+        .fetch_all(pool)
+        .await?)
+}
+
 /// 手工启停用户。推进**所有** agent 的 `user_state_revision`(§6.3)。
 ///
 /// `auto_disabled` 被显式置为 false:管理员手动的启停不该被月重置之类的

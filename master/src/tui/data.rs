@@ -102,6 +102,8 @@ pub struct UserRow {
     /// 已分配的节点 id。分配框要靠它把已选项打上勾 ——
     /// 只有个数的话,打开分配框会是一片空白,人以为原来什么都没选。
     pub node_ids: Vec<i64>,
+    /// 订阅响应头按这几台机器的网卡用量报(§10.3)。空 = 按用户自己的用量。
+    pub nic_agent_ids: Vec<i64>,
     pub sub_token: String,
 }
 
@@ -480,10 +482,16 @@ pub async fn load_users(pool: &SqlitePool) -> Result<Vec<UserRow>> {
         by_user.entry(uid).or_default().push(nid);
     }
 
+    let mut nics: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (uid, aid) in crate::db::node_repo::user_nic_bindings(pool).await? {
+        nics.entry(uid).or_default().push(aid);
+    }
+
     Ok(rows
         .into_iter()
         .map(|r| UserRow {
             node_ids: by_user.remove(&r.0).unwrap_or_default(),
+            nic_agent_ids: nics.remove(&r.0).unwrap_or_default(),
             id: r.0,
             name: r.1,
             enabled: r.2,
@@ -668,6 +676,7 @@ mod tests {
             expire_at: None,
             reset_day: None,
             node_ids: vec![3],
+            nic_agent_ids: vec![],
             sub_token: "t".into(),
         };
         assert_eq!(u.used(), 500);

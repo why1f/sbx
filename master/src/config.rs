@@ -34,6 +34,12 @@ impl Default for DbConfig {
 #[serde(default)]
 pub struct ClusterConfig {
     pub listen: String,
+    /// 被控机回连主控用的地址(IP 或域名,不含端口)。空 = 自动定。
+    ///
+    /// 自动那条路会先问外部服务「你看到我是谁」,再退回本机出口地址。
+    /// 云主机的网卡拿到的是**厂商给的内网地址**,所以本机视角靠不住 ——
+    /// 这个字段是给「自动也定不对」的场景留的最后一手(§8.1)。
+    pub public_host: String,
     /// false 则明文 ws(agent 侧也要 `insecure = true`)。
     pub tls: bool,
     /// 不存在时由主控自己用 rcgen 生成一张自签证书写进去(§1.3)。
@@ -47,6 +53,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:18443".into(),
+            public_host: String::new(),
             tls: true,
             cert_path: "/etc/sbx/tls/cert.pem".into(),
             key_path: "/etc/sbx/tls/key.pem".into(),

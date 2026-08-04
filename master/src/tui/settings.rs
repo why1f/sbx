@@ -133,6 +133,14 @@ pub fn all(cfg: &Config) -> Vec<Setting> {
         ),
         s(
             "cluster",
+            "public_host",
+            "主控对外地址",
+            cfg.cluster.public_host.clone(),
+            Kind::Text,
+            "被控机回连用的 IP 或域名,不含端口。留空 = 自动定(先问外部服务,再退回本机出口地址)",
+        ),
+        s(
+            "cluster",
             "listen",
             "集群监听",
             cfg.cluster.listen.clone(),

@@ -349,6 +349,43 @@ pub fn assign_nodes(u: &UserRow, nodes: &[NodeRow]) -> Modal {
     ))
 }
 
+/// 把用户的订阅流量绑到几台机器的网卡上(§10.3)。
+///
+/// 这个功能只影响**订阅响应头里的那三个数字**,别的一概不变:订阅内容、
+/// 用户自己的计费与停用判定、界面上的用户用量都走原来的路。
+/// 说清楚这一点很要紧 —— 一个只影响「显示」的开关不该让人以为它会限流。
+pub fn bind_nics(u: &UserRow, agents: &[AgentRow]) -> Modal {
+    let items: Vec<PickItem> = agents
+        .iter()
+        .map(|a| PickItem {
+            id: a.id,
+            label: a.name.clone(),
+            note: match a.nic_quota_bytes.filter(|q| *q > 0) {
+                Some(q) => format!(
+                    "本周期 {} / 配额 {}",
+                    crate::tui::theme::bytes(a.used()),
+                    crate::tui::theme::bytes(q)
+                ),
+                None => format!("本周期 {} · 未设配额", crate::tui::theme::bytes(a.used())),
+            },
+            checked: u.nic_agent_ids.contains(&a.id),
+        })
+        .collect();
+
+    let user_id = u.id;
+    let user = u.name.clone();
+    Modal::Picker(Picker::new(
+        "订阅按网卡流量报",
+        format!("用户 {}(勾上的机器,网卡用量之和会替换掉这个订阅报出去的流量)", u.name),
+        items,
+        Box::new(move |ids| Action::SetUserNics {
+            user_id,
+            user: user.clone(),
+            agent_ids: ids.to_vec(),
+        }),
+    ))
+}
+
 /// 改一个配置项。一个字段的小表单 —— 布尔项走不到这里(按一下就切了)。
 pub fn setting_edit(item: crate::tui::settings::Setting) -> Modal {
     let section = item.section;
@@ -618,6 +655,7 @@ mod preview {
             expire_at: None,
             reset_day: Some(22),
             node_ids: vec![1],
+            nic_agent_ids: vec![],
             sub_token: "tok".into(),
         };
 

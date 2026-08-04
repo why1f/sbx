@@ -69,6 +69,13 @@ struct App {
     users: Vec<data::UserRow>,
     speed: SpeedTracker,
     modal: Option<Modal>,
+    /// 后台探到的公网 IP。
+    ///
+    /// **必须后台探。** 它要打一次外网(见 `install::probe_public_ip` 的说明),
+    /// 在按下 `a` 的那一刻同步去打,界面会冻住好几秒。开界面时就丢一个任务出去,
+    /// 等人走到服务管理页再按 `a`,结果早就到了;没到就按 `resolve_host` 的
+    /// 次序退回本机出口地址。
+    probed_ip: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// 打开着的用量明细(节点 → 各用户 / 用户 → 各节点)。
     ///
     /// 与 `modal` 分开是因为它**是只读的、且数据要异步查**:走 `Modal` 的话
@@ -95,6 +102,7 @@ impl App {
             speed: SpeedTracker::default(),
             modal: None,
             overlay: None,
+            probed_ip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             status: None,
             status_is_error: false,
             quit: false,
@@ -159,7 +167,7 @@ impl App {
                     Some(u) => format!("  │  #{} {}", u.id, u.name),
                     None => "  │  还没有用户,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [Enter]用量明细  [n]分配节点  [t]启/停  [s]订阅  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [t]启/停  [s]订阅  [d]删除{sel}")
             }
             Page::Settings => {
                 format!("{common}  [Enter]改这一项  │  改完要重启 daemon:systemctl restart sbx")
@@ -195,6 +203,12 @@ impl App {
 
     fn sub_base(&self) -> &str {
         &self.cfg.subscription.public_base
+    }
+
+    /// 主控地址。锁只在这一句里持有,别把它带进渲染。
+    fn master_host(&self) -> String {
+        let probed = self.probed_ip.lock().ok().and_then(|g| g.clone());
+        install::resolve_host(&self.cfg, probed.as_deref())
     }
 
     /// 重新读一次配置文件。设置页写完之后要调 —— 否则页面上还是旧值,
@@ -263,6 +277,16 @@ async fn event_loop<B: ratatui::backend::Backend>(term: &mut Terminal<B>, mut ap
         }
     });
 
+    // 公网地址后台探一次。失败不影响任何东西 —— resolve_host 会按次序退回去。
+    let slot = app.probed_ip.clone();
+    tokio::spawn(async move {
+        if let Some(ip) = install::probe_public_ip().await {
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(ip);
+            }
+        }
+    });
+
     app.refresh().await?;
     let mut ticker = tokio::time::interval(TICK);
 
@@ -294,9 +318,12 @@ async fn event_loop<B: ratatui::backend::Backend>(term: &mut Terminal<B>, mut ap
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
+    // 页签占**两行**:一行文字 + 一行下边框。给 1 行的话 `Borders::BOTTOM`
+    // 会把那唯一一行吃掉,结果是页签整条消失、只剩一条横线 —— 这正是 v0.3.0
+    // 换成 ratatui `Tabs` 之后出的回归(tabs_are_actually_visible 盯着它)。
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)])
         .split(f.area());
 
     modal::tabs(f, chunks[0], &PAGES, app.page as usize);
@@ -513,6 +540,17 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                 Some(u) => app.modal = Some(forms::assign_nodes(u, &app.nodes)),
                 None => app.fail("没有选中任何用户"),
             },
+            // 绑网卡:只改这个用户订阅响应头里的流量数字(§10.3)。
+            KeyCode::Char('b') => {
+                if app.agents.is_empty() {
+                    app.fail("还没有被控服务器可绑");
+                    return None;
+                }
+                match app.selected_user() {
+                    Some(u) => app.modal = Some(forms::bind_nics(u, &app.agents)),
+                    None => app.fail("没有选中任何用户"),
+                }
+            }
             KeyCode::Char('s') => {
                 if let Some(u) = app.selected_user() {
                     let base = app.cfg.subscription.public_base.trim_end_matches('/').to_string();
@@ -625,12 +663,10 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
 ///
 /// 命令**单独占一行**放在最上面,而不是混在说明里:它是这个框存在的唯一理由,
 /// 而且是那条要被复制走的东西 —— 终端不支持 OSC 52 时人得用鼠标去选它。
-fn install_modal(cfg: &Config, title: &str, token: Option<&str>, tail: Vec<String>) -> Modal {
-    // 主控地址在这里定,不问人:配了订阅域名就用域名,否则探本机出口地址。
-    let host = install::resolve_host(cfg);
-    let cmd = install::command(cfg, &host, token);
+fn install_modal(cfg: &Config, host: &str, title: &str, token: Option<&str>, tail: Vec<String>) -> Modal {
+    let cmd = install::command(cfg, host, token);
     let mut body = vec![cmd.clone(), String::new()];
-    body.extend(install::notes(&host, token.is_some()));
+    body.extend(install::notes(host, token.is_some()));
     body.extend(tail);
     Modal::info_copyable(title, body, cmd)
 }
@@ -657,8 +693,10 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 agent_repo::update_settings(&app.pool, id, name, *quota_bytes, *reset_day).await?;
             }
             // token 明文只在这里出现这一次。库里只有 hash 与前 8 位(§8.1)。
+            let host = app.master_host();
             app.modal = Some(install_modal(
                 &app.cfg,
+                &host,
                 &format!("agent #{id} {name} —— 在被控机上跑这一条"),
                 Some(&token),
                 Vec::new(),
@@ -672,8 +710,10 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         }
 
         Action::ShowInstall { id, name } => {
+            let host = app.master_host();
             app.modal = Some(install_modal(
                 &app.cfg,
+                &host,
                 &format!("agent #{id} {name} 的接入命令"),
                 None,
                 Vec::new(),
@@ -683,8 +723,10 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
 
         Action::RotateToken { id, name } => {
             let token = agent_repo::rotate_token(&app.pool, *id).await?;
+            let host = app.master_host();
             app.modal = Some(install_modal(
                 &app.cfg,
+                &host,
                 &format!("{name} 的新 token —— 在那台机器上重跑这一条"),
                 Some(&token),
                 vec![
@@ -816,6 +858,17 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(String::new())
         }
 
+        Action::SetUserNics { user_id, user, agent_ids } => {
+            node_repo::set_user_nics(&app.pool, *user_id, agent_ids).await?;
+            if agent_ids.is_empty() {
+                return Ok(format!("{user} 的订阅流量已改回按自己的用量报"));
+            }
+            Ok(format!(
+                "{user} 的订阅流量改成报 {} 台机器的网卡用量之和(只影响订阅响应头)",
+                agent_ids.len()
+            ))
+        }
+
         // 刷新本身在主循环里做(每个动作之后都会 refresh 一次),这里只给回执。
         Action::Refresh => Ok("已刷新".into()),
 
@@ -851,7 +904,7 @@ mod tests {
     fn install_modal_puts_the_command_on_its_own_first_line() {
         let mut cfg = Config::default();
         cfg.cluster.tls = false;
-        let m = install_modal(&cfg, "t", Some("tok"), Vec::new());
+        let m = install_modal(&cfg, "203.0.113.8", "t", Some("tok"), Vec::new());
         let Modal::Info { body, copy, .. } = &m else { panic!("应当是信息框") };
         assert!(body[0].starts_with("curl -fsSL "), "第一行就该是命令: {:?}", body[0]);
         assert_eq!(copy.as_deref(), Some(body[0].as_str()), "按 y 复制的就该是那一行");
@@ -865,7 +918,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.cluster.tls = false;
         let mut a = app();
-        a.modal = Some(install_modal(&cfg, "t", Some("tok"), Vec::new()));
+        a.modal = Some(install_modal(&cfg, "203.0.113.8", "t", Some("tok"), Vec::new()));
         assert!(on_key(&mut a, key('y')).is_none());
         let Some(Modal::Info { copied, .. }) = &a.modal else { panic!("弹窗不该关掉") };
         let msg = copied.as_deref().unwrap_or_default();
@@ -902,6 +955,7 @@ mod tests {
         cfg.subscription.public_base = "https://sub.example.com".into();
         let mut m = install_modal(
             &cfg,
+            "sub.example.com",
             "agent #1 tokyo-1 —— 在被控机上跑这一条",
             Some("Zm9vYmFyYmF6cXV1eDEyMzQ1Njc4OWFiY2RlZg"),
             Vec::new(),
@@ -1042,6 +1096,67 @@ mod tests {
         // 内存里的那份也要更新。
         assert_eq!(a.cfg.subscription.public_base, "https://sub.example.com");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **页签文字必须真的画出来。**
+    ///
+    /// v0.3.0 换成 ratatui 的 `Tabs` + `Borders::BOTTOM` 之后,页签区还是只给了
+    /// 一行 —— 那一行被下边框吃掉,结果整条页签消失,屏幕上只剩一条横线。
+    /// 界面「看起来只是少了点东西」,而实际是导航条整个没了。
+    ///
+    /// 断言的是渲染出来的字符,不是布局参数:参数对不对只有画出来才知道。
+    #[tokio::test]
+    async fn tabs_are_actually_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let a = app();
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let first: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        let flat: String = first.chars().filter(|c| !c.is_whitespace()).collect();
+
+        for (i, t) in PAGES.iter().enumerate() {
+            let want: String = format!("{t}[{}]", i + 1).chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(flat.contains(&want), "页签第一行里没有 {want}:{first:?}");
+        }
+        // 第二行是那条下边框。少了它页签和内容会糊在一起。
+        let second: String = (0..buf.area.width).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        assert!(second.contains('─'), "页签下面该有一条分隔线:{second:?}");
+        // `-- --nocapture` 时能直接看一眼长什么样。
+        println!("{}
+{}", first.trim_end(), second.trim_end());
+    }
+
+    /// 绑网卡是**多选**,而且打开时已绑的要是勾上的 —— 与分配节点同一个道理:
+    /// 一片空白会让人以为原来什么都没绑,一保存就把绑定全清了。
+    #[tokio::test]
+    async fn the_nic_picker_starts_from_the_current_binding() {
+        let mut a = app();
+        a.page = Page::Users;
+        a.agents = vec![stub_agent(1), stub_agent(2), stub_agent(3)];
+        let mut u = stub_user(true);
+        u.nic_agent_ids = vec![1, 3];
+        a.users = vec![u];
+
+        on_key(&mut a, key('b'));
+        let Some(Modal::Picker(p)) = &a.modal else { panic!("应当开一个多选框") };
+        let checked: Vec<i64> = p.items.iter().filter(|i| i.checked).map(|i| i.id).collect();
+        assert_eq!(checked, vec![1, 3]);
+        // 抬头必须说清它只影响订阅报出去的数字。
+        assert!(p.head.contains("订阅"), "{}", p.head);
+    }
+
+    /// 没有 agent 时不能开绑定框 —— 那个框里一个可勾的都没有。
+    #[tokio::test]
+    async fn binding_nics_without_any_agent_explains_itself() {
+        let mut a = app();
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+        on_key(&mut a, key('b'));
+        assert!(a.modal.is_none());
+        assert!(a.status_is_error);
     }
 
     fn app() -> App {
@@ -1256,6 +1371,7 @@ mod tests {
             expire_at: None,
             reset_day: None,
             node_ids: vec![],
+            nic_agent_ids: vec![],
             sub_token: "t".into(),
         }
     }
