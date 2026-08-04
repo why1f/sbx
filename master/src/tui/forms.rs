@@ -638,6 +638,8 @@ mod preview {
             protocol: "vless-reality".into(),
             listen_port: 443,
             user_count: 0,
+            cycle_up: 0,
+            cycle_down: 0,
             params: crate::model::node::NodeParams {
                 server_name: Some("www.apple.com".into()),
                 ..Default::default()

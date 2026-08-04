@@ -104,10 +104,13 @@ pub fn dashboard(
 
     let mid = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(c[2]);
     top_users(f, mid[0], users, now);
-    agent_quotas(f, mid[1], agents, now);
+    // 右边是**节点视图**,不是被控机视图。每台机器的网卡明细搬去了服务管理页的
+    // 二级页面(按 Enter)—— 网卡是整机口径,和这里两张表用的用户口径不是一回事,
+    // 摆在同一屏上并排比只会让人把两个数字当成同一个数字的两次统计(§6.4)。
+    top_nodes(f, mid[1], nodes, !agents.is_empty());
 }
 
 fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], users: &[UserRow]) {
@@ -316,54 +319,158 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
 /// 卡在 30s 上会让正常的网络抖动表现成「CPU 数字一闪一闪地消失」。
 const HOST_METRICS_STALE_AFTER: i64 = 90;
 
-fn agent_quotas(f: &mut Frame, area: Rect, agents: &[AgentRow], now: i64) {
+/// 仪表盘右下角:各节点本周期跑了多少,按用量排。
+///
+/// 条形画的是**占全部节点总量的份额**,不是配额比例 —— 节点没有配额,
+/// 这里回答的问题是「量都堆在哪个节点上」。tag 后面必须跟机器名:
+/// tag 在不同机器上可以重名,只有 tag 的两行会长得一模一样。
+fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool) {
+    let mut top: Vec<&NodeRow> = nodes.iter().collect();
+    top.sort_by_key(|n| std::cmp::Reverse(n.cycle_up.saturating_add(n.cycle_down)));
     let rows = area.height.saturating_sub(2) as usize;
-    let bar_w = (area.width.saturating_sub(34)).clamp(0, 14) as usize;
+    let total: i64 = nodes.iter().map(|n| n.cycle_up.saturating_add(n.cycle_down)).sum();
+
+    // 宽度从内框往回算,而不是拍几个常数:`tag@机器名` 比用户名长得多,
+    // 而这一栏只占半屏。算错一格的后果是 `%` 被悄悄切掉,看起来像
+    // 「份额是 0」而不是「这里显示不下」。
+    //
+    // 让位顺序是**整列整列地丢**:先丢条形,再丢百分比 —— 挤压某一列
+    // ratatui 是不吭声的,而少一整列人一眼就看得出来(§13.4)。
+    let inner = area.width.saturating_sub(2) as usize;
+    let fixed = 2 + 11 + 11; // 缩进 + `↑{:>9} ` + `↓{:>9} `
+    let label_w = inner.saturating_sub(fixed + 5).clamp(8, 22);
+    let rest = inner.saturating_sub(fixed + label_w);
+    let show_pct = rest >= 5;
+    let bar_w = if show_pct { (rest - 5).min(10) } else { 0 };
 
     let mut lines: Vec<Line> = Vec::new();
-    if agents.is_empty() {
+    if top.is_empty() {
+        // 一台被控机都没有的时候,让人去节点页是死路 —— 建节点要先选机器。
+        // 空状态得指向**真正的下一步**,否则它只是一句看起来有用的废话。
         lines.push(Line::from(Span::styled(
-            "  还没有被控服务器。按 [2] 去服务管理页,再按 [a] 加一台。",
+            if has_agents {
+                "  还没有节点。按 [3] 去节点页,再按 [a] 建一个。"
+            } else {
+                "  还没有被控服务器。按 [2] 去服务管理页,再按 [a] 加一台。"
+            },
             Style::default().fg(theme::DIM),
         )));
     }
-    // 每台占两行:第一行流量与配额,第二行 CPU / 内存 / load。
-    // 挤在一行里的话窄一点就全被截掉,而这两组数字回答的是不同的问题
-    // (还能跑多少流量 / 这台机器现在吃不吃得消)。
-    for a in agents.iter().take(rows / 2) {
-        let (dot, color) = match a.status.as_str() {
-            "online" => ("●", theme::ONLINE),
-            "offline" => ("●", theme::OFFLINE),
-            _ => ("○", theme::NEVER),
-        };
+    for n in top.into_iter().take(rows) {
+        let used = n.cycle_up.saturating_add(n.cycle_down);
+        let share = if total > 0 { used as f64 / total as f64 } else { 0.0 };
         let mut spans = vec![
-            Span::styled(format!("  {dot} "), Style::default().fg(color)),
-            Span::raw(theme::pad(&a.name, 12)),
-            Span::raw(format!("{:>10}  ", theme::bytes(a.used()))),
+            Span::raw(format!(
+                "  {}",
+                theme::pad(&format!("{}@{}", n.tag, n.agent_name), label_w)
+            )),
+            Span::styled(format!("↑{:>9} ", theme::bytes(n.cycle_up)), Style::default().fg(theme::UP)),
+            Span::styled(
+                format!("↓{:>9} ", theme::bytes(n.cycle_down)),
+                Style::default().fg(theme::DOWN),
+            ),
         ];
-        match a.quota_ratio() {
-            Some(r) => {
-                if bar_w >= 4 {
-                    spans.extend(theme::gradient_bar(r, bar_w));
-                }
-                spans.push(Span::styled(
-                    format!(" {:>3.0}%", r * 100.0),
-                    Style::default().fg(theme::gradient_at(r)),
-                ));
-            }
-            None => spans.push(Span::styled(" 不限流量", Style::default().fg(theme::DIM))),
+        if bar_w >= 4 {
+            spans.extend(theme::gradient_bar(share, bar_w));
+        }
+        if show_pct {
+            spans.push(Span::styled(
+                format!("{:>4.0}%", share * 100.0),
+                Style::default().fg(theme::gradient_at(share)),
+            ));
         }
         lines.push(Line::from(spans));
-        lines.push(Line::from(Span::styled(
-            format!("      {}", host_metrics(a, now, area.width.saturating_sub(8) as usize)),
-            Style::default().fg(theme::DIM),
-        )));
     }
 
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 被控服务器 ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 节点用量 ")),
         area,
     );
+}
+
+/// 网卡明细二级页面的表头补充行(服务管理页按 Enter)。
+///
+/// 这几行回答的是「这台机器**整机**烧了多少、还剩多少配额」,
+/// 而下面的表回答「这台机器上是哪个节点在跑量」。两者口径不同:
+/// 网卡是 `/proc/net/dev` 的整机进出(含系统更新、别的服务、协议开销),
+/// 节点是 sing-box 记的账。厂商按前者计费,所以前者才是「这个月要付多少钱」
+/// 的答案,而后者是「谁在用」的答案(§6.4 / §7.2)。
+///
+/// 网卡数字从**加入集群那一刻**开始从 0 计,不是从开机算起 —— 否则第一次
+/// 上报就会把这台机器开机至今的历史全部计入本周期(v0.3.0 修的就是这个)。
+pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
+    let mut out: Vec<Line> = Vec::new();
+
+    let nic_total = a.cycle_rx.saturating_add(a.cycle_tx);
+    out.push(Line::from(vec![
+        Span::styled("  网卡本周期  ", Style::default().fg(theme::DIM)),
+        Span::styled(format!("↑ {:<10}", theme::bytes(a.cycle_rx)), Style::default().fg(theme::UP)),
+        Span::styled(format!("↓ {:<10}", theme::bytes(a.cycle_tx)), Style::default().fg(theme::DOWN)),
+        Span::styled("合计 ", Style::default().fg(theme::DIM)),
+        Span::styled(theme::bytes(nic_total), Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+
+    let mut quota = vec![Span::styled("  配额        ", Style::default().fg(theme::DIM))];
+    match (a.quota_ratio(), a.nic_quota_bytes) {
+        (Some(r), Some(q)) => {
+            quota.extend(theme::gradient_bar(r, 12));
+            quota.push(Span::styled(
+                format!(" {:>3.0}%  ", r * 100.0),
+                Style::default().fg(theme::gradient_at(r)),
+            ));
+            quota.push(Span::raw(format!("{} / {}  ", theme::bytes(a.used()), theme::bytes(q))));
+            // 剩余量单独写出来:百分比在「配额 10 TB、已用 91%」时看着还行,
+            // 而真正要紧的是「还剩 900 GB」这个绝对值。
+            quota.push(Span::styled(
+                format!("剩 {}", theme::bytes((q - a.used()).max(0))),
+                Style::default().fg(theme::DIM),
+            ));
+        }
+        // 不限流量的行**不画条**:一根满条读起来是「用完了」,正好相反(§8.2)。
+        _ => quota.push(Span::styled("不限流量", Style::default().fg(theme::DIM))),
+    }
+    out.push(Line::from(quota));
+
+    let mut cycle = vec![
+        Span::styled("  重置        ", Style::default().fg(theme::DIM)),
+        Span::raw(format!("每月 {}", forms::reset_day_label(a.nic_reset_day))),
+    ];
+    if let Some(d) = a.nic_reset_day.filter(|d| (1..=31).contains(d)) {
+        let today = forms::today_day(now) as i64;
+        // 同一天就是「今天」,否则算到下一个该日子还有几天(跨月按 30 天估)。
+        let days = if d == today {
+            0
+        } else if d > today {
+            d - today
+        } else {
+            30 - today + d
+        };
+        cycle.push(Span::styled(
+            if days == 0 { "  (就是今天)".to_string() } else { format!("  (约 {days} 天后)") },
+            Style::default().fg(theme::DIM),
+        ));
+    }
+    out.push(Line::from(cycle));
+
+    let speed = match (a.up_per_sec, a.down_per_sec) {
+        (Some(u), Some(d)) => vec![
+            Span::styled(format!("↑ {:<10}", theme::rate(u)), Style::default().fg(theme::UP)),
+            Span::styled(format!("↓ {}", theme::rate(d)), Style::default().fg(theme::DOWN)),
+        ],
+        // 没有两次可比的采样就写 `--`。当 0 显示会让「刚打开界面」
+        // 和「这台机器闲着」看起来一模一样。
+        _ => vec![Span::styled("↑ --        ↓ --", Style::default().fg(theme::DIM))],
+    };
+    let mut rate = vec![Span::styled("  当前速率    ", Style::default().fg(theme::DIM))];
+    rate.extend(speed);
+    out.push(Line::from(rate));
+
+    out.push(Line::from(vec![
+        Span::styled("  主机        ", Style::default().fg(theme::DIM)),
+        Span::styled(host_metrics(a, now, 60), Style::default().fg(theme::DIM)),
+    ]));
+
+    out
 }
 
 /// 一行 CPU / 内存 / load /(放得下的话)运行时长。
@@ -1126,23 +1233,33 @@ pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], s
 /// 两个方向共用一个渲染:它们查的是 `user_traffic` 的同一张表,只是分组的那一维不同。
 /// 表里同时给**本周期**和**累计**:本周期是计费口径(会被月重置清零),
 /// 累计是从建账起的总量 —— 只给其中一个,总会有人拿它去回答另一个问题。
-pub fn breakdown(f: &mut Frame, area: Rect, title: &str, head: &str, rows: &[BreakdownRow]) {
-    let w = 92.min(area.width.max(1));
-    let h = (rows.len().max(1) as u16 + 6).min(area.height.max(1));
+pub fn breakdown(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    head: &str,
+    info: &[Line<'static>],
+    rows: &[BreakdownRow],
+) {
+    // 92 是给「累计 + 说明」那段留的最小体面宽度;终端更宽就用到 104,
+    // 网卡明细的说明(协议 · 端口 · 人数)在 92 上正好放不下。
+    let w = 104.min(area.width.max(1));
+    // info 行要算进高度里。不算的话网卡明细会把最后几行节点顶出框外 ——
+    // 而 Paragraph 是**静默**截断的,看起来就像那几个节点不存在。
+    let h = (rows.len().max(1) as u16 + info.len() as u16 + 6).min(area.height.max(1));
     let rect = super::modal::centered(area, 0, 0, w, h);
     f.render_widget(ratatui::widgets::Clear, rect);
 
     let total: i64 = rows.iter().map(|r| r.cycle()).sum();
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            format!("  {head}"),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!("  {head}"),
+        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(info.iter().cloned());
+    lines.push(Line::from(""));
     if rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  还没有分配关系。分配了但没跑过流量的也会显示在这里(全 0)。",
+            "  还没有可显示的行。建好但一次没跑过流量的也会列在这里(全 0)。",
             Style::default().fg(theme::DIM),
         )));
     }
@@ -1165,10 +1282,12 @@ pub fn breakdown(f: &mut Frame, area: Rect, title: &str, head: &str, rows: &[Bre
             format!(" {:>3.0}%  ", share * 100.0),
             Style::default().fg(theme::gradient_at(share)),
         ));
-        spans.push(Span::styled(
-            format!("累计 {}  {}", theme::bytes(r.total_up + r.total_down), r.note),
-            Style::default().fg(theme::DIM),
-        ));
+        // 尾巴**自己截**,不交给 Paragraph。Paragraph 是无声切断的,
+        // 切出来的 `vless-real` 看着像一个完整的协议名;`vless-rea…` 一眼就知道是被截了。
+        let tail = format!("累计 {}  {}", theme::bytes(r.total_up + r.total_down), r.note);
+        let used: usize = spans.iter().map(|s| theme::cols(&s.content)).sum();
+        let room = (w as usize).saturating_sub(2).saturating_sub(used);
+        spans.push(Span::styled(theme::truncate(&tail, room), Style::default().fg(theme::DIM)));
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
@@ -1246,6 +1365,8 @@ mod tests {
             protocol: "vless-reality".into(),
             listen_port: 8443,
             user_count: 3,
+            cycle_up: 0,
+            cycle_down: 0,
             params: crate::model::node::NodeParams {
                 server_name: Some("www.apple.com".into()),
                 ..Default::default()
@@ -1371,7 +1492,7 @@ mod tests {
             draw_to_string(w, h, |f| {
                 settings(f, f.area(), &crate::tui::settings::all(&crate::config::Config::default()), 0)
             });
-            draw_to_string(w, h, |f| breakdown(f, f.area(), "t", "h", &[]));
+            draw_to_string(w, h, |f| breakdown(f, f.area(), "t", "h", &[], &[]));
         }
     }
 
@@ -1603,6 +1724,98 @@ mod tests {
         assert!(out.contains("alice"), "但明细必须留着:\n{out}");
     }
 
+    /// 仪表盘右下角是**节点视图**,不是被控机视图。
+    ///
+    /// 网卡那一栏搬去了服务管理页的二级页面 —— 它是整机口径,
+    /// 和这一屏上另外两张表的用户口径不是一回事(§6.4)。
+    #[test]
+    fn dashboard_bottom_row_is_users_and_nodes() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &[agent(Some(1 << 40), Some(22))], &[node()], &[user()], &hist, NOW)
+        });
+        assert!(has_cjk(&out, "用量 Top"), "用户视图要在:
+{out}");
+        assert!(has_cjk(&out, "节点用量"), "节点视图要在:
+{out}");
+        assert!(has_cjk(&out, "tokyo-reality@tokyo-1"), "节点行要带机器名:
+{out}");
+        // 「被控服务器」那个面板整块搬走了。留着它等于同一屏上摆两个口径的数字。
+        assert!(!flat(&out).contains(&flat("┌ 被控服务器")), "网卡面板不该还在仪表盘上:
+{out}");
+    }
+
+    /// 节点视图的百分比不能被切掉。
+    ///
+    /// 少一个 `%` 会把「份额 100%」读成「份额 100」,而更糟的是
+    /// `0%` 被切成 `0` —— 那看起来像一个正常的数字,没人会发现这一列是残的。
+    #[test]
+    fn node_view_never_clips_the_percent_sign() {
+        let rows = vec![NodeRow { cycle_up: 3 << 30, cycle_down: 1 << 30, ..node() }];
+        // 57 是 120 列屏幕上这一栏的实际宽度 —— 原来的算法在这里正好差一格,
+        // 把 `%` 挤掉了。50 是再窄一档:此时条形该整列消失,但百分比要留住。
+        for w in [50u16, 57, 80, 100, 120, 160] {
+            let out = draw_to_string(w, 10, |f| {
+                let a = f.area();
+                super::top_nodes(f, a, &rows, true)
+            });
+            assert!(out.contains("100%"), "{w} 列下百分比被切了:
+{out}");
+        }
+    }
+
+    /// 一台被控机都没有的时候,节点视图要指向**真正的下一步**。
+    /// 让人去节点页是死路 —— 建节点的表单要先选一台机器。
+    #[test]
+    fn node_view_points_at_adding_a_machine_first() {
+        let out = draw_to_string(60, 6, |f| {
+            let a = f.area();
+            super::top_nodes(f, a, &[], false)
+        });
+        assert!(has_cjk(&out, "按 [2] 去服务管理页"), "{out}");
+
+        let out = draw_to_string(60, 6, |f| {
+            let a = f.area();
+            super::top_nodes(f, a, &[], true)
+        });
+        assert!(has_cjk(&out, "按 [3] 去节点页"), "{out}");
+    }
+
+    /// 网卡明细的表头:没有配额就不画条(一根满条读起来是「用完了」),
+    /// 没有速率读数就写 `--`(写 0 会让「刚打开」和「闲着」看起来一样)。
+    #[test]
+    fn nic_info_says_unlimited_and_unknown_rather_than_zero() {
+        let mut a = agent(None, None);
+        a.up_per_sec = None;
+        a.down_per_sec = None;
+        let out = draw_to_string(100, 10, |f| {
+            let area = f.area();
+            breakdown(f, area, "t", "h", &nic_info(&a, NOW), &[])
+        });
+        assert!(has_cjk(&out, "不限流量"), "无配额要写不限:
+{out}");
+        assert!(out.contains("--"), "没读数要写 --:
+{out}");
+        assert!(!out.contains("0 B/s"), "不该把没读数显示成 0:
+{out}");
+    }
+
+    /// 网卡明细同屏摆着两个口径的数字,标题里必须说清哪个是厂商计费的那个。
+    /// 不说的话,两个对不上的数字就是一条永远查不明白的「bug」(§6.4)。
+    #[test]
+    fn nic_info_shows_the_machine_wide_numbers() {
+        let a = agent(Some(500 * 1_073_741_824), Some(22));
+        let out = draw_to_string(110, 12, |f| {
+            let area = f.area();
+            breakdown(f, area, "tokyo-1 的网卡明细", "tokyo-1 · 网卡按厂商口径计费", &nic_info(&a, NOW), &[])
+        });
+        assert!(has_cjk(&out, "网卡本周期"), "{out}");
+        assert!(has_cjk(&out, "剩"), "剩余量要写出来,只有百分比不够用:
+{out}");
+        assert!(has_cjk(&out, "每月 22 日"), "重置日要在:
+{out}");
+    }
+
     /// 空库时仪表盘要给出「下一步按什么」,而不是几个空框。
     #[test]
     fn empty_dashboard_tells_you_what_to_do_next() {
@@ -1673,6 +1886,8 @@ mod tests {
                 protocol: "hysteria2".into(),
                 listen_port: 8444,
                 user_count: 1,
+                cycle_up: 0,
+                cycle_down: 0,
                 params: crate::model::node::NodeParams {
                     ipv6: true,
                     relay: crate::model::node::RelaySetting {
@@ -1758,7 +1973,40 @@ mod tests {
                 f.area(),
                 "节点 tokyo-reality 上的用户",
                 "tokyo-reality(在 tokyo-1 上)· 2 个用户",
+                &[],
                 &bd
+            ))
+        );
+        // 服务管理页按 Enter 出来的那一张:上面五行是整机网卡口径,
+        // 下面的表是节点(sing-box)口径。两组数字并排,谁也别冒充谁。
+        let nic_rows = vec![
+            BreakdownRow {
+                label: "tokyo-reality".into(),
+                note: "2 人 · vless-reality".into(),
+                cycle_up: 20 * 1_073_741_824,
+                cycle_down: 55 * 1_073_741_824,
+                total_up: 120 * 1_073_741_824,
+                total_down: 300 * 1_073_741_824,
+            },
+            BreakdownRow {
+                label: "tokyo-ws".into(),
+                note: "0 人 · vless-ws".into(),
+                cycle_up: 0,
+                cycle_down: 0,
+                total_up: 0,
+                total_down: 0,
+            },
+        ];
+        let a = agent(Some(500 * 1_073_741_824), Some(22));
+        println!(
+            "── 网卡明细(服务管理页 Enter)──\n{}\n",
+            draw_to_string(120, 16, |f| breakdown(
+                f,
+                f.area(),
+                "tokyo-1 的网卡明细",
+                "tokyo-1 · 2 个节点 · 网卡按厂商口径计费",
+                &nic_info(&a, NOW),
+                &nic_rows
             ))
         );
         println!("── 服务管理 ──\n{}\n", draw_to_string(120, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW)));

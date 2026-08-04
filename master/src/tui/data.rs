@@ -79,6 +79,12 @@ pub struct NodeRow {
     pub protocol: String,
     pub listen_port: i64,
     pub user_count: i64,
+    /// 这个节点上**所有用户**本周期用量之和。仪表盘的节点视图按它排序。
+    ///
+    /// 与 `agents` 上的网卡数字是两个口径:这里是 sing-box 记的账,
+    /// 网卡是整机进出(§6.4 / §7.2)。两个数对不上是正常的,不是 bug。
+    pub cycle_up: i64,
+    pub cycle_down: i64,
     /// 节点参数原样带回来,给「编辑节点」做预填。
     ///
     /// **这里面有凭据**(reality 私钥、自签证书私钥、ss 服务端密钥,见 model/node.rs)。
@@ -208,6 +214,48 @@ pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<Break
             // 否则两行长得一模一样,只能靠顺序猜是哪一台。
             label: format!("{tag} @ {agent}"),
             note: format!("{proto} · :{port}"),
+            cycle_up: cu,
+            cycle_down: cd,
+            total_up: tu,
+            total_down: td,
+        })
+        .collect())
+}
+
+/// `nodes` × `user_traffic` 聚合后的一行。
+type AgentNodeRow = (String, String, i64, i64, i64, i64, i64, i64);
+
+/// 某台被控机上,各节点的用量。
+///
+/// 这是「网卡明细」二级页面的主体:先看整机网卡烧了多少(在 head 那几行),
+/// 再看这台机器上是哪个节点在跑量。两个口径不同,**必须并排看**才有意义 ——
+/// 网卡是整机进出(含系统更新、别的服务),节点是 sing-box 记的账(§6.4)。
+///
+/// `LEFT JOIN`:建了但一次没跑过的节点也要出现(全 0)。
+/// 「配了没生效」正是最需要看见的情况,内连接会把它整行藏起来。
+pub async fn agent_breakdown(pool: &SqlitePool, agent_id: i64) -> Result<Vec<BreakdownRow>> {
+    let rows: Vec<AgentNodeRow> = sqlx::query_as(
+        "SELECT n.tag, n.protocol, n.listen_port,
+                (SELECT COUNT(*) FROM user_nodes un WHERE un.node_id = n.id),
+                COALESCE(SUM(t.cycle_up), 0),   COALESCE(SUM(t.cycle_down), 0),
+                COALESCE(SUM(t.total_up), 0),   COALESCE(SUM(t.total_down), 0)
+           FROM nodes n
+           LEFT JOIN user_traffic t ON t.node_id = n.id
+          WHERE n.agent_id = ?
+          GROUP BY n.id
+          ORDER BY (COALESCE(SUM(t.cycle_up), 0) + COALESCE(SUM(t.cycle_down), 0)) DESC, n.id",
+    )
+    .bind(agent_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(tag, proto, _port, users, cu, cd, tu, td)| BreakdownRow {
+            label: tag,
+            // 人数排在最前面:这一页问的是「量堆在哪」,而「几个人在用」是
+            // 紧接着的下一个问题。端口不写 —— 它是节点页的事,和流量对账无关,
+            // 而这一栏窄到装不下所有东西时,先被截掉的正是最右边那一段。
+            note: format!("{users} 人 · {proto}"),
             cycle_up: cu,
             cycle_down: cd,
             total_up: tu,
@@ -427,12 +475,14 @@ pub async fn load_agents(
 }
 
 /// `nodes` + 所属 agent 名 + 用户数 + 原始 `params_json`。
-type NodeQueryRow = (i64, i64, String, String, String, i64, i64, String);
+type NodeQueryRow = (i64, i64, String, String, String, i64, i64, i64, i64, String);
 
 pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
     let rows: Vec<NodeQueryRow> = sqlx::query_as(
         "SELECT n.id, n.agent_id, a.name, n.tag, n.protocol, n.listen_port,
                 (SELECT COUNT(*) FROM user_nodes un WHERE un.node_id = n.id),
+                COALESCE((SELECT SUM(t.cycle_up)   FROM user_traffic t WHERE t.node_id = n.id), 0),
+                COALESCE((SELECT SUM(t.cycle_down) FROM user_traffic t WHERE t.node_id = n.id), 0),
                 n.params_json
            FROM nodes n JOIN agents a ON a.id = n.agent_id
           ORDER BY n.agent_id, n.id",
@@ -442,7 +492,7 @@ pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
     Ok(rows
         .into_iter()
         .map(
-            |(id, agent_id, agent_name, tag, protocol, listen_port, user_count, params)| NodeRow {
+            |(
                 id,
                 agent_id,
                 agent_name,
@@ -450,6 +500,19 @@ pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
                 protocol,
                 listen_port,
                 user_count,
+                cycle_up,
+                cycle_down,
+                params,
+            )| NodeRow {
+                id,
+                agent_id,
+                agent_name,
+                tag,
+                protocol,
+                listen_port,
+                user_count,
+                cycle_up,
+                cycle_down,
                 // 解不出来就当空参数:一行坏 JSON 不该让整个节点页读不出来。
                 params: serde_json::from_str(&params).unwrap_or_default(),
             },
@@ -682,5 +745,130 @@ mod tests {
         assert_eq!(u.used(), 500);
         assert_eq!(u.quota_ratio(), Some(0.5));
         assert_eq!(u.node_count(), 1);
+    }
+
+    // ── agent_breakdown / load_nodes 的库测 ────────────────────────────────
+
+    async fn pool() -> SqlitePool {
+        let path = std::env::temp_dir().join(format!("sbx-tuidata-{}.db", uuid::Uuid::new_v4()));
+        crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap()
+    }
+
+    /// 造一台机器 + 一个节点 + 一个分到该节点的用户,返回 (agent_id, node_id, user_id)。
+    async fn fixture(p: &SqlitePool, tag: &str) -> (i64, i64, i64) {
+        let (agent_id, _) = crate::db::agent_repo::create(p, tag, 0).await.unwrap();
+        let (node_id, _) = crate::db::node_repo::add_node(
+            p,
+            agent_id,
+            tag,
+            crate::model::node::Protocol::VlessReality,
+            8443,
+            &crate::model::node::NodeParams::default(),
+        )
+        .await
+        .unwrap();
+        let user_id = crate::db::node_repo::add_user(p, "alice", 0, 0).await.unwrap();
+        crate::db::node_repo::set_user_nodes(p, user_id, &[node_id]).await.unwrap();
+        (agent_id, node_id, user_id)
+    }
+
+    async fn traffic(p: &SqlitePool, user_id: i64, node_id: i64, up: i64, down: i64) {
+        sqlx::query(
+            "INSERT INTO user_traffic
+                 (user_id, node_id, cycle_up, cycle_down, total_up, total_down, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(user_id)
+        .bind(node_id)
+        .bind(up)
+        .bind(down)
+        .bind(up * 2)
+        .bind(down * 2)
+        .execute(p)
+        .await
+        .unwrap();
+    }
+
+    /// 建好但一次没跑过流量的节点**必须出现**(全 0)。
+    ///
+    /// 「配了没生效」正是打开这一页最想看见的一种情况 —— 内连接会把它整行藏起来,
+    /// 界面上表现为「这个节点不存在」,而人刚刚才建过它。
+    #[tokio::test]
+    async fn agent_breakdown_lists_nodes_that_never_carried_traffic() {
+        let p = pool().await;
+        let (agent_id, _, _) = fixture(&p, "tokyo").await;
+        crate::db::node_repo::add_node(
+            &p,
+            agent_id,
+            "idle",
+            crate::model::node::Protocol::VlessWs,
+            2053,
+            &crate::model::node::NodeParams::default(),
+        )
+        .await
+        .unwrap();
+
+        let rows = agent_breakdown(&p, agent_id).await.unwrap();
+        assert_eq!(rows.len(), 2, "两个节点都要在:{rows:?}");
+        let idle = rows.iter().find(|r| r.label == "idle").unwrap();
+        assert_eq!(idle.cycle(), 0);
+        assert!(idle.note.contains("0 人"), "没人用的节点要写明白:{}", idle.note);
+    }
+
+    /// 一个节点上多个用户的量要**加起来**。
+    /// 不聚合的话同一个 tag 会出现好几行,看起来像建重了。
+    #[tokio::test]
+    async fn agent_breakdown_sums_every_user_on_the_node() {
+        let p = pool().await;
+        let (agent_id, node_id, alice) = fixture(&p, "tokyo").await;
+        let bob = crate::db::node_repo::add_user(&p, "bob", 0, 0).await.unwrap();
+        crate::db::node_repo::set_user_nodes(&p, bob, &[node_id]).await.unwrap();
+        traffic(&p, alice, node_id, 100, 200).await;
+        traffic(&p, bob, node_id, 30, 70).await;
+
+        let rows = agent_breakdown(&p, agent_id).await.unwrap();
+        assert_eq!(rows.len(), 1, "一个节点一行:{rows:?}");
+        assert_eq!(rows[0].cycle_up, 130);
+        assert_eq!(rows[0].cycle_down, 270);
+        assert!(rows[0].note.contains("2 人"), "{}", rows[0].note);
+    }
+
+    /// 别台机器的节点不能混进来。
+    #[tokio::test]
+    async fn agent_breakdown_only_covers_its_own_machine() {
+        let p = pool().await;
+        let (tokyo, _, _) = fixture(&p, "tokyo").await;
+        fixture_second_machine(&p).await;
+        let rows = agent_breakdown(&p, tokyo).await.unwrap();
+        assert_eq!(rows.len(), 1, "只该有 tokyo 自己的节点:{rows:?}");
+        assert_eq!(rows[0].label, "tokyo");
+    }
+
+    async fn fixture_second_machine(p: &SqlitePool) {
+        let (agent_id, _) = crate::db::agent_repo::create(p, "osaka", 0).await.unwrap();
+        crate::db::node_repo::add_node(
+            p,
+            agent_id,
+            "osaka",
+            crate::model::node::Protocol::Hysteria2,
+            8444,
+            &crate::model::node::NodeParams::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// 仪表盘的节点视图靠 `load_nodes` 带回来的 cycle_up/down 排序。
+    /// 这两列一旦忘了填,整栏会全是 0 —— 而那看起来像「真的没流量」。
+    #[tokio::test]
+    async fn load_nodes_carries_per_node_cycle_traffic() {
+        let p = pool().await;
+        let (_, node_id, alice) = fixture(&p, "tokyo").await;
+        traffic(&p, alice, node_id, 111, 222).await;
+
+        let rows = load_nodes(&p).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cycle_up, 111);
+        assert_eq!(rows[0].cycle_down, 222);
     }
 }

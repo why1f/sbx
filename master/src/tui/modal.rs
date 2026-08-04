@@ -60,6 +60,8 @@ pub enum Action {
     ShowNodeUsers { id: i64, tag: String, agent: String },
     /// 打开「这个用户在各节点上用了多少」。
     ShowUserNodes { id: i64, name: String },
+    /// 打开「这台机器的网卡明细」:整机网卡用量 + 配额 + 各节点跑了多少。
+    ShowAgentNics { id: i64, name: String },
     /// 立刻刷一遍。常规刷新是每秒一次,但改完配置或另一个进程动了库时要马上看到。
     Refresh,
     AddNode(NodeDraft),

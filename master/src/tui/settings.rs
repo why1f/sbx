@@ -105,7 +105,7 @@ pub fn all(cfg: &Config) -> Vec<Setting> {
             "订阅对外地址",
             cfg.subscription.public_base.clone(),
             Kind::Text,
-            "形如 https://sub.example.com。它同时决定新增 agent 时的主控地址,重启 daemon 生效",
+            "给用户的订阅地址,形如 https://sub.example.com(带协议,不带 /sub/…)",
         ),
         s(
             "subscription",
@@ -137,7 +137,7 @@ pub fn all(cfg: &Config) -> Vec<Setting> {
             "主控对外地址",
             cfg.cluster.public_host.clone(),
             Kind::Text,
-            "被控机回连用的 IP 或域名,不含端口。留空 = 自动定(先问外部服务,再退回本机出口地址)",
+            "被控机回连用的 IP 或域名,不含协议与端口。留空 = 自动定,顺序:订阅域名 → 探到的公网 IP → 本机出口地址",
         ),
         s(
             "cluster",

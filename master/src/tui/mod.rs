@@ -24,6 +24,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{CrosstermBackend, Terminal};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use sqlx::SqlitePool;
 use std::time::Duration;
 
@@ -36,7 +38,7 @@ const PAGES: [&str; 5] = ["仪表盘", "服务管理", "节点", "用户", "设�
 /// 刷新间隔。1 秒足够跟上 30 秒一次的上报,又不会让 SQLite 被空转拖累。
 const TICK: Duration = Duration::from_millis(1000);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     Dashboard = 0,
     Agents = 1,
@@ -153,7 +155,7 @@ impl App {
                     ),
                     None => "  │  还没有被控服务器,按 [a] 加一台".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [i]接入命令  [r]轮换token  [d]删除{sel}")
+                format!("{common}  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [r]轮换token  [d]删除{sel}")
             }
             Page::Nodes => {
                 let sel = match self.selected_node() {
@@ -226,6 +228,10 @@ impl App {
 struct Overlay {
     title: String,
     head: String,
+    /// 表头下面的补充行。节点/用户明细不需要,留空;
+    /// 网卡明细要靠它把「整机烧了多少」和下面「各节点跑了多少」并排摆出来 ——
+    /// 这两个数字口径不同,分开看会得出错误结论(§6.4)。
+    info: Vec<Line<'static>>,
     rows: Vec<data::BreakdownRow>,
 }
 
@@ -346,7 +352,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     modal::status_bar(f, chunks[2], &app.status_line(), app.status_is_error);
 
     if let Some(o) = &app.overlay {
-        pages::breakdown(f, f.area(), &o.title, &o.head, &o.rows);
+        pages::breakdown(f, f.area(), &o.title, &o.head, &o.info, &o.rows);
     }
     if let Some(m) = &app.modal {
         modal::render(f, f.area(), m);
@@ -429,6 +435,15 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             KeyCode::Char('a') => app.modal = Some(forms::agent_add()),
             KeyCode::Char('E') => match app.selected_agent() {
                 Some(a) => app.modal = Some(agent_edit(a)),
+                None => app.fail("没有选中任何被控服务器"),
+            },
+            // 「这台机器网卡烧了多少、都是哪个节点在跑」。厂商按网卡计费,
+            // 所以这是每月对账时问的第一个问题 —— 与节点页/用户页的 Enter 同一个手势。
+            KeyCode::Enter | KeyCode::Char('v') => match app.selected_agent() {
+                Some(a) => {
+                    let (id, name) = (a.id, a.name.clone());
+                    return Some(Action::ShowAgentNics { id, name });
+                }
                 None => app.fail("没有选中任何被控服务器"),
             },
             KeyCode::Char('i') => match app.selected_agent() {
@@ -553,21 +568,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             }
             KeyCode::Char('s') => {
                 if let Some(u) = app.selected_user() {
-                    let base = app.cfg.subscription.public_base.trim_end_matches('/').to_string();
-                    let url = if base.is_empty() {
-                        format!("/sub/{}(配置里没填 subscription.public_base,只能给出路径)", u.sub_token)
-                    } else {
-                        format!("{base}/sub/{}", u.sub_token)
-                    };
-                    app.modal = Some(Modal::info(
-                        &format!("{} 的订阅", u.name),
-                        vec![
-                            url,
-                            String::new(),
-                            "浏览器打开 → 流量统计页;客户端 UA 会被自动识别。".into(),
-                            "强制格式:地址后加 ?type=clash / ?type=stats。".into(),
-                        ],
-                    ));
+                    app.modal = Some(sub_modal(&app.cfg, &u.name, &u.sub_token));
                 } else {
                     app.fail("没有选中任何用户");
                 }
@@ -611,6 +612,73 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
         }
     }
     None
+}
+
+/// 「这条订阅怎么用」。
+///
+/// 光给一条 URL 是不够的:默认配置下订阅服务**只听 127.0.0.1:18081**,
+/// 那条地址在别的机器上打不开。这是有意的默认(裸端口对公网暴露一个能列出
+/// 全部节点凭据的接口不合适),但如果界面不说,人只会看到一条打不开的链接,
+/// 然后去怀疑 token 或者节点配置 —— 那是查不到头的方向。
+///
+/// 所以这个框按当前配置分三种情形说话:服务关着 / 没配对外地址 / 一切就绪。
+fn sub_modal(cfg: &Config, name: &str, token: &str) -> Modal {
+    let base = cfg.subscription.public_base.trim().trim_end_matches('/').to_string();
+    let path = format!("/sub/{token}");
+    let listen = &cfg.subscription.listen;
+
+    if !cfg.subscription.enabled {
+        return Modal::info(
+            &format!("{name} 的订阅"),
+            vec![
+                "订阅服务是关的,这条地址现在一律返回 404。".into(),
+                String::new(),
+                format!("路径:{path}"),
+                String::new(),
+                "去设置页(按 5)把「订阅服务」打开,再重启 daemon:".into(),
+                "  systemctl restart sbx".into(),
+            ],
+        );
+    }
+
+    if base.is_empty() {
+        return Modal::info(
+            &format!("{name} 的订阅"),
+            vec![
+                format!("路径:{path}"),
+                String::new(),
+                format!("现在订阅服务只听 {listen},外面还访问不到。两条路选一条:"),
+                String::new(),
+                "① 挂 nginx(推荐,能上 TLS):".into(),
+                format!("     location /sub/ {{ proxy_pass http://{listen}; }}"),
+                "   然后在设置页(按 5)把「订阅对外地址」填成 https://你的域名".into(),
+                String::new(),
+                "② 直接对外听(仅内网或临时用):".into(),
+                "   设置页把「订阅监听」改成 0.0.0.0:18081,".into(),
+                "   「订阅对外地址」填 http://你的IP:18081 —— 注意这是明文,".into(),
+                "   而这条地址能列出该用户全部节点的凭据。".into(),
+                String::new(),
+                "改完都要重启 daemon:systemctl restart sbx".into(),
+            ],
+        );
+    }
+
+    let url = format!("{base}{path}");
+    Modal::info_copyable(
+        &format!("{name} 的订阅"),
+        vec![
+            url.clone(),
+            String::new(),
+            "贴进客户端就能用 —— 客户端的 UA 会被自动识别成对应格式。".into(),
+            "浏览器打开是流量统计页。".into(),
+            String::new(),
+            "要强制某种格式,地址后面加:".into(),
+            "  ?type=clash    Clash / Mihomo 的 YAML".into(),
+            "  ?type=base64   通用的 base64 链接列表".into(),
+            "  ?type=stats    流量统计页".into(),
+        ],
+        url,
+    )
 }
 
 /// 编辑被控服务器。放在这里而不是 `forms.rs`,因为它要读 `AgentRow` ——
@@ -842,6 +910,7 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             app.overlay = Some(Overlay {
                 title: format!("节点 {tag} 上的用户"),
                 head: format!("{tag}(在 {agent} 上)· {n} 个用户"),
+                info: vec![],
                 rows,
             });
             Ok(String::new())
@@ -853,6 +922,28 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             app.overlay = Some(Overlay {
                 title: format!("{name} 的节点用量"),
                 head: format!("{name} · {n} 个节点"),
+                info: vec![],
+                rows,
+            });
+            Ok(String::new())
+        }
+
+        Action::ShowAgentNics { id, name } => {
+            let rows = data::agent_breakdown(&app.pool, *id).await?;
+            let n = rows.len();
+            // agent 的实时读数只在内存里(SpeedTracker),库里查不到 ——
+            // 所以这里从已经加载好的那一份取,而不是重新查库。
+            let info = match app.agents.iter().find(|a| a.id == *id) {
+                Some(a) => pages::nic_info(a, chrono::Local::now().timestamp()),
+                None => vec![Line::from(Span::styled(
+                    "  这台机器刚被删掉了,按 [R] 刷新",
+                    Style::default().fg(theme::DIM),
+                ))],
+            };
+            app.overlay = Some(Overlay {
+                title: format!("{name} 的网卡明细"),
+                head: format!("{name} · {n} 个节点 · 网卡按厂商口径计费"),
+                info,
                 rows,
             });
             Ok(String::new())
@@ -994,7 +1085,7 @@ mod tests {
         let mut a = app();
         a.page = Page::Nodes;
         a.nodes = vec![stub_node(7, "n7")];
-        a.overlay = Some(Overlay { title: "t".into(), head: "h".into(), rows: vec![] });
+        a.overlay = Some(Overlay { title: "t".into(), head: "h".into(), info: vec![], rows: vec![] });
 
         assert!(on_key(&mut a, key('d')).is_none(), "不该产生删除动作");
         assert!(a.modal.is_none(), "也不该弹出确认框");
@@ -1005,7 +1096,10 @@ mod tests {
         assert!(matches!(a.modal, Some(Modal::Confirm { .. })), "这次才该弹确认框");
     }
 
-    /// 节点页和用户页的 Enter 各自打开自己方向的明细。
+    /// 三个列表页的 Enter 各自打开自己方向的明细 —— 同一个手势,三种视角。
+    ///
+    /// 服务管理页那一条尤其要盯着:`r`(轮换 token)就在旁边,而 Enter 一旦
+    /// 被接到别的分支上,人按下去会得到一个不可撤销的动作而不是一张只读表。
     #[tokio::test]
     async fn enter_opens_the_right_breakdown() {
         let mut a = app();
@@ -1018,6 +1112,75 @@ mod tests {
         a.users = vec![stub_user(true)];
         let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(act, Some(Action::ShowUserNodes { id: 1, .. })), "用户页要看各节点");
+
+        a.page = Page::Agents;
+        a.agents = vec![stub_agent(3)];
+        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::ShowAgentNics { id: 3, .. })), "服务管理页要看网卡明细");
+        assert!(a.modal.is_none(), "Enter 不该弹出任何会改东西的框");
+    }
+
+    /// 空表上按 Enter 只该给一句提示,不能 panic —— 这三页的 `selected_*`
+    /// 在没有行的时候返回 None,少一个分支就是一次下标越界。
+    #[tokio::test]
+    async fn enter_on_an_empty_list_just_complains() {
+        for page in [Page::Agents, Page::Nodes, Page::Users] {
+            let mut a = app();
+            a.page = page;
+            let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(act.is_none(), "{page:?} 空表不该产生动作");
+            assert!(a.status_is_error, "{page:?} 该给一句提示");
+        }
+    }
+
+    /// 订阅框按当前配置说三种不同的话。
+    ///
+    /// 这一条守的是「链接打不开时,界面得说出真正的原因」。默认配置下订阅
+    /// 只听 127.0.0.1,给一条打不开的 URL 会把人引去查 token 和节点配置 ——
+    /// 那个方向永远查不出结果。
+    #[test]
+    fn subscription_modal_explains_why_the_link_may_not_open() {
+        let body = |m: &Modal| match m {
+            Modal::Info { body, .. } => body.join("
+"),
+            _ => panic!("订阅框应当是只读信息框"),
+        };
+
+        // ① 服务关着 —— 先说这个,别的都没意义。
+        let mut cfg = Config::default();
+        cfg.subscription.enabled = false;
+        cfg.subscription.public_base = "https://sub.example.com".into();
+        let t = body(&sub_modal(&cfg, "alice", "tok"));
+        assert!(t.contains("404"), "关着的时候要说清返回 404:
+{t}");
+
+        // ② 开着但没配对外地址 —— 要给出**怎么让它能被访问到**,而不只是一条路径。
+        let cfg = Config::default();
+        assert!(cfg.subscription.enabled);
+        assert!(cfg.subscription.public_base.is_empty());
+        let t = body(&sub_modal(&cfg, "alice", "tok"));
+        assert!(t.contains("/sub/tok"), "路径要给:
+{t}");
+        assert!(t.contains("127.0.0.1:18081"), "要点出它现在只听本机:
+{t}");
+        assert!(t.contains("nginx"), "要给出反代这条路:
+{t}");
+
+        // ③ 配好了 —— 给完整地址,并且能一键复制。
+        let mut cfg = Config::default();
+        cfg.subscription.public_base = "https://sub.example.com/".into();
+        let m = sub_modal(&cfg, "alice", "tok");
+        let t = body(&m);
+        assert!(t.contains("https://sub.example.com/sub/tok"), "尾部斜杠不该变成双斜杠:
+{t}");
+        match m {
+            // 订阅地址是这个框存在的全部理由,必须能 `y` 复制 ——
+            // 一串二十位的随机 token 靠手抄是抄不对的。
+            Modal::Info { copy: Some(c), .. } => {
+                assert_eq!(c, "https://sub.example.com/sub/tok")
+            }
+            _ => panic!("配好之后要能复制"),
+        }
     }
 
     /// `R` 是大写的:小写 `r` 在服务管理页是「轮换 token」,
@@ -1354,6 +1517,8 @@ mod tests {
             protocol: "vless-reality".into(),
             listen_port: 443,
             user_count: 0,
+            cycle_up: 0,
+            cycle_down: 0,
             params: Default::default(),
         }
     }
