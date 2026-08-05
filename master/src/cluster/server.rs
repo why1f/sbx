@@ -629,6 +629,53 @@ mod tests {
 
     use tokio_tungstenite::tungstenite;
 
+    /// 等一个条件成立,而不是睡一个固定时长。
+    ///
+    /// 这几个测试要等的都是**别的任务写完库**(驱逐清理、断连标记、组装失败记审计)。
+    /// 早先的写法是 `sleep(200ms)` 再断言,那有两个方向的毛病:
+    ///   * 机器一忙(CI 上并发跑、本地刚编译完)就可能还没写完 —— 假失败。
+    ///     v0.3.4 打 tag 那次的 `1 failed` 大概率就是这么来的,而它之后 47 次
+    ///     重跑全绿,于是「红了就重跑」变成习惯,下次真回归也会被同样放过去。
+    ///   * 反过来,条件一毫秒就满足时也要白等 200ms。
+    ///
+    /// 轮询到条件成立就立刻返回,超时才失败 —— 快路径更快,慢机器上更稳。
+    /// 上限给到 5 秒:比任何一次正常的库写入都长得多,真卡住了也能在测试里
+    /// 报出一句人话,而不是一个「断言失败」的空壳。
+    async fn wait_for<F, Fut>(what: &str, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("等了 5 秒也没等到:{what}");
+    }
+
+    /// 在一个窗口内反复断言条件**一直**成立。
+    ///
+    /// 给「某件事不要发生」用。这类断言不能用 `wait_for`:条件一开始就是真的,
+    /// 轮询会立刻返回,而那条可能出问题的路径还没来得及跑 —— 测试永远绿,
+    /// 却什么都没验证。这里反过来:在窗口里反复查,只要塌过一次就抓到。
+    ///
+    /// 窗口固定 300ms。这一条确实要花掉这点时间(不像 `wait_for` 有快路径),
+    /// 但它是**唯一**能测「不该发生的事没发生」的办法。
+    async fn stays_true<F, Fut>(what: &str, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            assert!(cond().await, "条件中途塌了:{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// 起一个 server,返回 (ws_url, pool)。测试结束时 server 随 runtime 一起销毁。
     async fn spawn_server() -> (String, SqlitePool) {
         let pool = pool().await;
@@ -793,8 +840,14 @@ mod tests {
 
         // 旧连接被驱逐后主动断开,它的清理**不能**把新连接标成 offline。
         drop(ws1);
-        // 给旧连接的清理路径一点时间跑完
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // 这一条等的是「某件事**不要**发生」,所以不能像别处那样轮询到条件成立就返回
+        // —— `is_online()` 一开始就是 true,那样会立刻通过,而根本没给那条
+        // 有 bug 的清理路径留出跑的时间。这里改成**在一个窗口内反复断言它一直成立**:
+        // 清理若真的把新连接标成 offline,总会在某一次检查里被抓到。
+        stays_true("新连接在旧连接清理期间一直在线", || async {
+            crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap().is_online()
+        })
+        .await;
 
         let a = crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap();
         assert!(
@@ -936,7 +989,17 @@ mod tests {
 
         let mut ws = connect(&url).await;
         assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // 等审计行落库。catch_up 是 spawn 出去的,握手返回时它还没跑完。
+        wait_for("config_build_failed 审计落库", || async {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_events WHERE kind = 'config_build_failed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n > 0
+        })
+        .await;
 
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE kind = 'config_build_failed'",
@@ -974,7 +1037,12 @@ mod tests {
         let mut ws = connect(&url).await;
         assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
         drop(ws);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // 断开后的 offline 标记也是异步的:drop 只是关掉了 socket,
+        // 服务端那边还要跑完清理才写库。
+        wait_for("断开后被标成 offline", || async {
+            !crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap().is_online()
+        })
+        .await;
 
         let a = crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap();
         assert!(!a.is_online(), "断开后应标 offline");
