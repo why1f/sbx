@@ -320,8 +320,17 @@ impl SpeedTracker {
     /// **只在真的来了新上报时记**(`report_at` 前进了)。TUI 每秒刷新一次,
     /// 每次都记的话,一轮上报会被复制成 30 个一模一样的点 —— 图上是一条条平台,
     /// 横轴的含义也变成了「刷新次数」而不是时间。
-    fn observe(&mut self, report_at: i64, up: f64, down: f64) {
-        if report_at <= self.last_report_at {
+    ///
+    /// `known` 是**有速率读数的 agent 个数**。为 0 时不记点:那不是
+    /// 「全网速率是 0」,是「还没有任何可比的采样」。记了的话,刚开界面的第一帧
+    /// 会推进一个 `(0, 0)`,下一轮上报推进真实速率 —— 历史里只有两个点,
+    /// 而 ratatui 会把它们拉满整个宽度,画出一条从左下到右上的斜线,
+    /// 看起来像「流量在一小时里稳步爬升」,实际上只是两点之间的插值。
+    ///
+    /// 参数放在这里而不是让调用方自己判:调用方少判一次,图就又变回那条假斜线,
+    /// 而那是一个**看起来完全正常**的错误。
+    fn observe(&mut self, report_at: i64, up: f64, down: f64, known: usize) {
+        if known == 0 || report_at <= self.last_report_at {
             return;
         }
         self.last_report_at = report_at;
@@ -467,9 +476,15 @@ pub async fn load_agents(
 
     // 全集群合计,给折线图用。**只算有读数的那些** —— 把 None 当 0 会让
     // 「刚打开界面」和「全网都闲着」画出同一条线。
+    //
+    // **只在至少有一个读数时才记点**(count > 0)。否则第一帧推进 `(0, 0)`,
+    // 下一轮上报推进真实速率,历史里就只有两个点 —— ratatui 把两个点拉满整个宽度,
+    // 画出一条从左下到右上的斜线,看起来像「流量在一小时里稳步爬升」,
+    // 实际上只是插值。
+    let known = out.iter().filter(|a| a.up_per_sec.is_some()).count();
     let up: f64 = out.iter().filter_map(|a| a.up_per_sec).sum();
     let down: f64 = out.iter().filter_map(|a| a.down_per_sec).sum();
-    speed.observe(newest_report, up, down);
+    speed.observe(newest_report, up, down, known);
 
     Ok(out)
 }
@@ -667,23 +682,42 @@ mod tests {
     #[test]
     fn history_advances_only_on_a_new_report() {
         let mut t = SpeedTracker::default();
-        t.observe(100, 1.0, 2.0);
-        t.observe(100, 9.0, 9.0); // 同一轮上报,忽略
-        t.observe(90, 9.0, 9.0); // 更旧的时间戳,忽略
+        t.observe(100, 1.0, 2.0, 1);
+        t.observe(100, 9.0, 9.0, 1); // 同一轮上报,忽略
+        t.observe(90, 9.0, 9.0, 1); // 更旧的时间戳,忽略
         assert_eq!(t.history().len(), 1);
         assert_eq!(t.history()[0], (1.0, 2.0));
 
-        t.observe(130, 3.0, 4.0);
+        t.observe(130, 3.0, 4.0, 1);
         assert_eq!(t.history().len(), 2);
         assert_eq!(t.history()[1], (3.0, 4.0));
     }
 
     /// 历史是有界的,否则一个开着几天的 TUI 会一直吃内存。
+    /// 刚打开界面时,还没有任何速率读数,**不该**往图上记一个 0 点。
+    ///
+    /// 记了的话:第一帧推进 `(0, 0)`,下一轮上报推进真实速率,于是历史里只有
+    /// 两个点 —— ratatui 把它们拉满整个宽度,画出一条从左下到右上的斜线。
+    /// 那条线看起来像「流量在一小时里稳步爬升」,而实际上只是两个点之间的插值。
+    #[test]
+    fn a_frame_with_no_readings_records_nothing() {
+        let mut t = SpeedTracker::default();
+        // 第一帧:只有一台 agent,它上报过一次,但 TUI 还没有第二个采样点可比。
+        let (up, down) = t.feed(1, NicSample { rx: 1000, tx: 2000, at: 100, boot_id: Some("b".into()) }, 100);
+        assert_eq!((up, down), (None, None), "第一次见到就该是 None");
+        // load_agents 把所有有读数的 agent 的速率加起来,没有读数的不参与:
+        // 0 个有读数 => sum 还是 0.0,但那不是「有 0.0 速率的读数」,是「没有任何读数」。
+        t.observe(100, 0.0, 0.0, 0);
+        assert!(t.history().is_empty(), "没有任何读数的那一帧不该记点");
+    }
+
+
     #[test]
     fn history_is_bounded() {
+
         let mut t = SpeedTracker::default();
         for i in 0..(HISTORY_LEN as i64 * 3) {
-            t.observe(i + 1, i as f64, 0.0);
+            t.observe(i + 1, i as f64, 0.0, 1);
         }
         assert_eq!(t.history().len(), HISTORY_LEN);
         // 留下的是**最新**的那一段。
