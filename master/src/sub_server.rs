@@ -72,7 +72,7 @@ pub async fn run(pool: SqlitePool, cfg: SubscriptionConfig) -> Result<()> {
 /// token 的形状校验。**在查库之前做**:
 /// 它挡掉的是路径穿越、超长字符串这类明显不是 token 的输入,
 /// 顺便让绝大多数扫描流量不落到数据库上。
-fn token_looks_valid(token: &str) -> bool {
+pub(crate) fn token_looks_valid(token: &str) -> bool {
     (16..=64).contains(&token.len())
         && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
@@ -819,6 +819,40 @@ mod tests {
         assert!(body.contains("正常"), "账号自己没超,状态该是正常:
 {body}");
         assert!(body.contains("账号自身"), "得把账号自己的用量也写出来");
+    }
+
+    /// 撤销之后,订阅地址**真的**返回 404。
+    ///
+    /// 前面 node_repo 那条测的是「写进去的值过不了格式校验」,这条测的是
+    /// 整条 HTTP 路径 —— 中间任何一环把它当成普通 token 去查库,撤销就失效了,
+    /// 而失效的表现是「撤了但还能下载」,没有任何报错。
+    #[tokio::test]
+    async fn a_revoked_subscription_returns_404() {
+        let p = nic_pool().await;
+        let uid = crate::db::node_repo::add_user(&p, "alice", 0, 0).await.unwrap();
+        let before: String = sqlx::query_scalar("SELECT sub_token FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        // 撤销前是能下的,先把这一点钉住 —— 否则下面的 404 可能只是因为
+        // 这个 fixture 本来就取不到东西。
+        let (status, _, _) = get(&p, &format!("/sub/{before}"), "curl").await;
+        assert_eq!(status, StatusCode::OK, "撤销前该能下载");
+
+        crate::db::node_repo::revoke_sub_token(&p, uid).await.unwrap();
+        let after: String = sqlx::query_scalar("SELECT sub_token FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        let (status, _, body) = get(&p, &format!("/sub/{after}"), "curl").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "撤销后必须 404");
+        assert!(body.is_empty(), "404 不该带任何内容");
+
+        // 老地址同样失效 —— 撤销的意义就在这里。
+        let (status, _, _) = get(&p, &format!("/sub/{before}"), "curl").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "老 URL 必须一起失效");
     }
 
     #[tokio::test]

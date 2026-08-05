@@ -365,6 +365,85 @@ pub async fn set_user_nodes(
 }
 
 /// 把某个用户绑定的**网卡流量来源**整体替换成 `agent_ids`。
+/// 手动重置用户流量。**只清零已用量,不会改动月重置日期。**
+///
+/// 与周期重置的区别:周期重置推进 `last_reset_ym` 并自动放人,手动重置不推。
+/// 手动重置的场景是「管理员想在不改档期的情况下清一次流量」——
+/// 典型情况是给用户续了费或改了配额,想立刻让新额度生效而不是等下个月。
+///
+/// **不推进任何 revision**:这是个纯计费数字,agent 不需要知道它。
+pub async fn reset_user_traffic(pool: &SqlitePool, user_id: i64) -> Result<()> {
+    // 与 supervisor::reset_user_cycles 的逻辑一致:cycle_* 清零,
+    // total_* 不动(终身累计),last_up / last_down **也不能动**(它们是
+    // delta 计算的基线,清零会让下一次上报被当成新纪元重复计一遍)。
+    sqlx::query("UPDATE user_traffic SET cycle_up = 0, cycle_down = 0 WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    // 这个用户在所有节点上都还没产生过流量时影响 0 行也是正常的
+    // (他还没跑过任何流量)。只要 user 存在,清零就算成功。
+    let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .is_some();
+    if !exists {
+        anyhow::bail!("没有 id 为 {user_id} 的用户");
+    }
+    Ok(())
+}
+
+/// 撤销订阅 token 时写进 `sub_token` 的前缀。
+///
+/// **不能像旧项目那样写空串。** sbx 的 `users.sub_token` 是 `NOT NULL UNIQUE`
+/// (001 那张表),空串在**第二个**被撤销的用户上就会撞唯一索引 ——
+/// 表现是「第一个能撤,后面的报数据库错误」。
+///
+/// 所以撤销 = 写一个**故意不合法**的值:`!revoked:<id>`。它带 `!` 和 `:`,
+/// 过不了 `sub_server::token_looks_valid` 的字符集(只准字母数字和 `-_`),
+/// 于是在查库之前就被挡下、返回 404;而带上 id 又保证了每行互不相同。
+pub const REVOKED_PREFIX: &str = "!revoked:";
+
+/// 这个 token 是不是被撤销了。
+pub fn is_revoked(token: &str) -> bool {
+    token.starts_with(REVOKED_PREFIX)
+}
+
+/// 重新生成订阅 token。返回新 token。
+///
+/// **不推进任何 revision**:订阅 token 不进 sing-box 配置,agent 不需要知道它。
+/// 老 URL 立刻失效 —— 这正是这个操作的目的(泄露之后换一把锁)。
+pub async fn regenerate_sub_token(pool: &SqlitePool, user_id: i64) -> Result<String> {
+    let token = crate::cluster::token::generate();
+    let n = sqlx::query("UPDATE users SET sub_token = ? WHERE id = ?")
+        .bind(&token)
+        .bind(user_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        anyhow::bail!("没有 id 为 {user_id} 的用户");
+    }
+    Ok(token)
+}
+
+/// 撤销订阅 token:订阅地址立刻返回 404,`[g]` 重新生成可以恢复。
+///
+/// 与「停用用户」是两件事:停用挡的是**代理连接**(§7.5),撤销挡的是
+/// **订阅下载**。一个泄露了订阅链接但还该上网的用户,要的是这个而不是停用。
+pub async fn revoke_sub_token(pool: &SqlitePool, user_id: i64) -> Result<()> {
+    let n = sqlx::query("UPDATE users SET sub_token = ? WHERE id = ?")
+        .bind(format!("{REVOKED_PREFIX}{user_id}"))
+        .bind(user_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        anyhow::bail!("没有 id 为 {user_id} 的用户");
+    }
+    Ok(())
+}
+
 ///
 /// **不推进任何 revision。** 这张表不进 sing-box 配置 —— 绑定关系只被订阅那一条路
 /// 读(`sub_server::usage_header`),agent 根本不需要知道它。为它推进 revision
@@ -510,6 +589,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mult, 2.0);
+    }
+
+    /// 撤销之后写进库里的那个值**必须过不了订阅接口的格式校验**。
+    ///
+    /// 这是撤销真正生效的那一步:`sub_server::handle_sub` 在查库**之前**先看
+    /// token 长得对不对,不对就 404。要是撤销写进去的东西恰好还是合法形状,
+    /// 那它就变成了一个「换了个名字但依然能用」的 token —— 一个静默失效的安全操作。
+    #[tokio::test]
+    async fn a_revoked_token_cannot_pass_the_url_check() {
+        let p = pool().await;
+        let id = add_user(&p, "alice", 0, 0).await.unwrap();
+        revoke_sub_token(&p, id).await.unwrap();
+
+        let token: String = sqlx::query_scalar("SELECT sub_token FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert!(is_revoked(&token), "该被认作已撤销:{token}");
+        assert!(
+            !crate::sub_server::token_looks_valid(&token),
+            "撤销值不能是合法形状,否则订阅还能下载:{token}"
+        );
+    }
+
+    /// **撤销多个用户不能撞唯一索引。**
+    ///
+    /// `users.sub_token` 是 `NOT NULL UNIQUE`。旧项目的撤销是写空串,
+    /// 那在第二个用户上就会失败 —— 表现是「第一个能撤,后面的报数据库错误」。
+    /// sbx 写的是 `!revoked:<id>`,每行天然不同。
+    #[tokio::test]
+    async fn revoking_two_users_does_not_collide() {
+        let p = pool().await;
+        let a = add_user(&p, "alice", 0, 0).await.unwrap();
+        let b = add_user(&p, "bob", 0, 0).await.unwrap();
+        revoke_sub_token(&p, a).await.unwrap();
+        revoke_sub_token(&p, b).await.unwrap(); // 这一行是重点
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT sub_token) FROM users")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "两个撤销值必须互不相同");
+    }
+
+    /// 重新生成会给出一个**新**的、合法形状的 token,并且能从撤销状态恢复。
+    #[tokio::test]
+    async fn regenerating_replaces_the_token_and_undoes_a_revoke() {
+        let p = pool().await;
+        let id = add_user(&p, "alice", 0, 0).await.unwrap();
+        let first: String = sqlx::query_scalar("SELECT sub_token FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+
+        revoke_sub_token(&p, id).await.unwrap();
+        let fresh = regenerate_sub_token(&p, id).await.unwrap();
+
+        assert!(!is_revoked(&fresh), "恢复之后不该还是撤销态");
+        assert!(crate::sub_server::token_looks_valid(&fresh), "新 token 该是合法形状:{fresh}");
+        assert_ne!(fresh, first, "必须换一把新锁,不能把老 token 还回来");
+    }
+
+    /// 手动重置**只清零已用量**,不动月重置日期,也不动终身累计。
+    ///
+    /// `last_reset_ym` 不能推进:推了的话这个月的自动重置就被跳过了,
+    /// 而管理员按这个键的意思是「现在清一次」,不是「这个月不用再清了」。
+    /// `last_up/last_down` 更不能动 —— 它们是 delta 的基线(§5.2),
+    /// 清零会让下一次上报被当成新纪元,把一整个周期的量重复计一遍。
+    #[tokio::test]
+    async fn resetting_traffic_keeps_the_cycle_day_and_the_lifetime_total() {
+        let p = pool().await;
+        let (agent_id, _) = crate::db::agent_repo::create(&p, "tokyo", 0).await.unwrap();
+        let (node_id, _) = add_node(
+            &p,
+            agent_id,
+            "n",
+            Protocol::VlessReality,
+            8443,
+            &NodeParams::default(),
+        )
+        .await
+        .unwrap();
+        let uid = add_user(&p, "alice", 0, 0).await.unwrap();
+        set_user_nodes(&p, uid, &[node_id]).await.unwrap();
+        sqlx::query(
+            "INSERT INTO user_traffic
+                 (user_id, node_id, cycle_up, cycle_down, total_up, total_down,
+                  last_up, last_down, updated_at)
+             VALUES (?, ?, 100, 200, 1000, 2000, 55, 66, 0)",
+        )
+        .bind(uid)
+        .bind(node_id)
+        .execute(&p)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE users SET reset_day = 22, last_reset_ym = '2026-07' WHERE id = ?")
+            .bind(uid)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        reset_user_traffic(&p, uid).await.unwrap();
+
+        let (cu, cd, tu, td, lu, ld): (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT cycle_up, cycle_down, total_up, total_down, last_up, last_down
+               FROM user_traffic WHERE user_id = ?",
+        )
+        .bind(uid)
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!((cu, cd), (0, 0), "本周期用量该清零");
+        assert_eq!((tu, td), (1000, 2000), "终身累计不该动");
+        assert_eq!((lu, ld), (55, 66), "delta 基线绝不能动");
+
+        let (day, ym): (Option<i64>, String) =
+            sqlx::query_as("SELECT reset_day, last_reset_ym FROM users WHERE id = ?")
+                .bind(uid)
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(day, Some(22), "月重置日期不该动");
+        assert_eq!(ym, "2026-07", "不该推进 last_reset_ym,否则本月的自动重置会被跳过");
+    }
+
+    /// 一次流量都没跑过的用户也能重置(不该报错),而不存在的用户要报错。
+    #[tokio::test]
+    async fn resetting_is_fine_with_no_traffic_but_errors_on_a_missing_user() {
+        let p = pool().await;
+        let id = add_user(&p, "alice", 0, 0).await.unwrap();
+        reset_user_traffic(&p, id).await.unwrap();
+        assert!(reset_user_traffic(&p, 9999).await.is_err(), "不存在的用户该报错");
+        assert!(revoke_sub_token(&p, 9999).await.is_err(), "不存在的用户该报错");
+        assert!(regenerate_sub_token(&p, 9999).await.is_err(), "不存在的用户该报错");
     }
 
     async fn pool() -> SqlitePool {

@@ -140,13 +140,31 @@ impl App {
     ///
     /// 摘要里带 `token_prefix` 是有实际用途的:主控日志里认证失败只会记前 8 位
     /// (§8.1 不回显完整 token),对不上号的时候要靠这里把日志和某一行连起来。
+    /// 顶栏右侧那一行:版本 + 规模 + **每页都一样**的那几个键。
+    ///
+    /// 通用键只写在这里一处。以前它们跟在每页的专有键前面(`common` 前缀),
+    /// 于是「切页/选择/刷新/退出」在底栏里重复五遍,把真正会变的那部分
+    /// ——当页能做什么——挤到了行尾,窄终端上正好被截掉。
+    fn header_line(&self) -> String {
+        format!(
+            " sbx v{}  用户:{}  节点:{}  机器:{}  [1-5/Tab]切页  [↑↓/jk]选择  [R]刷新  [q]退出",
+            env!("CARGO_PKG_VERSION"),
+            self.users.len(),
+            self.nodes.len(),
+            self.agents.len(),
+        )
+    }
+
+    /// 底栏:**只有当页专有**的操作,加选中项摘要。
+    ///
+    /// 摘要里带 `token_prefix` 是有实际用途的:主控日志里认证失败只会记前 8 位
+    /// (§8.1 不回显完整 token),对不上号的时候要靠这里把日志和某一行连起来。
     fn status_line(&self) -> String {
         if let Some(msg) = &self.status {
             return msg.clone();
         }
-        let common = "[1-5]切页  [↑↓/jk]选择  [R]刷新  [q]退出";
         match self.page {
-            Page::Dashboard => format!("{common}  │  仪表盘是只读的;要动手请去 2/3/4 页"),
+            Page::Dashboard => "仪表盘是只读的;要动手请去 2/3/4 页".into(),
             Page::Agents => {
                 let sel = match self.selected_agent() {
                     Some(a) => format!(
@@ -155,24 +173,26 @@ impl App {
                     ),
                     None => "  │  还没有被控服务器,按 [a] 加一台".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [r]轮换token  [d]删除{sel}")
+                format!("[a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [r]轮换token  [d]删除{sel}")
             }
             Page::Nodes => {
                 let sel = match self.selected_node() {
                     Some(n) => format!("  │  #{} {} · {} 个用户在用", n.id, n.tag, n.user_count),
                     None => "  │  还没有节点,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [Enter]用量明细  [d]删除{sel}")
+                format!("[a]新增  [E]编辑  [Enter]用量明细  [d]删除{sel}")
             }
             Page::Users => {
                 let sel = match self.selected_user() {
                     Some(u) => format!("  │  #{} {}", u.id, u.name),
                     None => "  │  还没有用户,按 [a] 建一个".into(),
                 };
-                format!("{common}  [a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [t]启/停  [s]订阅  [d]删除{sel}")
+                format!(
+                    "[a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [T]token  [r]重置流量  [t]启/停  [s]订阅  [d]删除{sel}"
+                )
             }
             Page::Settings => {
-                format!("{common}  [Enter]改这一项  │  改完要重启 daemon:systemctl restart sbx")
+                "[Enter]改这一项  │  改完要重启 daemon:systemctl restart sbx".into()
             }
         }
     }
@@ -327,9 +347,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // 页签占**两行**:一行文字 + 一行下边框。给 1 行的话 `Borders::BOTTOM`
     // 会把那唯一一行吃掉,结果是页签整条消失、只剩一条横线 —— 这正是 v0.3.0
     // 换成 ratatui `Tabs` 之后出的回归(tabs_are_actually_visible 盯着它)。
+    // 四段:页签(2) / 主体 / 通用信息栏(1) / 当页专有操作栏(1)。
+    //
+    // 底下**两条**而不是一条:通用键(切页/选择/刷新/退出)和当页能做什么
+    // 混在一行时,人得整行读完才能分辨哪个键属于这一页。分开之后最后那条
+    // 永远只回答「在这一页我能做什么」,而它恰恰是唯一会变的那部分。
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     modal::tabs(f, chunks[0], &PAGES, app.page as usize);
@@ -349,7 +379,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Page::Users => pages::users(f, chunks[1], &app.users, app.sel[3], app.sub_base(), now),
         Page::Settings => pages::settings(f, chunks[1], &settings::all(&app.cfg), app.sel[4]),
     }
-    modal::status_bar(f, chunks[2], &app.status_line(), app.status_is_error);
+    modal::info_bar(f, chunks[2], &app.header_line());
+    modal::status_bar(f, chunks[3], &app.status_line(), app.status_is_error);
 
     if let Some(o) = &app.overlay {
         pages::breakdown(f, f.area(), &o.title, &o.head, &o.info, &o.rows);
@@ -566,6 +597,33 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                     None => app.fail("没有选中任何用户"),
                 }
             }
+            // 大写 T。小写 t 是「启/停用户」,而这两件事完全不同:
+            // 停用挡的是代理连接,撤销 token 挡的是订阅下载。
+            // 让它们只差一个 Shift 又都放在这一页,已经是最省的方案 ——
+            // 再省就得把其中一个挪走,而两个都是用户页该有的操作。
+            KeyCode::Char('T') => match app.selected_user() {
+                Some(u) => {
+                    app.modal = Some(Modal::Token {
+                        user_id: u.id,
+                        name: u.name.clone(),
+                        active: !crate::db::node_repo::is_revoked(&u.sub_token),
+                    })
+                }
+                None => app.fail("没有选中任何用户"),
+            },
+            KeyCode::Char('r') => match app.selected_user() {
+                Some(u) => {
+                    app.modal = Some(Modal::Confirm {
+                        title: "确认重置流量".into(),
+                        body: vec![
+                            format!("重置 '{}' 的流量?", u.name),
+                            "只清零已用流量,不会改动月重置日期".into(),
+                        ],
+                        action: Action::ResetUserTraffic { user_id: u.id, user: u.name.clone() },
+                    })
+                }
+                None => app.fail("没有选中任何用户"),
+            },
             KeyCode::Char('s') => {
                 if let Some(u) = app.selected_user() {
                     app.modal = Some(sub_modal(&app.cfg, &u.name, &u.sub_token));
@@ -626,6 +684,21 @@ fn sub_modal(cfg: &Config, name: &str, token: &str) -> Modal {
     let base = cfg.subscription.public_base.trim().trim_end_matches('/').to_string();
     let path = format!("/sub/{token}");
     let listen = &cfg.subscription.listen;
+
+    // 撤销过的 token 是一个**故意不合法**的值(`!revoked:<id>`)。
+    // 照常拼一条 URL 给出去,那条地址一定 404,而人会以为是服务坏了 ——
+    // 这一页得先说清「是你自己撤的」。
+    if crate::db::node_repo::is_revoked(token) {
+        return Modal::info(
+            &format!("{name} 的订阅"),
+            vec![
+                "这个用户的订阅已被撤销,地址现在返回 404。".into(),
+                String::new(),
+                "按 [T] → [g] 重新生成一个 token 即可恢复。".into(),
+                "注意:恢复出来的是**新地址**,老链接不会再能用。".into(),
+            ],
+        );
+    }
 
     if !cfg.subscription.enabled {
         return Modal::info(
@@ -960,6 +1033,24 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             ))
         }
 
+        // 三个都**不推进 revision**:订阅 token 与计费数字都不进 sing-box 配置,
+        // agent 不需要知道它们。回执里因此不说「等下发」,而是说「立刻生效」——
+        // 订阅那条路是主控自己的 HTTP 服务,改完下一次请求就是新的。
+        Action::RegenSubToken { user_id, user } => {
+            node_repo::regenerate_sub_token(&app.pool, *user_id).await?;
+            Ok(format!("{user} 的订阅 token 已重新生成,老 URL 立刻失效。按 [s] 看新地址"))
+        }
+
+        Action::RevokeSubToken { user_id, user } => {
+            node_repo::revoke_sub_token(&app.pool, *user_id).await?;
+            Ok(format!("{user} 的订阅已撤销,地址返回 404。[T] → [g] 可以恢复"))
+        }
+
+        Action::ResetUserTraffic { user_id, user } => {
+            node_repo::reset_user_traffic(&app.pool, *user_id).await?;
+            Ok(format!("{user} 的本周期流量已清零(月重置日期没动)"))
+        }
+
         // 刷新本身在主循环里做(每个动作之后都会 refresh 一次),这里只给回执。
         Action::Refresh => Ok("已刷新".into()),
 
@@ -1274,22 +1365,100 @@ mod tests {
         use ratatui::Terminal;
 
         let a = app();
-        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 22)).unwrap();
         term.draw(|f| draw(f, &a)).unwrap();
         let buf = term.backend().buffer().clone();
-        let first: String = (0..buf.area.width).map(|x| buf[(x, 0)].symbol().to_string()).collect();
-        let flat: String = first.chars().filter(|c| !c.is_whitespace()).collect();
+        let h = buf.area.height as usize;
 
+        let row = |y: u16| -> String {
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect()
+        };
+        let flat = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+
+        // 页签
+        let first = row(0);
+        let ff = flat(&first);
         for (i, t) in PAGES.iter().enumerate() {
-            let want: String = format!("{t}[{}]", i + 1).chars().filter(|c| !c.is_whitespace()).collect();
-            assert!(flat.contains(&want), "页签第一行里没有 {want}:{first:?}");
+            let want = flat(&format!("{t}[{}]", i + 1));
+            assert!(ff.contains(&want), "页签第一行里没有 {want}:{first:?}");
         }
-        // 第二行是那条下边框。少了它页签和内容会糊在一起。
-        let second: String = (0..buf.area.width).map(|x| buf[(x, 1)].symbol().to_string()).collect();
+        let second = row(1);
         assert!(second.contains('─'), "页签下面该有一条分隔线:{second:?}");
-        // `-- --nocapture` 时能直接看一眼长什么样。
-        println!("{}
-{}", first.trim_end(), second.trim_end());
+
+        // 顶部通用信息栏(倒数第二行)。
+        // 比对前要去空白:一个汉字占两个终端格,buffer 里读出来是「切 页」。
+        let info = row(h as u16 - 2);
+        let fi = flat(&info);
+        assert!(fi.contains("sbxv"), "通用信息栏里应有版本前缀:{info:?}");
+        assert!(fi.contains("切页"), "通用信息栏里应有切页提示:{info:?}");
+        assert!(fi.contains("退出"), "通用信息栏里应有退出提示:{info:?}");
+        assert!(fi.contains("用户:"), "通用信息栏里应有规模:{info:?}");
+
+        // 底部专有操作栏(最后一行)。它**不该**再重复通用键 ——
+        // 重复正是这次要拆开的那个毛病。
+        let hint = row(h as u16 - 1);
+        let fh = flat(&hint);
+        assert!(fh.contains("仪表盘"), "仪表盘页底栏应有页面说明:{hint:?}");
+        assert!(!fh.contains("退出"), "底栏不该再重复通用键:{hint:?}");
+
+        println!("{}\n{}\n…\n{}\n{}", first.trim_end(), second.trim_end(), info.trim_end(), hint.trim_end());
+    }
+
+    /// `[T]` 打开 token 管理,`[r]` 弹重置流量的确认框。
+    ///
+    /// 这两个键和已有的 `t`(启/停)、`R`(刷新)只差大小写,所以这条测试
+    /// 盯的是**每个键各自落到哪儿** —— 接错线的表现是「按了个看起来无害的键,
+    /// 结果做了另一件不可撤销的事」。
+    #[tokio::test]
+    async fn token_and_reset_keys_open_the_right_thing() {
+        let mut a = app();
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+
+        assert!(on_key(&mut a, key('T')).is_none(), "[T] 只开框,不该直接动手");
+        assert!(matches!(a.modal, Some(Modal::Token { user_id: 1, .. })), "[T] 该开 token 管理");
+        a.modal = None;
+
+        assert!(on_key(&mut a, key('r')).is_none(), "[r] 只开框,不该直接动手");
+        match &a.modal {
+            Some(Modal::Confirm { body, action, .. }) => {
+                assert!(
+                    matches!(action, Action::ResetUserTraffic { user_id: 1, .. }),
+                    "[r] 该是重置流量"
+                );
+                let text = body.join(" ");
+                assert!(text.contains("不会改动月重置日期"), "得说清不动档期:{text}");
+            }
+            other => panic!("[r] 该弹确认框,实际 {other:?}", other = other.is_some()),
+        }
+        a.modal = None;
+
+        // 小写 t 仍然是启/停 —— 没被 T 抢走。
+        let act = on_key(&mut a, key('t'));
+        assert!(matches!(act, Some(Action::SetUserEnabled { .. })), "[t] 该还是启/停");
+    }
+
+    /// token 框里 `[g]` / `[v]` 各自触发哪个动作;撤销过的不再给 `[v]`。
+    #[tokio::test]
+    async fn the_token_modal_offers_revoke_only_while_active() {
+        let mut m = Modal::Token { user_id: 7, name: "alice".into(), active: true };
+        assert!(
+            matches!(m.handle(key('v')), Outcome::Run(Action::RevokeSubToken { user_id: 7, .. })),
+            "开着的时候 [v] 该能撤销"
+        );
+        assert!(
+            matches!(m.handle(key('g')), Outcome::Run(Action::RegenSubToken { user_id: 7, .. })),
+            "[g] 该重新生成"
+        );
+
+        // 已撤销:[v] 不再有动作(免得对着一个已经关掉的订阅再关一次),
+        // 但 [g] 必须还在 —— 它是唯一的恢复路径。
+        let mut m = Modal::Token { user_id: 7, name: "alice".into(), active: false };
+        assert!(matches!(m.handle(key('v')), Outcome::Close(_)), "已撤销时 [v] 该没有动作");
+        assert!(
+            matches!(m.handle(key('g')), Outcome::Run(Action::RegenSubToken { .. })),
+            "已撤销时 [g] 必须还能恢复"
+        );
     }
 
     /// 绑网卡是**多选**,而且打开时已绑的要是勾上的 —— 与分配节点同一个道理:

@@ -334,14 +334,16 @@ fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool) {
     // 而这一栏只占半屏。算错一格的后果是 `%` 被悄悄切掉,看起来像
     // 「份额是 0」而不是「这里显示不下」。
     //
-    // 让位顺序是**整列整列地丢**:先丢条形,再丢百分比 —— 挤压某一列
-    // ratatui 是不吭声的,而少一整列人一眼就看得出来(§13.4)。
+    // **这里没有进度条,而且不该有。** 进度条的含义是「用了多少 / 上限多少」,
+    // 而节点没有上限 —— 配额是用户和整机网卡两个层面的事(§6.3)。
+    // 早先这里画的是「占全网流量的份额」,可它和别处的配额条长得一模一样,
+    // 于是一个跑了 90% 流量的健康节点看起来像「快爆了」。
+    // 份额只留那个百分比,并在标题里写明是占比。
     let inner = area.width.saturating_sub(2) as usize;
     let fixed = 2 + 11 + 11; // 缩进 + `↑{:>9} ` + `↓{:>9} `
     let label_w = inner.saturating_sub(fixed + 5).clamp(8, 22);
     let rest = inner.saturating_sub(fixed + label_w);
     let show_pct = rest >= 5;
-    let bar_w = if show_pct { (rest - 5).min(10) } else { 0 };
 
     let mut lines: Vec<Line> = Vec::new();
     if top.is_empty() {
@@ -370,20 +372,20 @@ fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool) {
                 Style::default().fg(theme::DOWN),
             ),
         ];
-        if bar_w >= 4 {
-            spans.extend(theme::gradient_bar(share, bar_w));
-        }
         if show_pct {
+            // 份额用中性色。跟着比例变红会把「这个节点承载得多」染成告警,
+            // 而它恰恰是正常的 —— 只有配额才有「超了」这回事。
             spans.push(Span::styled(
                 format!("{:>4.0}%", share * 100.0),
-                Style::default().fg(theme::gradient_at(share)),
+                Style::default().fg(theme::DIM),
             ));
         }
         lines.push(Line::from(spans));
     }
 
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 节点用量 ")),
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" 节点用量(% = 占全网份额) ")),
         area,
     );
 }
@@ -1760,6 +1762,36 @@ mod tests {
                 super::top_nodes(f, a, &rows, true)
             });
             assert!(out.contains("100%"), "{w} 列下百分比被切了:
+{out}");
+        }
+    }
+
+    /// 节点视图**不该有进度条**。
+    ///
+    /// 进度条的含义是「用了多少 / 上限多少」,而节点没有上限 —— 配额只存在于
+    /// 用户和整机网卡两个层面(§6.3)。早先这里画的是「占全网份额」,
+    /// 可它和别处的配额条长得一模一样,于是一个承载了 95% 流量的健康节点
+    /// 看起来像「快爆了」。份额只留百分比,标题里写明口径。
+    #[test]
+    fn node_view_has_no_progress_bar() {
+        let rows = vec![
+            NodeRow { cycle_up: 19 << 30, cycle_down: 1 << 30, ..node() },
+            NodeRow { id: 2, tag: "osaka".into(), cycle_up: 1 << 30, cycle_down: 0, ..node() },
+        ];
+        for w in [60u16, 80, 120, 160] {
+            let out = draw_to_string(w, 8, |f| {
+                let a = f.area();
+                super::top_nodes(f, a, &rows, true)
+            });
+            assert!(
+                !out.contains('█') && !out.contains('░'),
+                "{w} 列下节点视图又画出条形了:
+{out}"
+            );
+            // 份额本身要留着,并且标题得说清那个 % 是什么。
+            assert!(out.contains('%'), "{w} 列下份额百分比没了:
+{out}");
+            assert!(has_cjk(&out, "占全网份额"), "{w} 列下标题没写明口径:
 {out}");
         }
     }

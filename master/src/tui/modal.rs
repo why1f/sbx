@@ -82,6 +82,12 @@ pub enum Action {
     /// 把用户订阅响应头里的流量换成这几台机器的网卡用量之和(§10.3)。
     /// 空列表 = 解绑,改回按用户自己的用量报。
     SetUserNics { user_id: i64, user: String, agent_ids: Vec<i64> },
+    /// 重新生成订阅 token。老 URL 立即失效。
+    RegenSubToken { user_id: i64, user: String },
+    /// 撤销订阅 token。订阅地址返回 404,`[g]` 可恢复。
+    RevokeSubToken { user_id: i64, user: String },
+    /// 手动清零本周期流量。**不动**月重置日期。
+    ResetUserTraffic { user_id: i64, user: String },
 }
 
 /// 节点表单填出来的东西。密钥材料**不在这里** —— 新增时由 `secrets::fill` 生成,
@@ -305,6 +311,17 @@ pub enum Modal {
         /// 复制之后的回执,渲染在框里。
         copied: Option<String>,
     },
+    /// 订阅 token 管理:`[g]` 重新生成、`[v]` 撤销。
+    ///
+    /// 为什么不用 `Confirm`:这里有**两个**互斥的破坏性动作,而 `Confirm`
+    /// 只能带一个。做成两级菜单(先选再确认)要多按一次键,而这两个动作的
+    /// 后果都写在选项旁边了 —— 按下去之前就知道会发生什么。
+    Token {
+        user_id: i64,
+        name: String,
+        /// 当前订阅是开着的吗(token 没被撤销)。撤销过的不再显示 `[v]`。
+        active: bool,
+    },
 }
 
 /// 一次按键之后弹窗该怎么办。
@@ -358,6 +375,19 @@ impl Modal {
             Modal::Confirm { action, .. } => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Outcome::Run(action.clone()),
                 _ => Outcome::Close(Some("已取消".into())),
+            },
+
+            // token 管理。两个动作都是**不可撤销**的,所以只认那两个字母,
+            // 别的键一律关掉 —— 与 Confirm 同一个道理:不该有手滑的可能。
+            Modal::Token { user_id, name, active } => match k.code {
+                KeyCode::Char('g') | KeyCode::Char('G') => Outcome::Run(Action::RegenSubToken {
+                    user_id: *user_id,
+                    user: name.clone(),
+                }),
+                KeyCode::Char('v') | KeyCode::Char('V') if *active => {
+                    Outcome::Run(Action::RevokeSubToken { user_id: *user_id, user: name.clone() })
+                }
+                _ => Outcome::Close(None),
             },
 
             Modal::Form(form) => {
@@ -526,6 +556,58 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {title} "))
+                        .border_style(Style::default().fg(theme::ACCENT)),
+                ),
+                rect,
+            );
+        }
+
+        // token 管理。两个动作的**后果**写在选项那一行上,不是折叠在下面的说明里
+        // —— 它们都不可撤销,人得在按下去之前就看见。
+        Modal::Token { name, active, .. } => {
+            let w = 64.min(area.width.max(1));
+            let h = 10u16.min(area.height.max(1));
+            let rect = centered(area, 0, 0, w, h);
+            f.render_widget(Clear, rect);
+
+            let (dot, state) = if *active {
+                ("●", "订阅已开启")
+            } else {
+                ("○", "订阅已撤销")
+            };
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw(format!("  用户: {name}    当前: ")),
+                    Span::styled(
+                        format!("{dot} {state}"),
+                        Style::default()
+                            .fg(if *active { theme::ONLINE } else { theme::OFFLINE })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from("  [g]  重新生成 token(老 URL 立即失效)"),
+            ];
+            if *active {
+                lines.push(Line::from("  [v]  撤销 token(订阅返回 404,[g] 可恢复)"));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "       已撤销;按 [g] 重新生成即可恢复订阅",
+                    Style::default().fg(theme::DIM),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc/任意键] 取消",
+                Style::default().fg(theme::DIM),
+            )));
+
+            f.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Token 管理 ")
                         .border_style(Style::default().fg(theme::ACCENT)),
                 ),
                 rect,
@@ -748,6 +830,21 @@ pub fn status_bar(f: &mut Frame, area: Rect, text: &str, is_error: bool) {
 /// 样式照旧项目 `tui/widgets/tab_bar.rs`:`名字[序号]`,用 ratatui 的 `Tabs`
 /// 加一条下边框把页签区和内容区分开。序号就是**能直接按的键**(§8.2)——
 /// 只有 Tab 循环的话,从第一页跳到第五页要按四下,而人心里想的是「去第 5 页」。
+/// 通用信息栏:版本、规模、每页都一样的那几个键。
+///
+/// 与下面那条**专有操作栏**分开是刻意的:一条里既有「哪儿都能按的键」又有
+/// 「只有这一页能按的键」时,人得逐个读完才知道哪个属于当前页。
+/// 分成两条之后,下面那条永远只回答一个问题:「在这一页我能做什么」。
+pub fn info_bar(f: &mut Frame, area: Rect, text: &str) {
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            theme::truncate(text, area.width as usize),
+            Style::default().fg(theme::DIM),
+        ))),
+        area,
+    );
+}
+
 pub fn tabs(f: &mut Frame, area: Rect, titles: &[&str], selected: usize) {
     let items: Vec<Line> =
         titles.iter().enumerate().map(|(i, t)| Line::from(format!(" {t}[{}] ", i + 1))).collect();
@@ -760,6 +857,48 @@ pub fn tabs(f: &mut Frame, area: Rect, titles: &[&str], selected: usize) {
             .style(Style::default().fg(theme::DIM)),
         area,
     );
+}
+
+#[cfg(test)]
+mod render_preview {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw(w: u16, h: u16, m: &Modal) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render(f, f.area(), m)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("
+")
+    }
+
+    /// `cargo test render_preview::token -- --nocapture` 看一眼长什么样。
+    #[test]
+    fn token() {
+        for active in [true, false] {
+            let m = Modal::Token { user_id: 1, name: "alice".into(), active };
+            let out = draw(80, 12, &m);
+            println!("── active={active} ──
+{}
+", out.trim_end());
+            // 状态那一行必须说清现在是开是关 —— 两个动作的后果取决于它。
+            let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+            if active {
+                assert!(flat.contains("订阅已开启"), "{out}");
+                assert!(flat.contains("[v]"), "开着的时候要给撤销:{out}");
+            } else {
+                assert!(flat.contains("订阅已撤销"), "{out}");
+                assert!(!flat.contains("[v]"), "已撤销就不该再给 [v]:{out}");
+                assert!(flat.contains("[g]"), "恢复路径必须留着:{out}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
