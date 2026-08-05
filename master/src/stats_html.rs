@@ -29,10 +29,49 @@ pub struct StatsView {
     pub expire_at: Option<i64>,
     pub reset_day: Option<i64>,
     pub sub_token: String,
+    /// 绑了网卡时的替代口径(§10.3)。`Some` = 页面上那几个用量数字换成网卡口径。
+    ///
+    /// **账号状态(正常/超额/停用)仍然按用户自己的用量判**。绑网卡是一个
+    /// 纯显示功能,不该能把人停掉 —— 所以页面上必须同时把两个数字都写出来,
+    /// 否则「已用 900 GB」旁边挂着「正常」会像是个 bug。
+    pub nic: Option<NicUsage>,
+}
+
+/// 所绑机器的网卡用量之和。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NicUsage {
+    pub agents: usize,
+    pub up: i64,
+    pub down: i64,
+    /// 各机器配额之和;**只要有一台没设配额就是 0(不限)**。
+    /// 把设了的几台加起来当上限,会给出一个看起来精确、其实根本不是上限的数字。
+    pub quota: i64,
+}
+
+impl NicUsage {
+    fn total(&self) -> i64 {
+        self.up.saturating_add(self.down)
+    }
 }
 
 impl StatsView {
-    /// 计费口径的已用量(含倍率)。与 §6.3 的配额判定、TUI 的用量列同一个口径 ——
+    /// 页面主区显示的用量。绑了网卡就是网卡口径,否则是账号自己的计费用量。
+    fn shown_used(&self) -> i64 {
+        match &self.nic {
+            Some(n) => n.total(),
+            None => self.used(),
+        }
+    }
+
+    /// 页面主区显示的上限。
+    fn shown_quota(&self) -> i64 {
+        match &self.nic {
+            Some(n) => n.quota,
+            None => self.quota_bytes,
+        }
+    }
+
+    /// 账号自己的计费用量(含倍率)。与 §6.3 的配额判定、TUI 的用量列同一个口径 ——
     /// 三处显示不同的数字会让用户来问「到底哪个准」。
     fn used(&self) -> i64 {
         let raw = self.cycle_up.saturating_add(self.cycle_down);
@@ -45,11 +84,23 @@ impl StatsView {
         }
         (self.used() as f64 / self.quota_bytes as f64 * 100.0).clamp(0.0, 100.0)
     }
+
+    /// 进度条的百分比。跟着主区显示的那两个数走 —— 条画的是 `已用 / 上限`,
+    /// 这两个数换成网卡口径了,条还按账号自己的算就对不上,看着像画错了。
+    fn shown_percent(&self) -> f64 {
+        let quota = self.shown_quota();
+        if quota <= 0 {
+            return 0.0;
+        }
+        (self.shown_used() as f64 / quota as f64 * 100.0).clamp(0.0, 100.0)
+    }
 }
 
 /// 渲染整页。`base_url` 形如 `https://sub.example.com`(不带尾斜杠)。
 pub fn render(v: &StatsView, links: &[ShareLink], base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
+    // 状态判定始终用**账号自己的**用量:绑网卡是纯显示功能,不该影响
+    // 「这个号现在能不能用」的结论(§10.3)。
     let pct = v.percent();
     let expired = crate::model::user::expired(v.expire_at, chrono::Local::now().timestamp());
     let over = crate::model::user::over_quota(v.quota_bytes, v.used());
@@ -69,17 +120,27 @@ pub fn render(v: &StatsView, links: &[ShareLink], base_url: &str) -> String {
         ("", "", "正常")
     };
 
-    let total_str = if v.quota_bytes <= 0 { "不限".to_string() } else { fmt_bytes(v.quota_bytes) };
+    let shown_quota = v.shown_quota();
+    let total_str = if shown_quota <= 0 { "不限".to_string() } else { fmt_bytes(shown_quota) };
     let reset_desc = match v.reset_day {
         Some(d) if (1..=31).contains(&d) => format!("每月 {d} 号"),
         _ => "不重置".into(),
     };
-    let billing = if (v.traffic_multiplier - 1.0).abs() < 0.01 {
-        "单向".to_string()
-    } else if (v.traffic_multiplier - 2.0).abs() < 0.01 {
-        "双向".to_string()
-    } else {
-        format!("{:.1}x", v.traffic_multiplier)
+    // 绑了网卡时倍率是不参与的(网卡数字直接报),写倍率会误导。
+    let billing = match &v.nic {
+        Some(n) => format!("网卡口径 · {} 台机器", n.agents),
+        None if (v.traffic_multiplier - 1.0).abs() < 0.01 => "单向".to_string(),
+        None if (v.traffic_multiplier - 2.0).abs() < 0.01 => "双向".to_string(),
+        None => format!("{:.1}x", v.traffic_multiplier),
+    };
+    // 绑了网卡就多一行,把账号自己的用量也写出来 —— 少了这一行,
+    // 「已用 900 GB」旁边挂着「正常」会像是个 bug,而那才是账号的真实状态。
+    let own_row = match &v.nic {
+        Some(_) => format!(
+            r#"<span>账号自身: <b>{}</b>(停用判定按这个数)</span>"#,
+            fmt_bytes(v.used())
+        ),
+        None => String::new(),
     };
 
     let sub_sing = format!("{base}/sub/{}", v.sub_token);
@@ -174,6 +235,7 @@ details svg {{ display:block; margin:10px auto 4px; background:#fff; padding:10p
       <span>下行: <b>{down}</b></span>
       <span>计费: <b>{billing}</b></span>
       <span>节点: <b>{n_nodes}</b></span>
+      {own_row}
     </div>
   </div>
   <div class="card">
@@ -202,14 +264,15 @@ function copy(btn,text){{
         status_cls = status_cls,
         status_label = status_label,
         bar_cls = bar_cls,
-        pct = pct,
-        used = fmt_bytes(v.used()),
+        pct = v.shown_percent(),
+        used = fmt_bytes(v.shown_used()),
         total = total_str,
         reset = reset_desc,
         expire = describe_expire(v.expire_at),
-        up = fmt_bytes(v.cycle_up.max(0)),
-        down = fmt_bytes(v.cycle_down.max(0)),
+        up = fmt_bytes(v.nic.map(|n| n.up).unwrap_or(v.cycle_up).max(0)),
+        down = fmt_bytes(v.nic.map(|n| n.down).unwrap_or(v.cycle_down).max(0)),
         billing = billing,
+        own_row = own_row,
         n_nodes = links.len(),
         sub_rows = sub_rows,
         node_rows = node_rows,
@@ -337,6 +400,7 @@ mod tests {
             cycle_up: 20 * 1_073_741_824,
             cycle_down: 55 * 1_073_741_824,
             traffic_multiplier: 1.0,
+            nic: None,
             expire_at: None,
             reset_day: Some(22),
             sub_token: "tok".into(),
@@ -345,6 +409,77 @@ mod tests {
 
     fn link(tag: &str, link: &str) -> ShareLink {
         ShareLink { tag: tag.into(), protocol: "vless-reality".into(), link: link.into() }
+    }
+
+    fn nic_view() -> StatsView {
+        StatsView {
+            nic: Some(NicUsage {
+                agents: 2,
+                up: 300 * 1_073_741_824,
+                down: 600 * 1_073_741_824,
+                quota: 2000 * 1_073_741_824,
+            }),
+            ..view()
+        }
+    }
+
+    /// 绑了网卡之后,统计页上那几个用量数字要换成**网卡口径**。
+    ///
+    /// 这是这个功能存在的理由:VPS 厂商按网卡计费,管理员要能用任意一个
+    /// 代理客户端(或者浏览器)看到「这几台机器这个月烧了多少」,不用 ssh 上去查。
+    /// 之前只换了 `subscription-userinfo` 响应头,网页上还是账号自己的用量 ——
+    /// 于是绑完之后打开页面,看到的还是原来那个数,像是没生效。
+    #[test]
+    fn binding_nics_replaces_the_numbers_on_the_page() {
+        let html = render(&nic_view(), &[], "https://sub.example.com");
+        assert!(html.contains("900.00 GB"), "已用该是网卡的 300+600:\n{html}");
+        assert!(html.contains("300.00 GB"), "上行该是网卡上行");
+        assert!(html.contains("600.00 GB"), "下行该是网卡下行");
+        assert!(html.contains("1.95 TB"), "上限该是各机器配额之和");
+        assert!(html.contains("网卡口径"), "得标出来这是网卡口径,不然两个数对不上没法解释");
+        assert!(html.contains("2 台机器"), "绑了几台要写出来");
+    }
+
+    /// **账号状态仍然按账号自己的用量判。**
+    ///
+    /// 绑网卡是一个纯显示功能,不该能把人停掉(§10.3)。所以页面上既要显示
+    /// 网卡的大数字,又必须把账号自身的用量写出来 —— 少了后面这一行,
+    /// 「已用 900 GB / 上限 1.95 TB」旁边挂着一个「正常」会像是个 bug,
+    /// 而那恰恰是账号的真实状态。
+    #[test]
+    fn binding_nics_never_changes_the_account_status() {
+        let html = render(&nic_view(), &[], "https://sub.example.com");
+        assert!(html.contains("正常"), "账号自己只用了 75 GB / 100 GB,该是正常:\n{html}");
+        assert!(html.contains("账号自身"), "得把账号自己的用量也写出来");
+        assert!(html.contains("75.00 GB"), "账号自身的计费用量该照原样显示");
+
+        // 网卡烧爆了也不该把状态染红 —— 那是厂商的账,不是这个号的账。
+        let mut v = nic_view();
+        v.nic = Some(NicUsage { agents: 1, up: 0, down: 3000 * 1_073_741_824, quota: 100 * 1_073_741_824 });
+        let html = render(&v, &[], "https://sub.example.com");
+        assert!(html.contains("正常"), "网卡超了不该让账号显示成超额:\n{html}");
+    }
+
+    /// 没绑网卡的用户,页面一个字都不该变。
+    #[test]
+    fn without_a_binding_the_page_is_unchanged() {
+        let html = render(&view(), &[], "https://sub.example.com");
+        assert!(html.contains("75.00 GB"), "该显示账号自己的计费用量");
+        assert!(!html.contains("网卡口径"), "没绑就不该出现网卡的说法:\n{html}");
+        assert!(!html.contains("账号自身"), "没绑就不需要那一行补充说明");
+    }
+
+    /// 只要有一台机器没设配额,总量就报「不限」。
+    ///
+    /// 把设了配额的几台加起来当上限,会给出一个看起来精确、其实根本不是上限的
+    /// 数字 —— 那比不给更糟,因为页面会拿它算百分比、画进度条。
+    #[test]
+    fn an_uncapped_machine_makes_the_total_unlimited() {
+        let mut v = nic_view();
+        v.nic = Some(NicUsage { agents: 2, up: 1 << 30, down: 1 << 30, quota: 0 });
+        let html = render(&v, &[], "https://sub.example.com");
+        assert!(html.contains("不限"), "有一台没配额就该报不限:\n{html}");
+        assert!(html.contains("width:0.0%"), "上限未知时条该是空的,不是满的");
     }
 
     #[test]

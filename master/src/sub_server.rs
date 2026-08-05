@@ -244,7 +244,28 @@ async fn stats_view(pool: &SqlitePool, user_id: i64, name: &str) -> Result<crate
         expire_at,
         reset_day,
         sub_token,
+        // 统计页和响应头走**同一个** nic_usage —— 两处各查一遍库、
+        // 各写一份口径,迟早会在某个边界上给出两个不同的数字。
+        nic: nic_view(pool, user_id).await?,
     })
+}
+
+/// 统计页要的网卡视图。没绑就是 `None`,页面照原样显示账号自己的用量。
+async fn nic_view(pool: &SqlitePool, user_id: i64) -> Result<Option<crate::stats_html::NicUsage>> {
+    let Some((up, down, quota)) = nic_usage(pool, user_id).await? else {
+        return Ok(None);
+    };
+    let agents: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_nic_bindings WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(Some(crate::stats_html::NicUsage {
+        agents: agents.max(0) as usize,
+        up: up as i64,
+        down: down as i64,
+        quota: quota as i64,
+    }))
 }
 
 /// `subscription-userinfo: upload=X; download=Y; total=Z; expire=T`。
@@ -764,6 +785,40 @@ mod tests {
         let (status, _, yaml) = get(&p, &format!("/sub/{token}?type=clash"), "curl").await;
         assert_eq!(status, StatusCode::OK);
         assert!(yaml.contains("proxies:\n  []"), "{yaml}");
+    }
+
+    /// 绑了网卡之后,统计页上那几个数字要是网卡口径(已用 / 上限 / 上下行),
+    /// 状态(正常 / 超额)仍然按账号自己的用量判。
+    ///
+    /// 这正是那个功能存在的理由:管理员要能用任意一个代理客户端(或者浏览器)
+    /// 看到「这几台机器这个月烧了多少」,不用 ssh 上去查,而页面上改之前只有
+    /// 响应头里的数字换了,正文还是账号自己的用量 —— 看起来像是没生效。
+    #[tokio::test]
+    async fn binding_nics_replaces_the_numbers_on_the_stats_page() {
+        let p = nic_pool().await;
+        let (uid, aid) = fixture(&p, Some(500 * (1 << 30)), 300 * (1 << 30), 600 * (1 << 30)).await;
+        sqlx::query("INSERT INTO user_nic_bindings (user_id, agent_id) VALUES (?, ?)")
+            .bind(uid)
+            .bind(aid)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let token: String = sqlx::query_scalar("SELECT sub_token FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        let (status, _, body) = get(&p, &format!("/sub/{}?type=stats", token), "Mozilla").await;
+
+        assert_eq!(status, StatusCode::OK, "请求该成功");
+        assert!(body.contains("900.00 GB"), "已用该显示网卡口径 300+600:
+{body}");
+        assert!(body.contains("300.00 GB"), "上行该是网卡上行");
+        assert!(body.contains("600.00 GB"), "下行该是网卡下行");
+        assert!(body.contains("正常"), "账号自己没超,状态该是正常:
+{body}");
+        assert!(body.contains("账号自身"), "得把账号自己的用量也写出来");
     }
 
     #[tokio::test]

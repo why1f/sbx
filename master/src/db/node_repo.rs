@@ -165,6 +165,19 @@ pub async fn get_user_by_name(pool: &SqlitePool, name: &str) -> Result<Option<Us
         .await?)
 }
 
+/// 新用户的计费倍率。
+///
+/// **2.0,不是 1.0。** agent 的 tracker 记的是「客户端 ↔ 本机」那一段的
+/// read + write,而代理要把同样的数据再跟目标站点跑一遍(客户端→本机→目标,
+/// 目标→本机→客户端)—— 网卡上进出的量约是 tracker 数字的**两倍**,
+/// 而 VPS 厂商正是按网卡计费。默认 1.0 等于「用户账单只到厂商账单的一半」,
+/// 是在替管理员亏钱。
+///
+/// 默认值放在这里而不是 schema 的 `DEFAULT`:SQLite 改不了列默认值,只能重建
+/// 整张表,而 users 被 002 / 003 各加过一批列,重建就得把当前列一个不漏地抄一遍
+/// —— 抄漏一列的后果是那一列的数据在人已经在用的库上直接消失。见 006 那张迁移。
+pub const DEFAULT_TRAFFIC_MULTIPLIER: f64 = 2.0;
+
 /// 新增用户。
 ///
 /// **不推进任何 revision**:新用户还没被分配任何节点,不影响任何 agent 的配置。
@@ -176,13 +189,14 @@ pub async fn add_user(pool: &SqlitePool, name: &str, quota_bytes: i64, now: i64)
     let sub_token = crate::cluster::token::generate();
 
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (name, uuid, password, quota_bytes, sub_token, created_at)
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (name, uuid, password, quota_bytes, traffic_multiplier, sub_token, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(name)
     .bind(&uuid)
     .bind(&password)
     .bind(quota_bytes)
+    .bind(DEFAULT_TRAFFIC_MULTIPLIER)
     .bind(&sub_token)
     .bind(now)
     .fetch_one(pool)
@@ -438,6 +452,65 @@ pub async fn delete_user(pool: &SqlitePool, name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 新用户的倍率默认 **2.0**(双向)。
+    ///
+    /// tracker 记的是「客户端 ↔ 本机」那一段,而代理还要跟目标站点再跑一遍同样的量;
+    /// 网卡上的量约是记账数字的两倍,而 VPS 厂商按网卡收钱。默认 1.0 等于
+    /// 「用户账单只到厂商账单的一半」—— 那是一个会一直亏钱、且没人会发现的默认值。
+    #[tokio::test]
+    async fn a_new_user_is_billed_both_directions() {
+        let p = pool().await;
+        let id = add_user(&p, "alice", 0, 0).await.unwrap();
+        let mult: f64 = sqlx::query_scalar("SELECT traffic_multiplier FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(mult, 2.0, "新用户该按双向计费");
+        assert_eq!(mult, DEFAULT_TRAFFIC_MULTIPLIER);
+    }
+
+    /// **已有用户的倍率一个字节都不能动。**
+    ///
+    /// 它是管理员当时定的价。批量翻倍等于在所有人不知情的情况下把配额砍一半,
+    /// 那会让一批人在下一次巡检(30s)里直接被停用 —— 一个「改默认值」的动作
+    /// 不该有这种后果。006 那张迁移之所以是空的,就是为了这一条。
+    ///
+    /// 测法是**重开同一个库文件**:`init_pool` 每次都会把迁移从头过一遍,
+    /// 所以这正是「老库升级到带 006 的版本」那条路径。
+    #[tokio::test]
+    async fn upgrading_leaves_existing_multipliers_alone() {
+        let path = std::env::temp_dir().join(format!("sbx-mult-{}.db", uuid::Uuid::new_v4()));
+        let url = path.to_string_lossy().to_string();
+
+        let p = crate::db::init_pool(&url).await.unwrap();
+        let id = add_user(&p, "old", 0, 0).await.unwrap();
+        sqlx::query("UPDATE users SET traffic_multiplier = 1.0 WHERE id = ?")
+            .bind(id)
+            .execute(&p)
+            .await
+            .unwrap();
+        p.close().await;
+
+        // 再开一次 = 再跑一遍迁移。
+        let p = crate::db::init_pool(&url).await.unwrap();
+        let mult: f64 = sqlx::query_scalar("SELECT traffic_multiplier FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(mult, 1.0, "老用户的倍率不该被升级改掉");
+
+        // 同一个库上新建的用户仍然拿 2.0 —— 「不动老的」不等于「新的也退回去」。
+        let fresh = add_user(&p, "fresh", 0, 0).await.unwrap();
+        let mult: f64 = sqlx::query_scalar("SELECT traffic_multiplier FROM users WHERE id = ?")
+            .bind(fresh)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(mult, 2.0);
+    }
 
     async fn pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("sbx-noderepo-{}.db", uuid::Uuid::new_v4()));

@@ -269,6 +269,7 @@ pub fn user_add() -> Modal {
             vec![
                 "名称唯一,也是 inbound 里的用户名,建好之后不能改。".into(),
                 "建完记得按 [n] 分配节点:没分配节点的用户,订阅是空的。".into(),
+                "计费倍率默认 2.0(双向,与 VPS 厂商的网卡口径一致),建好后按 [E] 可改。".into(),
             ]
         })),
     )
@@ -292,7 +293,7 @@ pub fn user_edit(u: &UserRow) -> Modal {
             "编辑用户",
             vec![
                 Field::text("quota", "配额 GB (0 = 不限)", &quota_gb),
-                Field::text("mult", "计费倍率 (1.0 按实际 / 2.0 双倍)", &format!("{:.1}", u.traffic_multiplier)),
+                Field::text("mult", "计费倍率 (2.0 双向 / 1.0 单向)", &format!("{:.1}", u.traffic_multiplier)),
                 Field::text("expire", "到期 (YYYY-MM-DD,留空 = 永久)", &expire),
                 Field::text("reset", "重置日 (1-31,留空 = 不重置)", &reset),
             ],
@@ -311,6 +312,8 @@ pub fn user_edit(u: &UserRow) -> Modal {
         .with_note(Box::new(|_| {
             vec![
                 "计费用量 = (上行 + 下行) × 倍率;到期按当天 23:59:59 算。".into(),
+                "倍率 2.0 = 双向:代理要把同样的数据跟目标站点再跑一遍,".into(),
+                "网卡上的量约是记账数字的两倍,而 VPS 厂商按网卡收钱。1.0 只算客户端那一段。".into(),
                 "这四项不进 sing-box 配置,改它不会重建 box,下次巡检(30s)时生效。".into(),
                 "把配额调大之后,原先因超额被系统停用的用户会自动放出来。".into(),
             ]
