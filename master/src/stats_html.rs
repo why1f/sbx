@@ -423,6 +423,45 @@ mod tests {
         }
     }
 
+    /// 把绑了网卡的那张页面的关键几行打出来看一眼:
+    ///
+    /// ```sh
+    /// cargo test stats_html::tests::preview_nic -- --nocapture
+    /// ```
+    ///
+    /// 断言能守住数字,守不住「读起来是不是那个意思」—— 同一屏上摆着两个
+    /// 口径的数字,措辞稍微含糊一点就会被读成自相矛盾。
+    #[test]
+    fn preview_nic() {
+        let html = render(&nic_view(), &[], "https://sub.example.com");
+        for line in html.lines() {
+            let t = line.trim();
+            if t.starts_with("<div class=\"usage\">")
+                || t.starts_with("<span>")
+                || t.starts_with("<h1>")
+            {
+                // 去掉标签,只留人眼看得见的文字。
+                let mut out = String::new();
+                let mut skip = false;
+                for c in t.chars() {
+                    match c {
+                        '<' => skip = true,
+                        '>' => skip = false,
+                        _ if !skip => out.push(c),
+                        _ => {}
+                    }
+                }
+                let out = out.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !out.is_empty() {
+                    println!("  {out}");
+                }
+                // 注:`.usage` 那一行是 flex + space-between 的两个 span
+                // (左「已用 X」、右「上限」),上面的剥标签会把它们并成一串 ——
+                // 浏览器里它们分居两端。
+            }
+        }
+    }
+
     /// 绑了网卡之后,统计页上那几个用量数字要换成**网卡口径**。
     ///
     /// 这是这个功能存在的理由:VPS 厂商按网卡计费,管理员要能用任意一个
