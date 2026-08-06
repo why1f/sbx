@@ -23,7 +23,7 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use super::data::{AgentRow, BreakdownRow, NodeRow, UserRow};
+use super::data::{AgentRow, BreakdownRow, NodeRow, UserRow, HISTORY_LEN};
 use super::forms;
 use super::theme;
 
@@ -213,8 +213,25 @@ fn net_charts(f: &mut Frame, area: Rect, history: &VecDeque<(f64, f64)>) {
     let cur_up = history.back().map(|(u, _)| *u).unwrap_or(0.0);
     let cur_down = history.back().map(|(_, d)| *d).unwrap_or(0.0);
 
-    net_chart(f, cc[0], &up, theme::UP, format!(" ↑ 上行  {} ", theme::rate(cur_up)));
-    net_chart(f, cc[1], &down, theme::DOWN, format!(" ↓ 下行  {} ", theme::rate(cur_down)));
+    // 峰值写进标题。它原来在 y 轴 labels 里,而设 labels 会让 ratatui
+    // 腾出一列并画一条竖线 —— 那条线看起来像图里多出来的一组数据。
+    let peak = |pick: fn(&(f64, f64)) -> f64| {
+        history.iter().map(pick).fold(0.0_f64, f64::max)
+    };
+    net_chart(
+        f,
+        cc[0],
+        &up,
+        theme::UP,
+        format!(" ↑ 上行  {}   峰值 {} ", theme::rate(cur_up), theme::rate(peak(|(u, _)| *u))),
+    );
+    net_chart(
+        f,
+        cc[1],
+        &down,
+        theme::DOWN,
+        format!(" ↓ 下行  {}   峰值 {} ", theme::rate(cur_down), theme::rate(peak(|(_, d)| *d))),
+    );
 }
 
 fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title: String) {
@@ -231,7 +248,6 @@ fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title
         return;
     }
     let y_max = data.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max).max(1024.0) * 1.2;
-    let x_max = (data.len() - 1) as f64;
 
     let datasets = vec![Dataset::default()
         .marker(Marker::Braille)
@@ -241,14 +257,15 @@ fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title
     f.render_widget(
         Chart::new(datasets)
             .block(Block::default().borders(Borders::ALL).title(title))
-            .x_axis(Axis::default().bounds([0.0, x_max]))
-            .y_axis(
-                Axis::default()
-                    .bounds([0.0, y_max])
-                    // 纵轴只标顶:标满会把本来就窄的图挤没。
-                    .labels::<Vec<Line>>(vec![Line::from(""), Line::from(theme::rate(y_max))])
-                    .style(Style::default().fg(theme::DIM)),
-            ),
+            // 横轴按**容量**而不是当前点数。按点数的话,3 个点会被拉满整幅图宽,
+            // 相邻两点之间插出一条几十列长的直线 —— 那看起来像「一段平稳的趋势」,
+            // 而实际上中间什么都没发生。按容量画,曲线从左边开始随时间往右长,
+            // 空的部分就是空的,一眼能看出「才攒了这么多」。
+            .x_axis(Axis::default().bounds([0.0, HISTORY_LEN as f64]))
+            // **不设 y 轴 labels。** 设了 ratatui 会为标签腾出一列并画一条竖线,
+            // 那条竖线看起来像图里多出来的一组数据(用户就是这么报的)。
+            // 上限改写进标题,那里本来就有一行字。
+            .y_axis(Axis::default().bounds([0.0, y_max])),
         area,
     );
 }
@@ -1764,6 +1781,78 @@ mod tests {
             assert!(out.contains("100%"), "{w} 列下百分比被切了:
 {out}");
         }
+    }
+
+    /// 看一眼网速图:`cargo test tui::pages::tests::preview_chart -- --nocapture`
+    #[test]
+    fn preview_chart() {
+        let sparse: VecDeque<(f64, f64)> =
+            vec![(1000.0, 2000.0), (1500.0, 2500.0), (900.0, 1800.0), (1200.0, 2200.0)]
+                .into_iter()
+                .collect();
+        println!("── 只有 4 个点(刚开界面两分钟)──");
+        println!("{}", draw_to_string(120, 9, |f| {
+            let a = f.area();
+            super::net_charts(f, a, &sparse);
+        }));
+
+        // 攒满一小时,带真实波动。
+        let full: VecDeque<(f64, f64)> = (0..120)
+            .map(|i| {
+                let t = i as f64;
+                let up = 8000.0 + 5000.0 * (t / 7.0).sin() + 2000.0 * (t / 3.0).cos();
+                let down = 20000.0 + 12000.0 * (t / 11.0).cos() + 4000.0 * (t / 2.0).sin();
+                (up.max(0.0), down.max(0.0))
+            })
+            .collect();
+        println!("
+── 攒满 120 点(一小时)──");
+        println!("{}", draw_to_string(120, 9, |f| {
+            let a = f.area();
+            super::net_charts(f, a, &full);
+        }));
+    }
+
+    /// 网速图不该有竖线,稀疏数据也不该被拉满整幅宽度。
+    ///
+    /// 两个毛病都是用户报的:
+    ///   * 竖线 —— 设了 y 轴 labels,ratatui 会腾一列画轴线,看起来像多出一组数据;
+    ///   * 「两组数据」—— 横轴按点数,3 个点就被拉满整幅图宽,相邻点之间
+    ///     插出几十列长的直线,看着像两段独立的曲线。
+    #[test]
+    fn net_chart_has_no_axis_line_and_does_not_stretch() {
+        // 只有 4 个点(才跑了两分钟)。
+        let hist: VecDeque<(f64, f64)> =
+            vec![(1000.0, 2000.0), (1500.0, 2500.0), (900.0, 1800.0), (1200.0, 2200.0)]
+                .into_iter()
+                .collect();
+        let out = draw_to_string(120, 10, |f| {
+            let a = f.area();
+            super::net_charts(f, a, &hist);
+        });
+
+        // 竖线:框内不该有 `│`。左右两个图各有自己的边框,那是 `┌│└`,
+        // 出现在行首/行尾;轴线会出现在**内容区里**。
+        for line in out.lines() {
+            let inner: String = line.chars().skip(1).take(line.chars().count().saturating_sub(2)).collect();
+            let inner = inner.replace("││", ""); // 两图相邻处的边框
+            assert!(!inner.contains('│'), "图里不该有轴线竖线:
+{out}");
+        }
+
+        // 峰值写进标题(原来在 y 轴 labels 里)。
+        assert!(has_cjk(&out, "峰值"), "标题里该有峰值:
+{out}");
+
+        // 稀疏数据不该铺满:4 个点在 120 点的容量里只占最左边一小段,
+        // 右边大半应当是空的。
+        let last = out.lines().nth(4).unwrap_or("");
+        let right: String = last.chars().skip(last.chars().count() * 2 / 3).collect();
+        assert!(
+            right.chars().all(|c| c == ' ' || c == '│' || c == '─' || c == '┐' || c == '┘'),
+            "4 个点不该被拉到图的右边:
+{out}"
+        );
     }
 
     /// 节点视图**不该有进度条**。

@@ -136,11 +136,7 @@ impl App {
         self.status_is_error = true;
     }
 
-    /// 状态栏内容:有一次性消息就显示它,否则显示快捷键 + 选中项摘要。
-    ///
-    /// 摘要里带 `token_prefix` 是有实际用途的:主控日志里认证失败只会记前 8 位
-    /// (§8.1 不回显完整 token),对不上号的时候要靠这里把日志和某一行连起来。
-    /// 顶栏右侧那一行:版本 + 规模 + **每页都一样**的那几个键。
+    /// 最底下那条页脚:版本 + 规模 + **每页都一样**的那几个键。
     ///
     /// 通用键只写在这里一处。以前它们跟在每页的专有键前面(`common` 前缀),
     /// 于是「切页/选择/刷新/退出」在底栏里重复五遍,把真正会变的那部分
@@ -155,45 +151,78 @@ impl App {
         )
     }
 
-    /// 底栏:**只有当页专有**的操作,加选中项摘要。
+    /// 「操作」面板第一行:**当前选中的是什么**。
     ///
-    /// 摘要里带 `token_prefix` 是有实际用途的:主控日志里认证失败只会记前 8 位
-    /// (§8.1 不回显完整 token),对不上号的时候要靠这里把日志和某一行连起来。
-    fn status_line(&self) -> String {
-        if let Some(msg) = &self.status {
-            return msg.clone();
-        }
+    /// 与下面那行按键放在同一个框里是有意的:「[d]删除」和「选中: alice」
+    /// 隔开摆的话,按下去之前得先抬头去表里找光标在哪 —— 而那正是最不该
+    /// 需要确认两次的时刻。
+    fn ops_summary(&self) -> String {
         match self.page {
-            Page::Dashboard => "仪表盘是只读的;要动手请去 2/3/4 页".into(),
-            Page::Agents => {
-                let sel = match self.selected_agent() {
-                    Some(a) => format!(
-                        "  │  #{} {} · token {}… · {} 个节点",
-                        a.id, a.name, a.token_prefix, a.node_count
-                    ),
-                    None => "  │  还没有被控服务器,按 [a] 加一台".into(),
-                };
-                format!("[a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [r]轮换token  [d]删除{sel}")
-            }
-            Page::Nodes => {
-                let sel = match self.selected_node() {
-                    Some(n) => format!("  │  #{} {} · {} 个用户在用", n.id, n.tag, n.user_count),
-                    None => "  │  还没有节点,按 [a] 建一个".into(),
-                };
-                format!("[a]新增  [E]编辑  [Enter]用量明细  [d]删除{sel}")
-            }
+            Page::Dashboard => "  只读页;要动手请去 [2] 服务管理 / [3] 节点 / [4] 用户".into(),
+            Page::Agents => match self.selected_agent() {
+                // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
+                // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
+                Some(a) => format!(
+                    "  选中: {}  token: {}…  节点: {} 个  状态: {}",
+                    a.name,
+                    a.token_prefix,
+                    a.node_count,
+                    match a.status.as_str() {
+                        "online" => "● 在线",
+                        "offline" => "● 离线",
+                        _ => "○ 从未连接",
+                    }
+                ),
+                None => "  (还没有被控服务器,按 [a] 加一台)".into(),
+            },
+            Page::Nodes => match self.selected_node() {
+                Some(n) => format!(
+                    "  选中: {}  机器: {}  协议: {}  端口: {}  在用: {} 人",
+                    n.tag, n.agent_name, n.protocol, n.listen_port, n.user_count
+                ),
+                None => "  (还没有节点,按 [a] 建一个)".into(),
+            },
+            Page::Users => match self.selected_user() {
+                Some(u) => {
+                    let nodes = if u.node_count() == 0 {
+                        "未分配".to_string()
+                    } else {
+                        format!("{} 个", u.node_count())
+                    };
+                    // 订阅地址是这一页最常要看的东西(要发给用户)。
+                    // 撤销过的不拼地址 —— 那条 URL 一定 404,给出去只会让人
+                    // 以为服务坏了(sub_modal 里同一个理由)。
+                    let sub = if crate::db::node_repo::is_revoked(&u.sub_token) {
+                        "(已撤销)".to_string()
+                    } else {
+                        let base = self.sub_base().trim().trim_end_matches('/');
+                        if base.is_empty() {
+                            format!("/sub/{}", u.sub_token)
+                        } else {
+                            format!("{base}/sub/{}", u.sub_token)
+                        }
+                    };
+                    format!("  选中: {}  节点: {}  订阅: {}", u.name, nodes, sub)
+                }
+                None => "  (还没有用户,按 [a] 建一个)".into(),
+            },
+            Page::Settings => "  改的是配置文件本身,注释与排版都保留;改完要重启 daemon".into(),
+        }
+    }
+
+    /// 「操作」面板第二行:**这一页能按的键**。
+    ///
+    /// 通用键(切页/选择/刷新/退出)不在这里 —— 它们在最底下那条页脚里,
+    /// 只写一处。混在一起会让它们在五个页面里重复五遍,把真正会变的那部分挤走。
+    fn ops_keys(&self) -> &'static str {
+        match self.page {
+            Page::Dashboard => "",
+            Page::Agents => "  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [r]轮换token  [d]删除",
+            Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除",
             Page::Users => {
-                let sel = match self.selected_user() {
-                    Some(u) => format!("  │  #{} {}", u.id, u.name),
-                    None => "  │  还没有用户,按 [a] 建一个".into(),
-                };
-                format!(
-                    "[a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [T]token  [r]重置流量  [t]启/停  [s]订阅  [d]删除{sel}"
-                )
+                "  [a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [T]token  [r]重置流量  [t]启/停  [s]订阅  [d]删除"
             }
-            Page::Settings => {
-                "[Enter]改这一项  │  改完要重启 daemon:systemctl restart sbx".into()
-            }
+            Page::Settings => "  [Enter]改这一项",
         }
     }
 
@@ -347,17 +376,22 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // 页签占**两行**:一行文字 + 一行下边框。给 1 行的话 `Borders::BOTTOM`
     // 会把那唯一一行吃掉,结果是页签整条消失、只剩一条横线 —— 这正是 v0.3.0
     // 换成 ratatui `Tabs` 之后出的回归(tabs_are_actually_visible 盯着它)。
-    // 四段:页签(2) / 主体 / 通用信息栏(1) / 当页专有操作栏(1)。
+    // 四段,自上而下:页签(2) / 主体 / 「操作」面板(4) / 全局状态栏(1)。
     //
-    // 底下**两条**而不是一条:通用键(切页/选择/刷新/退出)和当页能做什么
-    // 混在一行时,人得整行读完才能分辨哪个键属于这一页。分开之后最后那条
-    // 永远只回答「在这一页我能做什么」,而它恰恰是唯一会变的那部分。
+    // 顺序照 sb-manager:**版本那一行在最底下**。它是整个界面的页脚 ——
+    // 版本号、规模、以及哪儿都能按的那几个键。把它夹在主体和操作栏中间
+    // (上一版就是这么错的)会让人以为它属于当页的操作。
+    //
+    // 「操作」是一个**带边框的面板**而不是一行裸文字:第一行是选中项摘要
+    // (在哪个用户/节点上、它的订阅地址),第二行才是这一页能按的键。
+    // 摘要必须和键放在一起 —— 「[d]删除」和「选中: alice」隔开摆的话,
+    // 按下去之前得先抬头去表里找光标在哪。
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(4),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -379,8 +413,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Page::Users => pages::users(f, chunks[1], &app.users, app.sel[3], app.sub_base(), now),
         Page::Settings => pages::settings(f, chunks[1], &settings::all(&app.cfg), app.sel[4]),
     }
-    modal::info_bar(f, chunks[2], &app.header_line());
-    modal::status_bar(f, chunks[3], &app.status_line(), app.status_is_error);
+    modal::ops_panel(f, chunks[2], &app.ops_summary(), app.ops_keys(), app.status.as_deref(), app.status_is_error);
+    modal::info_bar(f, chunks[3], &app.header_line());
 
     if let Some(o) = &app.overlay {
         pages::breakdown(f, f.area(), &o.title, &o.head, &o.info, &o.rows);
@@ -1385,20 +1419,23 @@ mod tests {
         let second = row(1);
         assert!(second.contains('─'), "页签下面该有一条分隔线:{second:?}");
 
-        // 顶部通用信息栏(倒数第二行)。
+        // **页脚在最底下那一行**,不是夹在中间。夹中间会让人以为版本那一行
+        // 属于当页的操作(上一版就是这么错的)。
         // 比对前要去空白:一个汉字占两个终端格,buffer 里读出来是「切 页」。
-        let info = row(h as u16 - 2);
+        let info = row(h as u16 - 1);
         let fi = flat(&info);
-        assert!(fi.contains("sbxv"), "通用信息栏里应有版本前缀:{info:?}");
-        assert!(fi.contains("切页"), "通用信息栏里应有切页提示:{info:?}");
-        assert!(fi.contains("退出"), "通用信息栏里应有退出提示:{info:?}");
-        assert!(fi.contains("用户:"), "通用信息栏里应有规模:{info:?}");
+        assert!(fi.contains("sbxv"), "最后一行该是页脚:{info:?}");
+        assert!(fi.contains("切页"), "页脚里应有切页提示:{info:?}");
+        assert!(fi.contains("退出"), "页脚里应有退出提示:{info:?}");
+        assert!(fi.contains("用户:"), "页脚里应有规模:{info:?}");
 
-        // 底部专有操作栏(最后一行)。它**不该**再重复通用键 ——
-        // 重复正是这次要拆开的那个毛病。
-        let hint = row(h as u16 - 1);
+        // 「操作」面板占页脚上面那 4 行,带边框和标题。
+        let ops_title = row(h as u16 - 5);
+        assert!(flat(&ops_title).contains("操作"), "该有一个带标题的操作面板:{ops_title:?}");
+        let hint = row(h as u16 - 3);
         let fh = flat(&hint);
-        assert!(fh.contains("仪表盘"), "仪表盘页底栏应有页面说明:{hint:?}");
+        // 它**不该**再重复通用键 —— 重复正是这次要拆开的那个毛病。
+        assert!(!fh.contains("退出"), "操作面板不该重复通用键:{hint:?}");
         assert!(!fh.contains("退出"), "底栏不该再重复通用键:{hint:?}");
 
         println!("{}\n{}\n…\n{}\n{}", first.trim_end(), second.trim_end(), info.trim_end(), hint.trim_end());
@@ -1459,6 +1496,34 @@ mod tests {
             matches!(m.handle(key('g')), Outcome::Run(Action::RegenSubToken { .. })),
             "已撤销时 [g] 必须还能恢复"
         );
+    }
+
+    /// 把「操作」面板和页脚画出来看一眼(用户页,有选中项)。
+    ///
+    /// ```sh
+    /// cargo test tui::tests::preview_footer -- --nocapture
+    /// ```
+    #[tokio::test]
+    async fn preview_footer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut a = app();
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+        a.agents = vec![stub_agent(1)];
+        a.nodes = vec![stub_node(1, "tokyo-reality")];
+        a.cfg.subscription.public_base = "https://sub.example.com".into();
+
+        let mut term = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        term.draw(|f| draw(f, &a)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let h = buf.area.height;
+        for y in (h - 6)..h {
+            let line: String =
+                (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            println!("{}", line.trim_end());
+        }
     }
 
     /// 绑网卡是**多选**,而且打开时已绑的要是勾上的 —— 与分配节点同一个道理:
@@ -1792,10 +1857,10 @@ mod tests {
             app.page = page;
             term.draw(|f| draw(f, &app)).unwrap();
         }
-        // 状态栏摘要要认出选中项(token 前缀是日志对号用的,§8.1)。
+        // 「操作」面板的摘要要认出选中项(token 前缀是日志对号用的,§8.1)。
         app.page = Page::Agents;
-        assert!(app.status_line().contains("tokyo-1"), "{}", app.status_line());
-        assert!(app.status_line().contains("token "), "{}", app.status_line());
+        assert!(app.ops_summary().contains("tokyo-1"), "{}", app.ops_summary());
+        assert!(app.ops_summary().contains("token:"), "{}", app.ops_summary());
     }
 
     /// 编辑节点**不能动密钥材料**。这条是 §9.1 最贵的那个错误的回归锚点:

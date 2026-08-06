@@ -932,12 +932,41 @@ mod tests {
         assert!(!yaml.contains("skip-cert-verify"), "reality 不该跳过校验:\n{yaml}");
     }
 
+    /// 公钥进 YAML、私钥绝不进。
+    ///
+    /// 比对时要走 `yaml_str`,不能直接拼原值:reality 公钥是 **base64url**
+    /// (字母表含 `-` 和 `_`),64 分之一的概率首字符是 `-`,而 `-` 开头的标量
+    /// 会被 `yaml_str` 加引号 —— 于是 `public-key: -abc` 变成 `public-key: "-abc"`,
+    /// 拼原值的断言就挂了。
+    ///
+    /// 这正是它**偶发**的原因:每次跑都现生成一对新密钥,大多数时候首字符
+    /// 不是 `-`,测试就绿。产品行为是对的(加引号更安全),错的是这条断言。
     #[test]
     fn clash_reality_carries_public_key_not_private() {
         let n = node(Protocol::VlessReality);
         let yaml = generate_clash_yaml(&user(), std::slice::from_ref(&n), &opts());
-        assert!(yaml.contains(&format!("public-key: {}", n.params.public_key.clone().unwrap())));
+        let pbk = n.params.public_key.clone().unwrap();
+        assert!(
+            yaml.contains(&format!("public-key: {}", yaml_str(&pbk))),
+            "公钥没进 YAML(pbk={pbk}):
+{yaml}"
+        );
         assert!(!yaml.contains(n.params.private_key.as_deref().unwrap()), "私钥泄进了 YAML");
+    }
+
+    /// 把上面那条的**偶发分支**钉死:公钥首字符是 `-` 时必须加引号。
+    ///
+    /// 不钉的话,这一支平均 64 次才走到一次 —— 等于没被测过。
+    #[test]
+    fn a_public_key_starting_with_a_dash_gets_quoted() {
+        let mut n = node(Protocol::VlessReality);
+        n.params.public_key = Some("-AbCdEf0123456789_-".into());
+        let yaml = generate_clash_yaml(&user(), std::slice::from_ref(&n), &opts());
+        assert!(
+            yaml.contains(r#"public-key: "-AbCdEf0123456789_-""#),
+            "`-` 开头的公钥必须加引号,否则 YAML 语义可能被读成别的东西:
+{yaml}"
+        );
     }
 
     /// IPv6 地址在 YAML 里必须加引号。

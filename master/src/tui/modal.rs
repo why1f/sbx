@@ -816,25 +816,48 @@ fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
 }
 
 /// 底部状态条。
-pub fn status_bar(f: &mut Frame, area: Rect, text: &str, is_error: bool) {
-    let style = if is_error {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(theme::DIM)
+/// 「操作」面板:选中项摘要 + 这一页能按的键,外面套一个边框。
+///
+/// 两行放在同一个框里是有意的:「[d]删除」和「选中: alice」隔开摆的话,
+/// 按下去之前得先抬头去表里找光标在哪 —— 而那正是最不该需要确认两次的时刻。
+///
+/// `msg` 是一次性回执(某个操作刚做完)。有它的时候**顶掉摘要那一行**,
+/// 而不是再挤出一行来:回执是当下最要紧的信息,而摘要下一帧就会回来。
+pub fn ops_panel(
+    f: &mut Frame,
+    area: Rect,
+    summary: &str,
+    keys: &str,
+    msg: Option<&str>,
+    is_error: bool,
+) {
+    let inner = (area.width as usize).saturating_sub(2);
+    let first = match msg {
+        Some(m) => Span::styled(
+            theme::truncate(&format!("  {m}"), inner),
+            if is_error {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::ONLINE)
+            },
+        ),
+        None => Span::raw(theme::truncate(summary, inner)),
     };
-    f.render_widget(Paragraph::new(Line::from(Span::styled(text.to_string(), style))), area);
+    let lines = vec![
+        Line::from(first),
+        Line::from(Span::styled(theme::truncate(keys, inner), Style::default().fg(theme::DIM))),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 操作 ")),
+        area,
+    );
 }
 
-/// 顶部页签。
+/// 最底下那条页脚:版本、规模、每页都一样的那几个键。
 ///
-/// 样式照旧项目 `tui/widgets/tab_bar.rs`:`名字[序号]`,用 ratatui 的 `Tabs`
-/// 加一条下边框把页签区和内容区分开。序号就是**能直接按的键**(§8.2)——
-/// 只有 Tab 循环的话,从第一页跳到第五页要按四下,而人心里想的是「去第 5 页」。
-/// 通用信息栏:版本、规模、每页都一样的那几个键。
-///
-/// 与下面那条**专有操作栏**分开是刻意的:一条里既有「哪儿都能按的键」又有
+/// 与上面那个「操作」面板分开是刻意的:一条里既有「哪儿都能按的键」又有
 /// 「只有这一页能按的键」时,人得逐个读完才知道哪个属于当前页。
-/// 分成两条之后,下面那条永远只回答一个问题:「在这一页我能做什么」。
+/// 分开之后「操作」永远只回答一个问题:「在这一页我能做什么」。
 pub fn info_bar(f: &mut Frame, area: Rect, text: &str) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -845,6 +868,11 @@ pub fn info_bar(f: &mut Frame, area: Rect, text: &str) {
     );
 }
 
+/// 顶部页签。
+///
+/// 样式照旧项目 `tui/widgets/tab_bar.rs`:`名字[序号]`,用 ratatui 的 `Tabs`
+/// 加一条下边框把页签区和内容区分开。序号就是**能直接按的键**(§8.2)——
+/// 只有 Tab 循环的话,从第一页跳到第五页要按四下,而人心里想的是「去第 5 页」。
 pub fn tabs(f: &mut Frame, area: Rect, titles: &[&str], selected: usize) {
     let items: Vec<Line> =
         titles.iter().enumerate().map(|(i, t)| Line::from(format!(" {t}[{}] ", i + 1))).collect();
