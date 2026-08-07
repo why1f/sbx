@@ -1673,8 +1673,8 @@ mod tests {
             super::net_charts(f, a, &sparse);
         }));
 
-        // 攒满一小时,带真实波动。
-        let full: VecDeque<(f64, f64)> = (0..120)
+        // 攒满整窗,带真实波动。
+        let full: VecDeque<(f64, f64)> = (0..crate::tui::data::HISTORY_LEN)
             .map(|i| {
                 let t = i as f64;
                 let up = 8000.0 + 5000.0 * (t / 7.0).sin() + 2000.0 * (t / 3.0).cos();
@@ -1683,7 +1683,7 @@ mod tests {
             })
             .collect();
         println!("
-── 攒满 120 点(一小时)──");
+── 攒满 60 点(1 秒上报 = 一分钟)──");
         println!("{}", draw_to_string(120, 9, |f| {
             let a = f.area();
             super::net_charts(f, a, &full);
