@@ -826,27 +826,39 @@ fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
 pub fn ops_panel(
     f: &mut Frame,
     area: Rect,
-    summary: &str,
+    summary: &[String],
     keys: &str,
     msg: Option<&str>,
     is_error: bool,
 ) {
     let inner = (area.width as usize).saturating_sub(2);
-    let first = match msg {
-        Some(m) => Span::styled(
-            theme::truncate(&format!("  {m}"), inner),
-            if is_error {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::ONLINE)
-            },
-        ),
-        None => Span::raw(theme::truncate(summary, inner)),
-    };
-    let lines = vec![
-        Line::from(first),
-        Line::from(Span::styled(theme::truncate(keys, inner), Style::default().fg(theme::DIM))),
-    ];
+    let mut lines: Vec<Line> = Vec::new();
+    match msg {
+        // 一次性回执**顶掉第一行摘要**,不再另挤一行出来:回执是当下最要紧的
+        // 信息,而摘要下一帧就回来了。
+        Some(m) => {
+            lines.push(Line::from(Span::styled(
+                theme::truncate(&format!("  {m}"), inner),
+                if is_error {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::ONLINE)
+                },
+            )));
+            for extra in summary.iter().skip(1) {
+                lines.push(Line::from(theme::truncate(extra, inner)));
+            }
+        }
+        None => {
+            for l in summary {
+                lines.push(Line::from(theme::truncate(l, inner)));
+            }
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        theme::truncate(keys, inner),
+        Style::default().fg(theme::DIM),
+    )));
     f.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 操作 ")),
         area,

@@ -151,18 +151,26 @@ impl App {
         )
     }
 
-    /// 「操作」面板第一行:**当前选中的是什么**。
+    /// 「操作」面板的摘要行:**当前选中的是什么**。
+    ///
+    /// 返回 1~2 行。节点页和用户页各有一批「列里放不下、但又必须看得见」的东西
+    /// (完整 SNI、中转落点、订阅地址、网卡绑定),它们原来在一个单独的
+    /// 「详情」面板里 —— 而那个面板的前半段和这里逐字重复,同一屏上把同一件事
+    /// 说了两遍,还各占四行。现在只留这一处。
     ///
     /// 与下面那行按键放在同一个框里是有意的:「[d]删除」和「选中: alice」
     /// 隔开摆的话,按下去之前得先抬头去表里找光标在哪 —— 而那正是最不该
     /// 需要确认两次的时刻。
-    fn ops_summary(&self) -> String {
+    ///
+    /// **这里绝不能渲染密钥材料**(§11.3):`NodeParams` 里还躺着 reality 私钥、
+    /// 证书私钥、ss 服务端密钥。只准取人自己填过的那几项。
+    fn ops_lines(&self) -> Vec<String> {
         match self.page {
-            Page::Dashboard => "  只读页;要动手请去 [2] 服务管理 / [3] 节点 / [4] 用户".into(),
+            Page::Dashboard => vec![],
             Page::Agents => match self.selected_agent() {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
-                Some(a) => format!(
+                Some(a) => vec![format!(
                     "  选中: {}  token: {}…  节点: {} 个  状态: {}",
                     a.name,
                     a.token_prefix,
@@ -172,15 +180,46 @@ impl App {
                         "offline" => "● 离线",
                         _ => "○ 从未连接",
                     }
-                ),
-                None => "  (还没有被控服务器,按 [a] 加一台)".into(),
+                )],
+                None => vec!["  (还没有被控服务器,按 [a] 加一台)".into()],
             },
             Page::Nodes => match self.selected_node() {
-                Some(n) => format!(
-                    "  选中: {}  机器: {}  协议: {}  端口: {}  在用: {} 人",
-                    n.tag, n.agent_name, n.protocol, n.listen_port, n.user_count
-                ),
-                None => "  (还没有节点,按 [a] 建一个)".into(),
+                Some(n) => {
+                    let p = crate::model::node::Protocol::parse(&n.protocol);
+                    let mut first = format!(
+                        "  选中: {}  机器: {}  {}:{}  在用: {} 人",
+                        n.tag, n.agent_name, n.protocol, n.listen_port, n.user_count
+                    );
+                    if forms::uses_sni(p) {
+                        first.push_str(&format!(
+                            "  SNI: {}",
+                            n.params.server_name.as_deref().unwrap_or("(未设,下发时取默认)")
+                        ));
+                    }
+                    if forms::uses_path(p) {
+                        first.push_str(&format!(
+                            "  path: {}",
+                            n.params.path.as_deref().unwrap_or("(未设,下发时取默认)")
+                        ));
+                    }
+                    // 订阅导出那一段:客户端到底连哪儿。中转时**不是**节点自身端口,
+                    // 这一句丢了就会有人对着节点端口查为什么连不上。
+                    let mut second = String::from("  订阅导出:");
+                    match pages::relay_label(n) {
+                        Some(l) => second
+                            .push_str(&format!(" 中转 {l}(客户端连这里,不是节点自身端口)")),
+                        None => second.push_str(&format!(
+                            " {} 的 {}",
+                            n.agent_name,
+                            if n.params.ipv6 { "IPv6" } else { "IPv4" }
+                        )),
+                    }
+                    if n.params.port_reuse {
+                        second.push_str("  · 端口复用(导出端口固定 443)");
+                    }
+                    vec![first, second]
+                }
+                None => vec!["  (还没有节点,按 [a] 建一个)".into()],
             },
             Page::Users => match self.selected_user() {
                 Some(u) => {
@@ -193,20 +232,39 @@ impl App {
                     // 撤销过的不拼地址 —— 那条 URL 一定 404,给出去只会让人
                     // 以为服务坏了(sub_modal 里同一个理由)。
                     let sub = if crate::db::node_repo::is_revoked(&u.sub_token) {
-                        "(已撤销)".to_string()
+                        "(已撤销,按 [T] → [g] 恢复)".to_string()
                     } else {
                         let base = self.sub_base().trim().trim_end_matches('/');
                         if base.is_empty() {
-                            format!("/sub/{}", u.sub_token)
+                            format!("/sub/{}(未配 public_base,只能给路径)", u.sub_token)
                         } else {
                             format!("{base}/sub/{}", u.sub_token)
                         }
                     };
-                    format!("  选中: {}  节点: {}  订阅: {}", u.name, nodes, sub)
+                    let first = format!(
+                        "  选中: {}  节点: {}  倍率: {:.1}x  订阅: {}",
+                        u.name,
+                        nodes,
+                        u.traffic_multiplier,
+                        sub
+                    );
+                    // 绑了网卡就必须说 —— 客户端里显示的流量和表里那个数不是一回事。
+                    if !u.nic_agent_ids.is_empty() {
+                        return vec![
+                            first,
+                            format!(
+                                "  订阅响应头报的是 {} 台机器的网卡用量之和,不是这个用户自己的用量(§10.3)",
+                                u.nic_agent_ids.len()
+                            ),
+                        ];
+                    }
+                    vec![first]
                 }
-                None => "  (还没有用户,按 [a] 建一个)".into(),
+                None => vec!["  (还没有用户,按 [a] 建一个)".into()],
             },
-            Page::Settings => "  改的是配置文件本身,注释与排版都保留;改完要重启 daemon".into(),
+            Page::Settings => {
+                vec!["  改的是配置文件本身,注释与排版都保留;改完要重启 daemon".into()]
+            }
         }
     }
 
@@ -386,12 +444,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     // (在哪个用户/节点上、它的订阅地址),第二行才是这一页能按的键。
     // 摘要必须和键放在一起 —— 「[d]删除」和「选中: alice」隔开摆的话,
     // 按下去之前得先抬头去表里找光标在哪。
+    // 「操作」面板的高度跟着内容走:上下边框 2 + 摘要 n 行 + 按键 1 行。
+    // **仪表盘给 0** —— 那是只读页,没有专有操作,摆一个只写着
+    // 「只读页,要动手请去别处」的空框纯属浪费四行(sb-manager 的仪表盘也没有)。
+    let ops = app.ops_lines();
+    let ops_h = if ops.is_empty() { 0 } else { ops.len() as u16 + 3 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(0),
-            Constraint::Length(4),
+            Constraint::Length(ops_h),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -413,7 +476,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Page::Users => pages::users(f, chunks[1], &app.users, app.sel[3], app.sub_base(), now),
         Page::Settings => pages::settings(f, chunks[1], &settings::all(&app.cfg), app.sel[4]),
     }
-    modal::ops_panel(f, chunks[2], &app.ops_summary(), app.ops_keys(), app.status.as_deref(), app.status_is_error);
+    if ops_h > 0 {
+        modal::ops_panel(f, chunks[2], &ops, app.ops_keys(), app.status.as_deref(), app.status_is_error);
+    }
     modal::info_bar(f, chunks[3], &app.header_line());
 
     if let Some(o) = &app.overlay {
@@ -1429,16 +1494,31 @@ mod tests {
         assert!(fi.contains("退出"), "页脚里应有退出提示:{info:?}");
         assert!(fi.contains("用户:"), "页脚里应有规模:{info:?}");
 
-        // 「操作」面板占页脚上面那 4 行,带边框和标题。
-        let ops_title = row(h as u16 - 5);
-        assert!(flat(&ops_title).contains("操作"), "该有一个带标题的操作面板:{ops_title:?}");
-        let hint = row(h as u16 - 3);
-        let fh = flat(&hint);
-        // 它**不该**再重复通用键 —— 重复正是这次要拆开的那个毛病。
-        assert!(!fh.contains("退出"), "操作面板不该重复通用键:{hint:?}");
-        assert!(!fh.contains("退出"), "底栏不该再重复通用键:{hint:?}");
+        // 仪表盘是只读页,**没有**「操作」面板 —— 页脚上面直接就是内容。
+        let above = row(h as u16 - 2);
+        assert!(!flat(&above).contains("操作"), "仪表盘不该有操作面板:{above:?}");
 
-        println!("{}\n{}\n…\n{}\n{}", first.trim_end(), second.trim_end(), info.trim_end(), hint.trim_end());
+        // 换到用户页:那里该有,而且它**不该**重复通用键 ——
+        // 重复正是这次要拆开的那个毛病。
+        let mut b = app();
+        b.page = Page::Users;
+        b.users = vec![stub_user(true)];
+        let mut term2 = Terminal::new(TestBackend::new(120, 22)).unwrap();
+        term2.draw(|f| draw(f, &b)).unwrap();
+        let buf2 = term2.backend().buffer().clone();
+        let row2 = |y: u16| -> String {
+            (0..buf2.area.width).map(|x| buf2[(x, y)].symbol().to_string()).collect()
+        };
+        // 用户页的摘要是一行,所以面板 = 边框 + 摘要 + 按键 + 边框 = 4 行,
+        // 标题那条边框在页脚往上第 4 行。
+        let ops_title = row2(h as u16 - 5);
+        assert!(flat(&ops_title).contains("操作"), "用户页该有操作面板:{ops_title:?}");
+        let keys = row2(h as u16 - 3);
+        assert!(!flat(&keys).contains("退出"), "操作面板不该重复通用键:{keys:?}");
+        assert!(flat(&keys).contains("token"), "按键行该在这儿:{keys:?}");
+
+        println!("{}
+{}", info.trim_end(), row2(h as u16 - 3).trim_end());
     }
 
     /// `[T]` 打开 token 管理,`[r]` 弹重置流量的确认框。
@@ -1515,14 +1595,93 @@ mod tests {
         a.nodes = vec![stub_node(1, "tokyo-reality")];
         a.cfg.subscription.public_base = "https://sub.example.com".into();
 
-        let mut term = Terminal::new(TestBackend::new(140, 20)).unwrap();
-        term.draw(|f| draw(f, &a)).unwrap();
-        let buf = term.backend().buffer().clone();
-        let h = buf.area.height;
-        for y in (h - 6)..h {
-            let line: String =
-                (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
-            println!("{}", line.trim_end());
+        a.nodes = vec![stub_node(1, "vless")];
+        for (label, page) in
+            [("用户页", Page::Users), ("节点页", Page::Nodes), ("仪表盘", Page::Dashboard)]
+        {
+            // 每页一个**新**终端。复用同一个 TestBackend 跨页画会留下上一页的残字:
+            // 面板高度不同,而汉字占两格,旧内容的后半格不会被覆盖。
+            let mut term = Terminal::new(TestBackend::new(140, 20)).unwrap();
+            a.page = page;
+            term.draw(|f| draw(f, &a)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let h = buf.area.height;
+            println!("── {label} ──");
+            for y in (h - 7)..h {
+                let line: String =
+                    (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                println!("{}", line.trim_end());
+            }
+            println!();
+        }
+    }
+
+    /// 「操作」摘要行要带上那几件**列里放不下、又必须看得见**的事。
+    ///
+    /// 这三条原来盯的是「详情」面板。那个面板和摘要行前半段逐字重复,
+    /// 已经去掉 —— 守卫跟着搬过来,否则删掉面板的同时也把这几条保证删了。
+    #[tokio::test]
+    async fn ops_lines_carry_what_the_table_cannot_show() {
+        // ① 中转:客户端实际连的不是节点自身端口。丢了这句会有人对着
+        //    节点端口查为什么连不上。
+        let mut a = app();
+        a.page = Page::Nodes;
+        let mut n = stub_node(1, "tokyo-reality");
+        n.params.relay = crate::model::node::RelaySetting {
+            host: "198.51.100.9".into(),
+            port: Some(12345),
+        };
+        a.nodes = vec![n];
+        let ops = a.ops_lines().join("\n");
+        assert!(ops.contains("198.51.100.9:12345"), "中转落点要显示出来:\n{ops}");
+        assert!(ops.contains("客户端连这里"), "{ops}");
+
+        // ② 订阅地址:这一页最常要看的东西(要发给用户)。
+        let mut a = app();
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+        a.cfg.subscription.public_base = "https://sub.example.com/".into();
+        let ops = a.ops_lines().join("\n");
+        assert!(ops.contains("https://sub.example.com/sub/"), "订阅地址要给全:\n{ops}");
+
+        // ③ 一个节点都没分配的用户,订阅是空的 —— 必须显眼。
+        let mut a = app();
+        a.page = Page::Users;
+        a.users = vec![data::UserRow { node_ids: vec![], ..stub_user(true) }];
+        let ops = a.ops_lines().join("\n");
+        assert!(ops.contains("未分配"), "没分配节点要说清楚:\n{ops}");
+    }
+
+    /// **摘要行绝不能渲染密钥材料**(§11.3)。
+    ///
+    /// `NodeParams` 里躺着 reality 私钥、证书私钥、ss 服务端密钥。
+    /// 摘要行现在要取 `server_name` / `path` / `relay` 这几项,取的时候
+    /// 一不小心就会把整个 params 塞进去 —— 而那是个**没有任何报错**的泄露。
+    #[tokio::test]
+    async fn ops_lines_never_leak_key_material() {
+        let mut a = app();
+        a.page = Page::Nodes;
+        let mut n = stub_node(1, "tokyo-reality");
+        n.params.private_key = Some("PRIVATE-KEY-MUST-NOT-APPEAR".into());
+        n.params.key_pem = Some("KEY-PEM-MUST-NOT-APPEAR".into());
+        n.params.ss_password = Some("SS-PASSWORD-MUST-NOT-APPEAR".into());
+        a.nodes = vec![n];
+        let ops = a.ops_lines().join("\n");
+        assert!(!ops.contains("MUST-NOT-APPEAR"), "密钥材料被写进摘要行了:\n{ops}");
+    }
+
+    /// 仪表盘**不该**有「操作」面板 —— 它是只读页,没有专有操作。
+    /// 摆一个只写着「要动手请去别处」的空框,纯粹浪费四行(sb-manager 也没有)。
+    #[tokio::test]
+    async fn the_dashboard_has_no_ops_panel() {
+        let mut a = app();
+        a.page = Page::Dashboard;
+        assert!(a.ops_lines().is_empty(), "仪表盘不该有操作摘要");
+
+        // 其余页都要有。
+        for page in [Page::Agents, Page::Nodes, Page::Users, Page::Settings] {
+            a.page = page;
+            assert!(!a.ops_lines().is_empty(), "{page:?} 该有操作摘要");
         }
     }
 
@@ -1859,8 +2018,9 @@ mod tests {
         }
         // 「操作」面板的摘要要认出选中项(token 前缀是日志对号用的,§8.1)。
         app.page = Page::Agents;
-        assert!(app.ops_summary().contains("tokyo-1"), "{}", app.ops_summary());
-        assert!(app.ops_summary().contains("token:"), "{}", app.ops_summary());
+        let ops = app.ops_lines().join(" ");
+        assert!(ops.contains("tokyo-1"), "{ops}");
+        assert!(ops.contains("token:"), "{ops}");
     }
 
     /// 编辑节点**不能动密钥材料**。这条是 §9.1 最贵的那个错误的回归锚点:

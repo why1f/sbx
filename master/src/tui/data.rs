@@ -298,15 +298,16 @@ pub struct SpeedTracker {
     rates: HashMap<i64, Rate>,
     /// 全集群速率历史,给仪表盘的折线图用。
     history: VecDeque<(f64, f64)>,
-    /// 见过的最新一次上报时间。用来判断「这一轮刷新有没有新数据」。
-    last_report_at: i64,
 }
 
 /// 速率读数保留多久。上报周期 30s,给三倍余量:
 /// 真的掉线了要变回 `--`,而不是永远挂着最后一个数字。
 const RATE_STALE_AFTER: i64 = 90;
 
-/// 折线图留多少个点。一个点 = 一轮上报(30s),120 个点 ≈ 一小时。
+/// 折线图留多少个点。**一个点 = 一次刷新**(`TICK` = 1s),120 个点 ≈ 两分钟。
+///
+/// 与 sb-manager 的 60 点 / 1 秒同一个口径。按上报记(30s 一个点)的话,
+/// 要一小时才铺满图,而在那之前图上只有几个孤点。
 pub const HISTORY_LEN: usize = 120;
 
 impl SpeedTracker {
@@ -315,25 +316,25 @@ impl SpeedTracker {
         &self.history
     }
 
-    /// 记一个历史点。
+    /// 记一个历史点。**每次刷新都记一个**,不是每轮上报记一个。
     ///
-    /// **只在真的来了新上报时记**(`report_at` 前进了)。TUI 每秒刷新一次,
-    /// 每次都记的话,一轮上报会被复制成 30 个一模一样的点 —— 图上是一条条平台,
-    /// 横轴的含义也变成了「刷新次数」而不是时间。
+    /// 早先是按上报记的(30 秒一个点),理由是「一轮上报复制成 30 个点会让横轴
+    /// 从时间变成刷新次数」。那个理由是错的:每秒一个点,横轴**就是**时间,
+    /// 一秒一格。真正的后果是图上只有个位数的点 —— 120 格的图里孤零零几个点
+    /// 挤在最左边(用户报的「变成一点点走了」),要一小时才铺满。
+    ///
+    /// 现在一次刷新一个点,两分钟铺满整幅图,和 sb-manager 的节奏一致。
+    /// 代价是底层读数每 30 秒才变一次,所以曲线是**阶梯状**的:一段平台
+    /// 接一个跳变。那不是渲染的毛病,是这个数字本来的分辨率 ——
+    /// 它是 30 秒平均值(§8.2),一个周期内保持不变才是对的。
     ///
     /// `known` 是**有速率读数的 agent 个数**。为 0 时不记点:那不是
-    /// 「全网速率是 0」,是「还没有任何可比的采样」。记了的话,刚开界面的第一帧
-    /// 会推进一个 `(0, 0)`,下一轮上报推进真实速率 —— 历史里只有两个点,
-    /// 而 ratatui 会把它们拉满整个宽度,画出一条从左下到右上的斜线,
-    /// 看起来像「流量在一小时里稳步爬升」,实际上只是两点之间的插值。
-    ///
-    /// 参数放在这里而不是让调用方自己判:调用方少判一次,图就又变回那条假斜线,
-    /// 而那是一个**看起来完全正常**的错误。
-    fn observe(&mut self, report_at: i64, up: f64, down: f64, known: usize) {
-        if known == 0 || report_at <= self.last_report_at {
+    /// 「全网速率是 0」,是「还没有任何可比的采样」。少了这条判断,刚开界面
+    /// 那几帧会记进一串 `(0, 0)`,把「还没数据」画成「速率真的是 0」。
+    fn observe(&mut self, up: f64, down: f64, known: usize) {
+        if known == 0 {
             return;
         }
-        self.last_report_at = report_at;
         if self.history.len() >= HISTORY_LEN {
             self.history.pop_front();
         }
@@ -439,11 +440,9 @@ pub async fn load_agents(
     .fetch_all(pool)
     .await?;
 
-    let mut newest_report = 0i64;
     let out: Vec<AgentRow> = rows
         .into_iter()
         .map(|r| {
-            newest_report = newest_report.max(r.updated_at);
             let (up, down) = speed.feed(
                 r.id,
                 NicSample { rx: r.last_rx, tx: r.last_tx, at: r.updated_at, boot_id: r.boot_id },
@@ -484,7 +483,7 @@ pub async fn load_agents(
     let known = out.iter().filter(|a| a.up_per_sec.is_some()).count();
     let up: f64 = out.iter().filter_map(|a| a.up_per_sec).sum();
     let down: f64 = out.iter().filter_map(|a| a.down_per_sec).sum();
-    speed.observe(newest_report, up, down, known);
+    speed.observe(up, down, known);
 
     Ok(out)
 }
@@ -676,29 +675,46 @@ mod tests {
         assert_eq!(t.feed(2, sample(600, 0, 130, "b2"), 130).0, Some(20.0));
     }
 
-    /// 折线图的点**只在真的来了新上报时**才记。
-    /// 每次刷新都记的话,一轮上报会被复制成 30 个一样的点 ——
-    /// 横轴的含义就从「时间」变成了「刷新次数」。
+    /// 折线图**每次刷新记一个点**,即使读数没变。
+    ///
+    /// 早先是每轮上报才记一个(30 秒一个点),于是 120 格的图要一小时才铺满,
+    /// 在那之前只有孤零零几个点挤在最左边。读数没变时照样记 —— 那画出来是
+    /// 一段平台,而平台正是事实:这个数字是 30 秒平均值,一个周期内本来就不变。
     #[test]
-    fn history_advances_only_on_a_new_report() {
+    fn history_advances_every_refresh() {
         let mut t = SpeedTracker::default();
-        t.observe(100, 1.0, 2.0, 1);
-        t.observe(100, 9.0, 9.0, 1); // 同一轮上报,忽略
-        t.observe(90, 9.0, 9.0, 1); // 更旧的时间戳,忽略
-        assert_eq!(t.history().len(), 1);
-        assert_eq!(t.history()[0], (1.0, 2.0));
+        // 同一个读数连记三次(上报还没换,但界面刷新了三次)。
+        t.observe(1.0, 2.0, 1);
+        t.observe(1.0, 2.0, 1);
+        t.observe(1.0, 2.0, 1);
+        assert_eq!(t.history().len(), 3, "每次刷新都该记一个点");
 
-        t.observe(130, 3.0, 4.0, 1);
-        assert_eq!(t.history().len(), 2);
-        assert_eq!(t.history()[1], (3.0, 4.0));
+        // 新读数到了。
+        t.observe(3.0, 4.0, 1);
+        assert_eq!(t.history().len(), 4);
+        assert_eq!(t.history()[3], (3.0, 4.0));
+    }
+
+    /// 两分钟就该铺满整幅图 —— 这是换成按刷新记点的全部意义。
+    ///
+    /// `TICK` 是 1 秒,`HISTORY_LEN` 是 120,所以 120 次刷新 = 两分钟。
+    /// 按上报记的话同样 120 个点要一小时,而在那之前图上都是空的。
+    #[test]
+    fn two_minutes_of_refreshes_fill_the_chart() {
+        let mut t = SpeedTracker::default();
+        let ticks = super::HISTORY_LEN;
+        for i in 0..ticks {
+            t.observe(i as f64, i as f64, 1);
+        }
+        assert_eq!(t.history().len(), super::HISTORY_LEN, "两分钟该把图铺满");
     }
 
     /// 历史是有界的,否则一个开着几天的 TUI 会一直吃内存。
-    /// 刚打开界面时,还没有任何速率读数,**不该**往图上记一个 0 点。
+    /// 刚打开界面时还没有任何速率读数,**不该**往图上记 0 点。
     ///
-    /// 记了的话:第一帧推进 `(0, 0)`,下一轮上报推进真实速率,于是历史里只有
-    /// 两个点 —— ratatui 把它们拉满整个宽度,画出一条从左下到右上的斜线。
-    /// 那条线看起来像「流量在一小时里稳步爬升」,而实际上只是两个点之间的插值。
+    /// 记了的话,开头那几帧会是一串 `(0, 0)` —— 把「还没有可比的采样」
+    /// 画成了「速率真的是 0」。这与 `up_per_sec` 用 `Option` 而不是 `0.0`
+    /// 是同一条理由。
     #[test]
     fn a_frame_with_no_readings_records_nothing() {
         let mut t = SpeedTracker::default();
@@ -707,7 +723,7 @@ mod tests {
         assert_eq!((up, down), (None, None), "第一次见到就该是 None");
         // load_agents 把所有有读数的 agent 的速率加起来,没有读数的不参与:
         // 0 个有读数 => sum 还是 0.0,但那不是「有 0.0 速率的读数」,是「没有任何读数」。
-        t.observe(100, 0.0, 0.0, 0);
+        t.observe(0.0, 0.0, 0);
         assert!(t.history().is_empty(), "没有任何读数的那一帧不该记点");
     }
 
@@ -717,7 +733,7 @@ mod tests {
 
         let mut t = SpeedTracker::default();
         for i in 0..(HISTORY_LEN as i64 * 3) {
-            t.observe(i + 1, i as f64, 0.0, 1);
+            t.observe(i as f64, 0.0, 1);
         }
         assert_eq!(t.history().len(), HISTORY_LEN);
         // 留下的是**最新**的那一段。

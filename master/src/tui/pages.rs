@@ -18,12 +18,12 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span, Text},
-    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table, Wrap},
+    widgets::{Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table},
     Frame,
 };
 use std::collections::VecDeque;
 
-use super::data::{AgentRow, BreakdownRow, NodeRow, UserRow, HISTORY_LEN};
+use super::data::{AgentRow, BreakdownRow, NodeRow, UserRow};
 use super::forms;
 use super::theme;
 
@@ -196,8 +196,9 @@ fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], us
 
 /// 上下行两张盲文点阵折线图。
 ///
-/// 一个点 = **一轮上报**(30s),不是一次刷新 —— 每次刷新都记的话,一轮上报会被
-/// 复制成 30 个一样的点,横轴的含义就从「时间」变成了「刷新次数」(data.rs::observe)。
+/// 一个点 = **一次刷新**(1s),120 点 ≈ 两分钟,与 sb-manager 同一个节奏。
+/// 底层读数每 30 秒才变一次,所以曲线是阶梯状的 —— 那是这个数字本来的分辨率
+/// (30 秒平均值,§8.2),不是渲染的毛病。
 ///
 /// 纵轴上限取历史最大值的 1.2 倍,保底 1 KB:固定上限会让小流量时的曲线永远贴着底,
 /// 而那时人恰恰想看的是「有没有波动」。
@@ -239,7 +240,7 @@ fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title
         // 一个点画不成线。直接说「在攒数据」,而不是画一张空图让人以为坏了。
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  还在攒数据(每 30 秒一个点)",
+                "  还在攒数据(每秒一个点)",
                 Style::default().fg(theme::DIM),
             )))
             .block(Block::default().borders(Borders::ALL).title(title)),
@@ -257,11 +258,14 @@ fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title
     f.render_widget(
         Chart::new(datasets)
             .block(Block::default().borders(Borders::ALL).title(title))
-            // 横轴按**容量**而不是当前点数。按点数的话,3 个点会被拉满整幅图宽,
-            // 相邻两点之间插出一条几十列长的直线 —— 那看起来像「一段平稳的趋势」,
-            // 而实际上中间什么都没发生。按容量画,曲线从左边开始随时间往右长,
-            // 空的部分就是空的,一眼能看出「才攒了这么多」。
-            .x_axis(Axis::default().bounds([0.0, HISTORY_LEN as f64]))
+            // 横轴跟着**当前点数**走,和 sb-manager 一样:曲线永远铺满整幅图宽,
+            // 攒满 120 点(两分钟)之后就变成一个往左滚的窗口。
+            //
+            // v0.3.6 这里按容量(固定 120)画过一版,是为了躲开「3 个点被拉成
+            // 一条横贯屏幕的斜线」。但那个毛病的根子在**采样太稀**(30 秒一个点),
+            // 已经在 data.rs 里改成每次刷新一个点了 —— 每秒进一个点,
+            // 图在几秒内就密起来,不再需要靠留白来遮丑。留白反而让图大半时间是空的。
+            .x_axis(Axis::default().bounds([0.0, ((data.len() - 1) as f64).max(1.0)]))
             // **不设 y 轴 labels。** 设了 ratatui 会为标签腾出一列并画一条竖线,
             // 那条竖线看起来像图里多出来的一组数据(用户就是这么报的)。
             // 上限改写进标题,那里本来就有一行字。
@@ -815,11 +819,11 @@ const NCOL_ALL: [NCol; 9] = [
 const NCOL_DROP: [NCol; 5] = [NCol::Export, NCol::Relay, NCol::Param, NCol::Id, NCol::Agent];
 
 pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
-    // 底部详情面板:列里放不下的东西(完整的 SNI、中转地址)在这里给全。
-    let c = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(4)])
-        .split(area);
+    // **没有单独的「详情」面板。** 它显示的东西(tag / 协议 / 端口 / 所属机器)
+    // 与底下「操作」面板的第一行逐字重复 —— 同一屏上把同一件事说两遍,
+    // 还各占四行。列里放不下的那几项(完整 SNI、中转落点、导出族)
+    // 现在归「操作」那一行管(mod.rs::ops_lines)。
+    let c = [area];
 
     let cols = pick(c[0].width, &NCOL_ALL, ncol_width, &NCOL_DROP);
     let table_rows: Vec<Row> = rows
@@ -868,12 +872,6 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
             .block(Block::default().borders(Borders::ALL).title(" 节点 ")),
         c[0],
     );
-    f.render_widget(
-        Paragraph::new(node_detail(rows.get(selected)))
-            .block(Block::default().borders(Borders::ALL).title(" 详情 "))
-            .wrap(Wrap { trim: false }),
-        c[1],
-    );
 }
 
 /// 该协议下最要紧的那个参数。SNI 与 path 不会同时存在(见 forms::uses_*)。
@@ -888,7 +886,7 @@ fn node_param(n: &NodeRow) -> String {
     }
 }
 
-fn relay_label(n: &NodeRow) -> Option<String> {
+pub fn relay_label(n: &NodeRow) -> Option<String> {
     if !n.params.relay.is_enabled() {
         return None;
     }
@@ -896,49 +894,6 @@ fn relay_label(n: &NodeRow) -> Option<String> {
         Some(p) => format!("{}:{}", n.params.relay.host, p),
         None => format!("{}:{}", n.params.relay.host, n.listen_port),
     })
-}
-
-fn node_detail(n: Option<&NodeRow>) -> Vec<Line<'static>> {
-    let Some(n) = n else {
-        return vec![Line::from(Span::styled(
-            "  还没有节点。按 [a] 建一个。",
-            Style::default().fg(theme::DIM),
-        ))];
-    };
-    // **只渲染人填的那几项。** params 里还有 reality 私钥、证书私钥、ss 服务端密钥,
-    // 它们不得出现在界面上(§11.3,model/node.rs 有同样的提醒)。
-    let p = crate::model::node::Protocol::parse(&n.protocol);
-    let mut spans = vec![
-        Span::styled("  #", Style::default().fg(theme::DIM)),
-        Span::styled(n.id.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(" {} · {} · 监听 {} · 在 {} 上", n.tag, n.protocol, n.listen_port, n.agent_name)),
-    ];
-    if forms::uses_sni(p) {
-        spans.push(Span::styled(
-            format!("  server_name: {}", n.params.server_name.as_deref().unwrap_or("(未设,下发时取默认)")),
-            Style::default().fg(theme::ACCENT),
-        ));
-    }
-    if forms::uses_path(p) {
-        spans.push(Span::styled(
-            format!("  path: {}", n.params.path.as_deref().unwrap_or("(未设,下发时取默认)")),
-            Style::default().fg(theme::ACCENT),
-        ));
-    }
-
-    let mut second = vec![Span::raw("  订阅导出:")];
-    match relay_label(n) {
-        Some(l) => second.push(Span::styled(
-            format!(" 中转 {l}(客户端连这里,不是节点自身端口)"),
-            Style::default().fg(theme::DOWN),
-        )),
-        None => second.push(Span::raw(format!(" {} 的 {}", n.agent_name, if n.params.ipv6 { "IPv6" } else { "IPv4" }))),
-    }
-    if n.params.port_reuse {
-        second.push(Span::styled("  · 端口复用(导出端口固定 443)", Style::default().fg(theme::DIM)));
-    }
-
-    vec![Line::from(spans), Line::from(second)]
 }
 
 // ─────────────────────────── users ───────────────────────────
@@ -1013,13 +968,10 @@ const UCOL_DROP: [UCol; 7] =
     [UCol::Mult, UCol::Reset, UCol::Up, UCol::Down, UCol::Bar, UCol::Nic, UCol::Expire];
 
 pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_base: &str, now: i64) {
-    // 绑了网卡的用户详情多一行(要说清「订阅报的不是这个数」)。
-    // 常态仍然是 4 行 —— 固定给 5 行会在矮终端上白白吃掉一行表格。
-    let detail_h = if rows.get(selected).is_some_and(|u| !u.nic_agent_ids.is_empty()) { 5 } else { 4 };
-    let c = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(detail_h)])
-        .split(area);
+    // 与节点页同理:没有单独的「详情」面板了 —— 它和「操作」面板的第一行
+    // (选中谁、分了几个节点、订阅地址)重复。绑网卡那句说明也搬去了那里。
+    let _ = sub_base;
+    let c = [area];
 
     let cols = pick(c[0].width, &UCOL_ALL, ucol_width, &UCOL_DROP);
     let today = forms::today_day(now);
@@ -1113,12 +1065,6 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
             .block(Block::default().borders(Borders::ALL).title(" 用户 ")),
         c[0],
     );
-    f.render_widget(
-        Paragraph::new(user_detail(rows.get(selected), sub_base))
-            .block(Block::default().borders(Borders::ALL).title(" 详情 "))
-            .wrap(Wrap { trim: false }),
-        c[1],
-    );
 }
 
 /// 到期列。**带上「还剩几天」** —— 光一个日期要人自己心算,
@@ -1136,53 +1082,6 @@ fn expire_cell(expire_at: Option<i64>, now: i64) -> Line<'static> {
         (forms::fmt_date(ts), Color::Reset)
     };
     Line::from(Span::styled(text, Style::default().fg(color)))
-}
-
-fn user_detail(u: Option<&UserRow>, sub_base: &str) -> Vec<Line<'static>> {
-    let Some(u) = u else {
-        return vec![Line::from(Span::styled(
-            "  还没有用户。按 [a] 建一个。",
-            Style::default().fg(theme::DIM),
-        ))];
-    };
-    let sub = if sub_base.is_empty() {
-        format!("/sub/{}(配置里没填 subscription.public_base,只能给出路径)", u.sub_token)
-    } else {
-        format!("{}/sub/{}", sub_base.trim_end_matches('/'), u.sub_token)
-    };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("  #", Style::default().fg(theme::DIM)),
-            Span::styled(u.id.to_string(), Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" {} · ", u.name)),
-            Span::styled(format!("↑ {}", theme::bytes(u.cycle_up)), Style::default().fg(theme::UP)),
-            Span::raw("  "),
-            Span::styled(
-                format!("↓ {}", theme::bytes(u.cycle_down)),
-                Style::default().fg(theme::DOWN),
-            ),
-            Span::raw(format!(
-                "  · 倍率 {:.1}x · 已分配 {} 个节点",
-                u.traffic_multiplier,
-                u.node_count()
-            )),
-        ]),
-        Line::from(vec![
-            Span::raw("  订阅: "),
-            Span::styled(sub, Style::default().fg(theme::ACCENT)),
-        ]),
-    ];
-    // 绑了网卡就必须说 —— 客户端里显示的流量和上面那一行数字不是一回事。
-    if !u.nic_agent_ids.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  订阅响应头报的是 {} 台机器的网卡用量之和,不是上面这个用户用量(§10.3)",
-                u.nic_agent_ids.len()
-            ),
-            Style::default().fg(theme::DOWN),
-        )));
-    }
-    lines
 }
 
 // ─────────────────────────── 设置 ───────────────────────────
@@ -1609,37 +1508,15 @@ mod tests {
         assert!(has_cjk(&out, "永久"), "{out}");
     }
 
-    /// 一个节点都没分配的用户,订阅是空的 —— 这一格必须显眼。
-    #[test]
-    fn users_without_nodes_are_visible() {
-        let u = UserRow { node_ids: vec![], ..user() };
-        let out = draw_to_string(120, 10, |f| users(f, f.area(), &[u], 0, "", NOW));
-        assert!(has_cjk(&out, "已分配 0 个节点"), "详情里要说清楚:\n{out}");
-    }
+    // 「订阅地址」「中转落点」「没分配节点」这三条搬去了 mod.rs ——
+    // 它们现在由「操作」面板的摘要行负责(`App::ops_lines`),
+    // 而这一层只剩表格。
 
-    /// 详情面板给的是订阅地址,**不是**任何凭据。
-    #[test]
-    fn user_detail_shows_the_subscription_url() {
-        let out = draw_to_string(120, 10, |f| {
-            users(f, f.area(), &[user()], 0, "https://sub.example.com/", NOW)
-        });
-        assert!(out.contains("https://sub.example.com/sub/tok"), "{out}");
-    }
-
-    /// 节点页要能看出「客户端到底会连到哪儿」:中转配了就显示中转。
-    #[test]
-    fn node_page_shows_where_clients_actually_connect() {
-        let mut n = node();
-        n.params.relay = crate::model::node::RelaySetting {
-            host: "198.51.100.9".into(),
-            port: Some(12345),
-        };
-        let out = draw_to_string(120, 8, |f| nodes(f, f.area(), &[n], 0));
-        assert!(out.contains("198.51.100.9:12345"), "中转落点要显示出来:\n{out}");
-        assert!(has_cjk(&out, "客户端连这里"), "{out}");
-    }
-
-    /// 节点详情**绝不能**渲染密钥材料。这条测试守的是 §11.3。
+    /// 节点**表格**绝不能渲染密钥材料(§11.3)。
+    ///
+    /// 摘要行那一侧由 `mod.rs::ops_lines_never_leak_key_material` 守 ——
+    /// 详情面板去掉之后,那些字段搬到了摘要行,守卫也要跟着搬,
+    /// 不然这条 §11.3 就只剩半边。
     #[test]
     fn node_detail_never_leaks_key_material() {
         let mut n = node();
@@ -1813,15 +1690,18 @@ mod tests {
         }));
     }
 
-    /// 网速图不该有竖线,稀疏数据也不该被拉满整幅宽度。
+    /// 网速图:不该有轴线竖线,而且**从第一帧起就铺满整幅图宽**。
     ///
-    /// 两个毛病都是用户报的:
-    ///   * 竖线 —— 设了 y 轴 labels,ratatui 会腾一列画轴线,看起来像多出一组数据;
-    ///   * 「两组数据」—— 横轴按点数,3 个点就被拉满整幅图宽,相邻点之间
-    ///     插出几十列长的直线,看着像两段独立的曲线。
+    /// 竖线那一条是用户报的:设了 y 轴 labels 之后 ratatui 会腾一列画轴线,
+    /// 看起来像图里多出来的一组数据。峰值改写进标题就不需要那一列了。
+    ///
+    /// 铺满那一条是 sb-manager 的行为:横轴跟着当前点数走,曲线永远占满宽度,
+    /// 攒满之后变成往左滚的窗口。v0.3.6 一度改成按固定容量画(右边留白),
+    /// 结果图上大半时间是空的 —— 那是在拿留白遮「采样太稀」的丑,
+    /// 而真正的根子已经在 data.rs 里治了(改成每次刷新采一个点)。
     #[test]
-    fn net_chart_has_no_axis_line_and_does_not_stretch() {
-        // 只有 4 个点(才跑了两分钟)。
+    fn net_chart_has_no_axis_line_and_fills_the_width() {
+        // 才跑了几秒,只有 4 个点。
         let hist: VecDeque<(f64, f64)> =
             vec![(1000.0, 2000.0), (1500.0, 2500.0), (900.0, 1800.0), (1200.0, 2200.0)]
                 .into_iter()
@@ -1834,25 +1714,25 @@ mod tests {
         // 竖线:框内不该有 `│`。左右两个图各有自己的边框,那是 `┌│└`,
         // 出现在行首/行尾;轴线会出现在**内容区里**。
         for line in out.lines() {
-            let inner: String = line.chars().skip(1).take(line.chars().count().saturating_sub(2)).collect();
+            let inner: String =
+                line.chars().skip(1).take(line.chars().count().saturating_sub(2)).collect();
             let inner = inner.replace("││", ""); // 两图相邻处的边框
-            assert!(!inner.contains('│'), "图里不该有轴线竖线:
-{out}");
+            assert!(!inner.contains('│'), "图里不该有轴线竖线:\n{out}");
         }
 
         // 峰值写进标题(原来在 y 轴 labels 里)。
-        assert!(has_cjk(&out, "峰值"), "标题里该有峰值:
-{out}");
+        assert!(has_cjk(&out, "峰值"), "标题里该有峰值:\n{out}");
 
-        // 稀疏数据不该铺满:4 个点在 120 点的容量里只占最左边一小段,
-        // 右边大半应当是空的。
-        let last = out.lines().nth(4).unwrap_or("");
-        let right: String = last.chars().skip(last.chars().count() * 2 / 3).collect();
-        assert!(
-            right.chars().all(|c| c == ' ' || c == '│' || c == '─' || c == '┐' || c == '┘'),
-            "4 个点不该被拉到图的右边:
-{out}"
-        );
+        // 铺满:曲线要一直画到右半边去,而不是缩在左下角。
+        let braille = |s: &str| s.chars().filter(|c| ('\u{2800}'..='\u{28FF}').contains(c)).count();
+        let right_half: usize = out
+            .lines()
+            .map(|l| {
+                let n = l.chars().count();
+                braille(&l.chars().skip(n / 2).collect::<String>())
+            })
+            .sum();
+        assert!(right_half > 0, "曲线该铺到右半边(和 sb-manager 一样):\n{out}");
     }
 
     /// 节点视图**不该有进度条**。
