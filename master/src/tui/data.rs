@@ -20,6 +20,8 @@ pub struct AgentRow {
     pub token_prefix: String,
     pub status: String,
     pub agent_version: Option<String>,
+    /// `runtime.GOARCH`。升级时靠它挑对产物 —— release 只出 amd64 / arm64。
+    pub arch: Option<String>,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub nic_quota_bytes: Option<i64>,
@@ -404,6 +406,7 @@ struct AgentQueryRow {
     token_prefix: String,
     status: String,
     agent_version: Option<String>,
+    arch: Option<String>,
     ipv4: Option<String>,
     ipv6: Option<String>,
     nic_quota_bytes: Option<i64>,
@@ -431,7 +434,7 @@ pub async fn load_agents(
     // LEFT JOIN:从没上报过的 agent 也要出现在列表里(值为 0),
     // 否则「加了但还没连上」的那台会直接看不见,而那正是最需要排查的一台。
     let rows: Vec<AgentQueryRow> = sqlx::query_as(
-        "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.ipv4, a.ipv6,
+        "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.arch, a.ipv4, a.ipv6,
                 a.nic_quota_bytes, a.nic_reset_day,
                 a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
                 t.boot_id,
@@ -465,6 +468,7 @@ pub async fn load_agents(
                 token_prefix: r.token_prefix,
                 status: r.status,
                 agent_version: r.agent_version,
+                arch: r.arch,
                 ipv4: r.ipv4,
                 ipv6: r.ipv6,
                 nic_quota_bytes: r.nic_quota_bytes,
@@ -772,6 +776,7 @@ mod tests {
             token_prefix: "abcd1234".into(),
             status: "online".into(),
             agent_version: None,
+            arch: Some("amd64".into()),
             ipv4: None,
             ipv6: None,
             nic_quota_bytes: None,

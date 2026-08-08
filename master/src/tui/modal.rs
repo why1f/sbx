@@ -88,6 +88,8 @@ pub enum Action {
     RevokeSubToken { user_id: i64, user: String },
     /// 手动清零本周期流量。**不动**月重置日期。
     ResetUserTraffic { user_id: i64, user: String },
+    /// 升级一台 agent(`None` = 在线的全部升)。
+    UpgradeAgents { only: Option<i64>, name: String },
 }
 
 /// 节点表单填出来的东西。密钥材料**不在这里** —— 新增时由 `secrets::fill` 生成,
@@ -311,6 +313,18 @@ pub enum Modal {
         /// 复制之后的回执,渲染在框里。
         copied: Option<String>,
     },
+    /// 升级 agent:`[u]` 只升这一台、`[a]` 在线的全部升。
+    ///
+    /// 与 `Confirm` 一样是破坏性动作,但这里有**两个**互斥的选择,
+    /// 而 `Confirm` 只能带一个。两者的影响面差一个数量级,所以必须让人
+    /// 在按下去之前就看见自己选的是哪个。
+    Upgrade {
+        agent_id: i64,
+        name: String,
+        /// 在线的 agent 台数。「全部升」实际会碰几台,得写出来。
+        online: usize,
+        version: String,
+    },
     /// 订阅 token 管理:`[g]` 重新生成、`[v]` 撤销。
     ///
     /// 为什么不用 `Confirm`:这里有**两个**互斥的破坏性动作,而 `Confirm`
@@ -375,6 +389,19 @@ impl Modal {
             Modal::Confirm { action, .. } => match k.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Outcome::Run(action.clone()),
                 _ => Outcome::Close(Some("已取消".into())),
+            },
+
+            // 升级 agent。只认那两个字母,别的键一律关掉 —— 与 Confirm 同理:
+            // 「全部升级」会让整个集群依次重启,不该有手滑的可能。
+            Modal::Upgrade { agent_id, name, .. } => match k.code {
+                KeyCode::Char('u') | KeyCode::Char('U') => Outcome::Run(Action::UpgradeAgents {
+                    only: Some(*agent_id),
+                    name: name.clone(),
+                }),
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    Outcome::Run(Action::UpgradeAgents { only: None, name: name.clone() })
+                }
+                _ => Outcome::Close(None),
             },
 
             // token 管理。两个动作都是**不可撤销**的,所以只认那两个字母,
@@ -556,6 +583,47 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" {title} "))
+                        .border_style(Style::default().fg(theme::ACCENT)),
+                ),
+                rect,
+            );
+        }
+
+        Modal::Upgrade { name, online, version, .. } => {
+            let w = 72.min(area.width.max(1));
+            let h = 12u16.min(area.height.max(1));
+            let rect = centered(area, 0, 0, w, h);
+            f.render_widget(Clear, rect);
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::raw("  升级到 "),
+                    Span::styled(
+                        format!("v{version}"),
+                        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("(主控自己的版本)", Style::default().fg(theme::DIM)),
+                ]),
+                Line::from(""),
+                Line::from(format!("  [u]  只升级 {name}")),
+                Line::from(format!("  [a]  升级在线的全部 {online} 台")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  升完 agent 会替换自己的二进制并退出,由 systemd 拉起新的。",
+                    Style::default().fg(theme::DIM),
+                )),
+                Line::from(Span::styled(
+                    "  期间那台机器上的代理会断几秒。离线的机器跳过。",
+                    Style::default().fg(theme::DIM),
+                )),
+                Line::from(""),
+                Line::from(Span::styled("  [Esc/任意键] 取消", Style::default().fg(theme::DIM))),
+            ];
+            f.render_widget(
+                Paragraph::new(lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" 升级 agent ")
                         .border_style(Style::default().fg(theme::ACCENT)),
                 ),
                 rect,

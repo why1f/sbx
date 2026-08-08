@@ -85,6 +85,9 @@ struct App {
     overlay: Option<Overlay>,
     /// 一次性消息(某个操作的结果)。为 `None` 时状态栏显示当前页的快捷键
     /// 与选中项摘要 —— 那是**常驻**信息,不该被上一次操作的回执长期占着。
+    /// 还没下发完的升级指令条数。TUI 只入队,真正下发在 daemon 那边(隔一拍),
+    /// 不显示的话人按完 [u] 会觉得什么都没发生。
+    pending_cmds: i64,
     status: Option<String>,
     status_is_error: bool,
     quit: bool,
@@ -105,6 +108,7 @@ impl App {
             modal: None,
             overlay: None,
             probed_ip: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_cmds: 0,
             status: None,
             status_is_error: false,
             quit: false,
@@ -171,7 +175,7 @@ impl App {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
                 Some(a) => vec![format!(
-                    "  选中: {}  token: {}…  节点: {} 个  状态: {}",
+                    "  选中: {}  token: {}…  节点: {} 个  状态: {}{}",
                     a.name,
                     a.token_prefix,
                     a.node_count,
@@ -179,6 +183,11 @@ impl App {
                         "online" => "● 在线",
                         "offline" => "● 离线",
                         _ => "○ 从未连接",
+                    },
+                    if self.pending_cmds > 0 {
+                        format!("   ⋯ {} 条升级待下发", self.pending_cmds)
+                    } else {
+                        String::new()
                     }
                 )],
                 None => vec!["  (还没有被控服务器,按 [a] 加一台)".into()],
@@ -275,7 +284,9 @@ impl App {
     fn ops_keys(&self) -> &'static str {
         match self.page {
             Page::Dashboard => "",
-            Page::Agents => "  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [r]轮换token  [d]删除",
+            Page::Agents => {
+                "  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
+            }
             Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除",
             Page::Users => {
                 "  [a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [T]token  [r]重置流量  [t]启/停  [s]订阅  [d]删除"
@@ -289,6 +300,7 @@ impl App {
         self.agents = data::load_agents(&self.pool, &mut self.speed, now).await?;
         self.nodes = data::load_nodes(&self.pool).await?;
         self.users = data::load_users(&self.pool).await?;
+        self.pending_cmds = crate::db::command_repo::pending_count(&self.pool).await.unwrap_or(0);
         // 删掉最后一行之后光标会落在表外,下一帧渲染就会读到不存在的下标。
         let lens =
             [0, self.agents.len(), self.nodes.len(), self.users.len(), settings::all(&self.cfg).len()];
@@ -583,6 +595,20 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                 }
                 None => app.fail("没有选中任何被控服务器"),
             },
+            // 小写 u:升级 agent。大写 U 是主控自升级(全局键)——
+            // 两者影响面差一个数量级(一台被控 vs 主控自己),不该共用一个键。
+            KeyCode::Char('u') => match app.selected_agent() {
+                Some(a) => {
+                    let online = app.agents.iter().filter(|x| x.status == "online").count();
+                    app.modal = Some(Modal::Upgrade {
+                        agent_id: a.id,
+                        name: a.name.clone(),
+                        online,
+                        version: crate::upgrade::target_version().to_string(),
+                    });
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
             KeyCode::Char('r') => {
                 if let Some(a) = app.selected_agent() {
                     let (id, name) = (a.id, a.name.clone());
@@ -769,6 +795,87 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
         }
     }
     None
+}
+
+/// 把 `agent.upgrade` **放进队列**,由 daemon 取走下发。
+///
+/// **TUI 不能自己发 RPC。** 它和 daemon 是两个进程,WS 连接活在 daemon 里
+/// (模块头那段说明的直接后果)。所以这里只做主控侧知道的那部分 ——
+/// 升到哪个版本、产物在哪、校验和是多少 —— 拼好塞进 `agent_commands`,
+/// daemon 的巡检循环下一拍取走执行。
+///
+/// 两件事在入队**之前**做完,任一步失败就不入队:
+///   1. 认架构:release 只出 amd64 / arm64,别的架构没有产物;
+///   2. 取 sha256:它是 agent 侧唯一能挡住「下到坏文件就替换自己」的东西
+///      (`agent/master/conn.go` 的 `replaceExecutable`),取不到宁可不升。
+///
+/// 离线的机器直接跳过。升级是**一次性指令**而不是状态,不会在它下次重连时
+/// 补发 —— 所以回执里必须把跳过的台数说出来,否则人会以为全升了。
+async fn upgrade_agents(app: &mut App, only: Option<i64>, name: &str) -> Result<String> {
+    let version = crate::upgrade::target_version();
+    let now = chrono::Local::now().timestamp();
+
+    let targets: Vec<(i64, String, Option<String>, String)> = app
+        .agents
+        .iter()
+        .filter(|a| match only {
+            Some(id) => a.id == id,
+            None => a.status == "online",
+        })
+        .map(|a| (a.id, a.name.clone(), a.arch.clone(), a.status.clone()))
+        .collect();
+    if targets.is_empty() {
+        return Ok(if only.is_some() {
+            format!("{name} 不在了,按 [R] 刷新")
+        } else {
+            "没有在线的被控服务器可升级".into()
+        });
+    }
+
+    // sha256 按**架构**取,不是按台取:同一架构的产物是同一个文件,
+    // 十台 arm64 没必要把同一个 .sha256 拉十遍。
+    let mut sums: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let (mut queued, mut offline, mut failed) = (0usize, 0usize, Vec::<String>::new());
+
+    for (id, aname, arch, status) in targets {
+        if status != "online" {
+            offline += 1;
+            continue;
+        }
+        let Some(a) = arch.as_deref().and_then(crate::upgrade::normalize_arch) else {
+            failed.push(format!(
+                "{aname}(架构 {} 没有发布产物)",
+                arch.as_deref().unwrap_or("未知")
+            ));
+            continue;
+        };
+        let url = crate::upgrade::agent_asset_url(version, a);
+        if !sums.contains_key(a) {
+            match crate::upgrade::fetch_sha256(&url).await {
+                Ok(sum) => {
+                    sums.insert(a.to_string(), sum);
+                }
+                Err(e) => {
+                    failed.push(format!("{aname}(取校验和失败:{e})"));
+                    continue;
+                }
+            }
+        }
+        let payload = serde_json::json!({ "url": url, "sha256": sums[a] });
+        match crate::db::command_repo::enqueue(&app.pool, id, "upgrade", &payload, now).await {
+            Ok(_) => queued += 1,
+            Err(e) => failed.push(format!("{aname}({e})")),
+        }
+    }
+
+    let mut msg = format!("已排队 {queued} 台升级到 v{version}(由 daemon 下发)");
+    if offline > 0 {
+        msg.push_str(&format!(",跳过 {offline} 台离线的"));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!(";失败:{}", failed.join("、")));
+    }
+    Ok(msg)
 }
 
 /// 「这条订阅怎么用」。
@@ -1149,6 +1256,8 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             node_repo::reset_user_traffic(&app.pool, *user_id).await?;
             Ok(format!("{user} 的本周期流量已清零(月重置日期没动)"))
         }
+
+        Action::UpgradeAgents { only, name } => upgrade_agents(app, *only, name).await,
 
         // 刷新本身在主循环里做(每个动作之后都会 refresh 一次),这里只给回执。
         Action::Refresh => Ok("已刷新".into()),
@@ -1883,6 +1992,7 @@ mod tests {
             token_prefix: "abcd1234".into(),
             status: "online".into(),
             agent_version: None,
+            arch: Some("amd64".into()),
             ipv4: None,
             ipv6: None,
             nic_quota_bytes: None,

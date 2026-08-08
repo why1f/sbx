@@ -341,6 +341,57 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
 /// `tg` 是可选的 Telegram 事件通道。每轮把各用户的用量百分比丢过去,
 /// **去重(哪一档已经通知过)是 bot 那边的事** —— 巡检只负责报现状,
 /// 让它同时管「判定」和「通知节流」会把两件独立的策略缠在一起。
+/// 取走 TUI 排进来的一次性指令并下发(目前只有 agent 升级)。
+///
+/// 放在巡检循环里而不是另起一个任务:它要的东西(registry、rpc、pool)
+/// 这里全都现成,而且这类指令本来就不追求秒级延迟 —— 排进去之后
+/// 下一拍(默认 30 秒)发出去即可。
+///
+/// **一条失败不影响其余。** 十台里有一台取不到产物,另外九台照升;
+/// 失败原因写回那一行,界面上能看到「为什么这台还是旧版本」。
+async fn drain_commands(
+    pool: &SqlitePool,
+    registry: &std::sync::Arc<tokio::sync::Mutex<crate::cluster::Registry>>,
+    rpc: &crate::cluster::Rpc,
+    now: i64,
+) -> Result<usize> {
+    let pending = crate::db::command_repo::take_pending(pool, now).await?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut done = 0usize;
+    for cmd in pending {
+        let method = match cmd.kind.as_str() {
+            "upgrade" => sbx_shared::method::AGENT_UPGRADE,
+            other => {
+                // 不认识的指令要**记下来**再丢掉。静默丢弃会让人对着一个
+                // 永远「待办」的队列发懵。
+                let msg = format!("不认识的指令类型:{other}");
+                tracing::warn!(id = cmd.id, kind = other, "丢弃不认识的指令");
+                let _ =
+                    crate::db::command_repo::finish(pool, cmd.id, Some(&msg), now).await;
+                continue;
+            }
+        };
+        let payload: serde_json::Value =
+            serde_json::from_str(&cmd.payload_json).unwrap_or(serde_json::Value::Null);
+        let result = rpc.call_default(registry, cmd.agent_id, method, payload).await;
+        let err = match &result {
+            Ok(_) => {
+                done += 1;
+                tracing::info!(agent_id = cmd.agent_id, kind = %cmd.kind, "指令已下发");
+                None
+            }
+            Err(e) => {
+                tracing::warn!(agent_id = cmd.agent_id, kind = %cmd.kind, error = %e, "指令下发失败");
+                Some(e.to_string())
+            }
+        };
+        crate::db::command_repo::finish(pool, cmd.id, err.as_deref(), now).await?;
+    }
+    Ok(done)
+}
+
 pub fn spawn(
     state: crate::cluster::ServerState,
     interval_secs: u64,
@@ -365,6 +416,14 @@ pub fn spawn(
                 // 单轮失败不该终止循环:下一轮 30s 后照常跑。
                 Err(e) => tracing::error!(error = %e, "配额巡检失败"),
             }
+            // TUI 排进来的一次性指令(升级)。与配额巡检分开做:
+            // 它失败了不该把巡检那一半也带下水。
+            match drain_commands(&state.pool, &state.registry, &state.rpc, now).await {
+                Ok(n) if n > 0 => tracing::info!(count = n, "已下发排队的指令"),
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "取排队指令失败"),
+            }
+
             if let Some(tx) = &tg {
                 if let Err(e) = report_usage(&state.pool, tx).await {
                     tracing::warn!(error = %e, "推送用量给 Telegram 失败");

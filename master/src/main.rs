@@ -22,6 +22,7 @@ mod supervisor;
 mod tg;
 mod tls;
 mod tui;
+mod upgrade;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

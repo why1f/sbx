@@ -4,6 +4,7 @@
 //!   1. 迁移必须**在建池之前**用一条独立连接跑完;
 //!   2. 每个版本的所有语句在**一个事务**里跑,不会停在「加了一半列」的中间态。
 
+pub mod command_repo;
 pub mod agent_repo;
 pub mod node_repo;
 
@@ -25,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/004_agent_host_metrics.sql"),
     include_str!("migrations/005_user_nic_bindings.sql"),
     include_str!("migrations/006_default_multiplier_two.sql"),
+    include_str!("migrations/007_agent_commands.sql"),
 ];
 
 /// 当前程序期望的 schema 版本(= 迁移脚本数量),供 doctor 比对实际库版本。
