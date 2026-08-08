@@ -1268,12 +1268,11 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             };
             // 与 CLI 走同一条路:密钥材料在**建节点时**生成一次(§9.1)。
             crate::secrets::fill(d.protocol, &mut params)?;
-            let (id, rev) =
+            // revision 推进了但**不写进回执**:那是个内部计数器,每改一次加一,
+            // 摆给人看只是一串越来越大的噪音。要紧的是「什么时候生效」。
+            let (id, _rev) =
                 node_repo::add_node(&app.pool, d.agent_id, &d.tag, d.protocol, d.port, &params).await?;
-            Ok(format!(
-                "已新增节点 #{id} {}(agent #{} 的 config_revision → {rev};在线的会重建 box)",
-                d.tag, d.agent_id
-            ))
+            Ok(format!("已新增节点 #{id} {},在线的机器会重建 box", d.tag))
         }
 
         Action::EditNode { id, draft } => {
@@ -1297,13 +1296,13 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             crate::secrets::fill(draft.protocol, &mut params)?;
 
             let tag = node.tag.clone();
-            let (agent_id, rev) = node_repo::update_node(&app.pool, *id, draft.port, &params).await?;
-            Ok(format!("已保存节点 {tag}(agent #{agent_id} 的 config_revision → {rev})"))
+            let (_agent_id, _rev) = node_repo::update_node(&app.pool, *id, draft.port, &params).await?;
+            Ok(format!("已保存节点 {tag},由 daemon 下发生效"))
         }
 
         Action::DeleteNode { id, tag } => {
-            let (agent_id, rev) = node_repo::delete_node(&app.pool, *id).await?;
-            Ok(format!("已删除节点 {tag}(agent #{agent_id} → rev {rev})"))
+            let (_agent_id, _rev) = node_repo::delete_node(&app.pool, *id).await?;
+            Ok(format!("已删除节点 {tag},由 daemon 下发生效"))
         }
 
         Action::AddUser { name, quota_gb } => {
@@ -1423,13 +1422,11 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         }
 
         Action::SetOutbound { id, name, strategy } => {
-            let rev = crate::db::agent_repo::set_outbound_strategy(&app.pool, *id, *strategy).await?;
-            // 说清「什么时候生效」:TUI 只改库,下发由 daemon 在下次握手或
-            // 下发时做(§4.1)。不说的话人会盯着机器看为什么没变。
-            Ok(format!(
-                "{name} 的出站策略改成「{}」(配置版本 {rev},由 daemon 下发)",
-                strategy.label()
-            ))
+            // revision 推进了,但**不写进回执**:那是个内部计数器,每改一次加一,
+            // 对着人显示只是一串越来越大的噪音。要紧的是「什么时候生效」——
+            // TUI 只改库,下发由 daemon 在下次握手或下发时做(§4.1)。
+            crate::db::agent_repo::set_outbound_strategy(&app.pool, *id, *strategy).await?;
+            Ok(format!("{name} 的出站策略改成「{}」,由 daemon 下发生效", strategy.label()))
         }
 
         Action::UpgradeAgents { only, name } => upgrade_agents(app, *only, name).await,
@@ -2530,7 +2527,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(msg.contains("config_revision"), "{msg}");
+        // 回执要说清「什么时候生效」——TUI 只改库,下发是 daemon 的事。
+        // (原来这里断言的是 "config_revision",那只是把内部计数器摆给人看,
+        //  已经从回执里去掉了。)
+        assert!(msg.contains("生效"), "{msg}");
 
         app.refresh().await.unwrap();
         let n = &app.nodes[0];

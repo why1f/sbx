@@ -606,6 +606,10 @@ const TRAFFIC_COL: u16 = 38;
 /// 它是最锦上添花的一列,不该从流量或重置日那里抢地方。
 const HOST_COL: u16 = 22;
 
+/// 出站策略列。最长的取值是「自动(跟随系统解析)」,但列表里用短名
+/// (「自动」/「优先v4」…),10 列够放。
+const OUTBOUND_COL: u16 = 10;
+
 /// agents 页的列宽。进度条是**可牺牲**的那一项:
 /// 重置日是信息,进度条只是同一份信息的图形化。
 #[derive(Clone, Copy)]
@@ -616,6 +620,11 @@ struct Cols {
     traffic: u16,
     /// 0 = 放不下,整列不画。
     host: u16,
+    /// 出站策略列。0 = 放不下,整列不画。
+    ///
+    /// 它值得占一列而不是只写在底部摘要里:摘要那一行会被操作回执顶掉,
+    /// 于是「按完 [o] 想确认改对没有」恰恰是看不到它的那一刻。
+    outbound: u16,
     /// 0 = 窄到画不下,只显示重置日文字。
     bar: usize,
 }
@@ -647,10 +656,14 @@ fn columns(total_width: u16) -> Cols {
     // 主机列多占一个列间隔,所以门槛比它自身宽一格。
     let host = if avail > ideal_sum + HOST_COL { HOST_COL } else { 0 };
 
+    // 出站策略列排在主机列**前面**让位:主机那两个数字(CPU/内存)是锦上添花,
+    // 而出站策略是一个「改了就得确认」的设置项 —— 窄屏上先保它。
+    let outbound = if avail > ideal_sum + OUTBOUND_COL { OUTBOUND_COL } else { 0 };
+
     // 进度条用流量列里除去重置日之后剩下的地方。剩不下 4 格就别画了:
     // 三四格的条读不出比例,只是占地方 —— 那时改用文字百分比。
     let bar = traffic.saturating_sub(RESET_LABEL_COLS).min(20) as usize;
-    Cols { name, ip, speed, traffic, host, bar: if bar < 4 { 0 } else { bar } }
+    Cols { name, ip, speed, traffic, host, outbound, bar: if bar < 4 { 0 } else { bar } }
 }
 
 pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now: i64) {
@@ -769,7 +782,25 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
                 )),
             ]));
 
+            // 出站策略:第一行是当前值,第二行提示怎么改。
+            // 第二行不是废话 —— 这一列是只读的表格,不写的话没人知道
+            // 它能改、更不知道按哪个键。
+            let outbound_cell = Cell::from(Text::from(vec![
+                Line::from(Span::styled(
+                    a.outbound.short(),
+                    Style::default().fg(if a.outbound == crate::model::outbound::OutboundStrategy::Auto {
+                        theme::DIM
+                    } else {
+                        theme::ACCENT
+                    }),
+                )),
+                Line::from(Span::styled("[o] 改", Style::default().fg(theme::DIM))),
+            ]));
+
             let mut cells = vec![name_cell, ip_cell, speed_cell, Cell::from(Text::from(vec![line1, line2]))];
+            if c.outbound > 0 {
+                cells.push(outbound_cell);
+            }
             if c.host > 0 {
                 cells.push(host_cell);
             }
@@ -785,6 +816,10 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
         Constraint::Length(c.traffic),
     ];
     let mut titles = vec!["名称 / 版本", "IP 地址", "网速", "流量"];
+    if c.outbound > 0 {
+        constraints.push(Constraint::Length(c.outbound));
+        titles.push("出站");
+    }
     if c.host > 0 {
         constraints.push(Constraint::Length(c.host));
         titles.push("主机");
@@ -1461,6 +1496,51 @@ mod tests {
             });
             draw_to_string(w, h, |f| breakdown(f, f.area(), "t", "h", &[], &[]));
         }
+    }
+
+    /// 出站策略要有**自己一列**,不能只写在底部摘要里。
+    ///
+    /// 摘要那一行会被操作回执顶掉 —— 而「按完 [o] 想确认改对没有」恰恰就是
+    /// 回执还挂着的那一刻。这条是用起来才发现的:操作完选中态一丢,
+    /// 就没地方看当前策略了。
+    #[test]
+    fn the_agents_table_has_an_outbound_column() {
+        use crate::model::outbound::OutboundStrategy;
+
+        let rows = vec![
+            AgentRow { outbound: OutboundStrategy::Ipv6Only, ..agent(None, None) },
+            AgentRow {
+                outbound: OutboundStrategy::PreferIpv4,
+                name: "osaka".into(),
+                ..agent(None, None)
+            },
+        ];
+        let out = draw_to_string(120, 8, |f| agents(f, f.area(), &rows, 0, NOW));
+        assert!(has_cjk(&out, "出站"), "该有表头:\n{out}");
+        assert!(has_cjk(&out, "仅 v6"), "该显示当前策略:\n{out}");
+        assert!(has_cjk(&out, "优先v4"), "第二行也要显示自己的:\n{out}");
+        // 这一列是只读表格,不写按键的话没人知道它能改。
+        assert!(out.contains("[o]"), "该提示怎么改:\n{out}");
+    }
+
+    /// 窄屏上出站策略比主机列**先保**:CPU/内存是锦上添花,
+    /// 而出站策略是一个「改了就得确认」的设置项。
+    #[test]
+    fn the_outbound_column_outranks_the_host_column() {
+        // 120 列:出站在、主机不在(主机要 140 才画得下)。
+        let c = super::columns(120);
+        assert!(c.outbound > 0, "120 列该画得下出站列");
+        assert_eq!(c.host, 0, "120 列还画不下主机列");
+
+        // 140 列:两个都在。
+        let c = super::columns(140);
+        assert!(c.outbound > 0 && c.host > 0, "140 列两个都该有");
+
+        // 极窄:两个都让掉,但表格本身还得能画(不 panic)。
+        let c = super::columns(70);
+        assert_eq!((c.outbound, c.host), (0, 0), "70 列该把两个都让掉");
+        let out = draw_to_string(70, 6, |f| agents(f, f.area(), &[agent(None, None)], 0, NOW));
+        assert!(!out.is_empty());
     }
 
     /// §13.4:80 列的窄终端下,**重置日不能被截断**,IPv6 要留住省略号。

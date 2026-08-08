@@ -57,6 +57,18 @@ impl OutboundStrategy {
         }
     }
 
+    /// 表格里那一列用的短名 —— 完整说法(「自动(跟随系统解析)」)有 14 列宽,
+    /// 摆进列表会把别的列挤没。
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Auto => "自动",
+            Self::PreferIpv4 => "优先v4",
+            Self::PreferIpv6 => "优先v6",
+            Self::Ipv4Only => "仅 v4",
+            Self::Ipv6Only => "仅 v6",
+        }
+    }
+
     /// 界面上的说法。
     pub fn label(self) -> &'static str {
         match self {
