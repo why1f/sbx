@@ -88,3 +88,54 @@ func TestRealityGoldenHasNoPublicKey(t *testing.T) {
 		t.Error("reality inbound 缺 private_key")
 	}
 }
+
+// 出站地址族策略的 golden(§9.1 同一条契约,范围不同)。
+//
+// 上面那组只有 inbound;这组是**整份配置** —— 出站策略写的是顶层 route / dns。
+// 要盯的三件事都只有真 sing-box 能答:
+//  1. `route.default_domain_resolver` 的字段名对不对(1.12.0 引入);
+//  2. 它 `server` 指向的 tag 在 dns.servers 里存不存在(指不到就起不来);
+//  3. `dns.servers` 用的是 1.12+ 的 `{"type":"local"}` 而不是已移除的
+//     `{"address":"local"}`。
+//
+// 另外直接断言配置里没有 `domain_strategy`。那个字段 1.14.0 已移除,而这里
+// require 的就是 1.14.0-beta.3 —— 但它**移除得没有声音**:实测 Check 会照常
+// 返回 nil,字段被静默丢掉。所以这一条不能指望 sing-box 帮我们发现,
+// 只能在这里自己按字符串挡:线上写错了是不会有任何报错的。
+const outboundGoldenDir = "../../master/testdata/outbound"
+
+func TestOutboundStrategyConfigsAreAccepted(t *testing.T) {
+	entries, err := os.ReadDir(outboundGoldenDir)
+	if err != nil {
+		t.Skipf("读不到 %s(不在完整仓库里?): %v", outboundGoldenDir, err)
+	}
+
+	c := New(nil)
+	found := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue // 跳过 .json.actual 之类的中间产物
+		}
+		found++
+		t.Run(strings.TrimSuffix(name, ".json"), func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join(outboundGoldenDir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(raw), "domain_strategy") {
+				t.Fatalf("%s 里出现了 domain_strategy —— 该字段 1.14.0 已移除,"+
+					"且是被静默丢掉(Check 仍然通过),线上不会有任何报错,"+
+					"表现只是「策略改了但没生效」", name)
+			}
+			// 这里的 golden 已经是整份配置(带 log/inbounds/outbounds),
+			// 不像 inbound 那组还要现包一层。
+			if err := c.Check(raw); err != nil {
+				t.Fatalf("sing-box 拒绝了 %s:%v\n%s", name, err, raw)
+			}
+		})
+	}
+	if found == 0 {
+		t.Fatal("一个 golden 都没读到 —— 先在 master 侧跑 outbound_strategies_match_golden_configs")
+	}
+}

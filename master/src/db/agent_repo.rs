@@ -92,6 +92,40 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
 /// `ipv4` / `ipv6` **不在这里改**:它们每次 `sysinfo.report` 都会被 agent 自探的值
 /// 覆盖(§7.3),在这里手工填一个值只会在下一个上报周期悄悄变回去 ——
 /// 一个「改了但过一会儿自己变回来」的输入框比没有这个输入框更糟。
+/// 改出站地址族策略,并**推进 `config_revision`**。
+///
+/// 与 `update_settings` 里那几项(名称、网卡配额、重置日)不同:那些只是主控
+/// 自己的记账,agent 根本不需要知道。而出站策略会进 sing-box 配置 ——
+/// 不推进 revision 的话,agent 握手时看到版本相同就不会拉新配置,
+/// 表现是「界面上改了,机器上没变」,而且**没有任何报错**(§4.1)。
+///
+/// 返回新的 `config_revision`,调用方可以立刻下发 `config.apply`。
+pub async fn set_outbound_strategy(
+    pool: &SqlitePool,
+    id: i64,
+    strategy: crate::model::outbound::OutboundStrategy,
+) -> Result<i64> {
+    let mut tx = pool.begin().await?;
+    let n = sqlx::query("UPDATE agents SET outbound_strategy = ? WHERE id = ?")
+        .bind(strategy.key())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        anyhow::bail!("没有 id 为 {id} 的被控服务器");
+    }
+    let rev: i64 = sqlx::query_scalar(
+        "UPDATE agents SET config_revision = config_revision + 1
+          WHERE id = ? RETURNING config_revision",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rev)
+}
+
 pub async fn update_settings(
     pool: &SqlitePool,
     id: i64,
@@ -148,6 +182,58 @@ mod tests {
     async fn pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("sbx-agentrepo-{}.db", uuid::Uuid::new_v4()));
         crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap()
+    }
+
+    /// **改出站策略必须推进 `config_revision`。**
+    ///
+    /// 它进 sing-box 配置。不推的话 agent 握手时看到版本相同就不拉新配置 ——
+    /// 表现是「界面上改了,机器上没变」,而且没有任何报错(§4.1)。
+    /// 这是这一整类 bug 里最难查的形状,所以专门钉住。
+    #[tokio::test]
+    async fn changing_the_outbound_strategy_bumps_config_revision() {
+        use crate::model::outbound::OutboundStrategy;
+        let p = pool().await;
+        let (id, _) = create(&p, "tokyo", 0).await.unwrap();
+
+        let before: i64 = sqlx::query_scalar("SELECT config_revision FROM agents WHERE id = ?")
+            .bind(id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+
+        let rev = set_outbound_strategy(&p, id, OutboundStrategy::Ipv6Only).await.unwrap();
+        assert_eq!(rev, before + 1, "该推进一格");
+
+        let (stored, now): (String, i64) =
+            sqlx::query_as("SELECT outbound_strategy, config_revision FROM agents WHERE id = ?")
+                .bind(id)
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(stored, "v6only", "存的是短名");
+        assert_eq!(now, rev);
+    }
+
+    /// 新建的 agent 默认 auto —— 升级到带这一列的版本时,行为不该变。
+    #[tokio::test]
+    async fn a_new_agent_defaults_to_auto() {
+        use crate::model::outbound::OutboundStrategy;
+        let p = pool().await;
+        let (id, _) = create(&p, "tokyo", 0).await.unwrap();
+        let stored: String = sqlx::query_scalar("SELECT outbound_strategy FROM agents WHERE id = ?")
+            .bind(id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(OutboundStrategy::parse(&stored), OutboundStrategy::Auto);
+    }
+
+    /// 不存在的 agent 要报错,而不是静默成功。
+    #[tokio::test]
+    async fn setting_the_strategy_on_a_missing_agent_errors() {
+        use crate::model::outbound::OutboundStrategy;
+        let p = pool().await;
+        assert!(set_outbound_strategy(&p, 9999, OutboundStrategy::Ipv4Only).await.is_err());
     }
 
     #[tokio::test]

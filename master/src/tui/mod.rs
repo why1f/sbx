@@ -215,7 +215,7 @@ impl App {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
                 Some(a) => vec![format!(
-                    "  选中: {}  token: {}…  节点: {} 个  状态: {}{}",
+                    "  选中: {}  token: {}…  节点: {} 个  状态: {}  出站: {}{}",
                     a.name,
                     a.token_prefix,
                     a.node_count,
@@ -224,6 +224,7 @@ impl App {
                         "offline" => "● 离线",
                         _ => "○ 从未连接",
                     },
+                    a.outbound.label(),
                     if self.pending_cmds > 0 {
                         format!("   ⋯ {} 条升级待下发", self.pending_cmds)
                     } else {
@@ -325,7 +326,7 @@ impl App {
         match self.page {
             Page::Dashboard => "  [←/→]换栏  [↑↓/jk]选择  [Enter]用量明细",
             Page::Agents => {
-                "  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
+                "  [a]新增  [E]编辑  [Enter]网卡明细  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
             }
             Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除",
             Page::Users => {
@@ -739,6 +740,23 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                 Some(a) => {
                     let (id, name) = (a.id, a.name.clone());
                     return Some(Action::ShowInstall { id, name });
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
+            // `o` 循环切下一个策略。做成一个键循环而不是弹窗选单,是因为
+            // 它只有五个取值、而且每次改都要立刻看到效果 —— 开个框选完再关,
+            // 比按两下 o 慢得多。误按的代价也小:再按几下就转回来了,
+            // 而且它只改解析策略,不动任何凭据。
+            KeyCode::Char('o') => match app.selected_agent() {
+                Some(a) => {
+                    let all = crate::model::outbound::OutboundStrategy::all();
+                    let cur = all.iter().position(|s| *s == a.outbound).unwrap_or(0);
+                    let next = all[(cur + 1) % all.len()];
+                    return Some(Action::SetOutbound {
+                        id: a.id,
+                        name: a.name.clone(),
+                        strategy: next,
+                    });
                 }
                 None => app.fail("没有选中任何被控服务器"),
             },
@@ -1404,6 +1422,16 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("{user} 的本周期流量已清零(月重置日期没动)"))
         }
 
+        Action::SetOutbound { id, name, strategy } => {
+            let rev = crate::db::agent_repo::set_outbound_strategy(&app.pool, *id, *strategy).await?;
+            // 说清「什么时候生效」:TUI 只改库,下发由 daemon 在下次握手或
+            // 下发时做(§4.1)。不说的话人会盯着机器看为什么没变。
+            Ok(format!(
+                "{name} 的出站策略改成「{}」(配置版本 {rev},由 daemon 下发)",
+                strategy.label()
+            ))
+        }
+
         Action::UpgradeAgents { only, name } => upgrade_agents(app, *only, name).await,
 
         // 这一条**不在这里做**:它要挂起终端(离开 alternate screen、关 raw mode)
@@ -1782,6 +1810,63 @@ mod tests {
 
         println!("{}
 {}", info.trim_end(), row2(h as u16 - 3).trim_end());
+    }
+
+    /// `[o]` 循环切出站策略,五个取值转一圈回到原点。
+    ///
+    /// 做成循环而不是弹窗选单:只有五个取值,而且改完要立刻看到效果 ——
+    /// 开个框选完再关比按两下慢得多。误按的代价也小(再按几下就转回来了,
+    /// 而且它不动任何凭据),所以不值得为它加一次确认。
+    #[tokio::test]
+    async fn the_outbound_key_cycles_through_every_strategy() {
+        use crate::model::outbound::OutboundStrategy;
+
+        let mut a = app();
+        a.page = Page::Agents;
+        a.agents = vec![stub_agent(7)];
+        assert_eq!(a.agents[0].outbound, OutboundStrategy::Auto, "默认该是自动");
+
+        // 从 Auto 开始按一圈,顺序要和 `all()` 一致,最后回到 Auto。
+        let want = OutboundStrategy::all();
+        for step in 1..=want.len() {
+            let act = on_key(&mut a, key('o'));
+            let expect = want[step % want.len()];
+            match act {
+                Some(Action::SetOutbound { id, strategy, .. }) => {
+                    assert_eq!(id, 7);
+                    assert_eq!(strategy, expect, "第 {step} 下该切到 {expect:?}");
+                    // 主循环会写库再 refresh;这里手动同步,好接着按下一下。
+                    a.agents[0].outbound = strategy;
+                }
+                other => panic!("[o] 该产生 SetOutbound,实际 {}", other.is_some()),
+            }
+        }
+        assert_eq!(a.agents[0].outbound, OutboundStrategy::Auto, "转一圈该回到原点");
+    }
+
+    /// 没选中任何机器时按 `[o]` 只给提示,不该 panic 也不该产生动作。
+    #[tokio::test]
+    async fn the_outbound_key_on_an_empty_list_just_complains() {
+        let mut a = app();
+        a.page = Page::Agents;
+        assert!(on_key(&mut a, key('o')).is_none());
+        assert!(a.status_is_error);
+    }
+
+    /// 摘要行要显示**当前**策略 —— 这是按下 `[o]` 之后唯一能确认改对了的地方
+    /// (列表里没有这一列)。
+    #[tokio::test]
+    async fn the_ops_line_shows_the_current_strategy() {
+        use crate::model::outbound::OutboundStrategy;
+
+        let mut a = app();
+        a.page = Page::Agents;
+        a.agents = vec![data::AgentRow {
+            outbound: OutboundStrategy::Ipv6Only,
+            ..stub_agent(1)
+        }];
+        let ops = a.ops_lines().join("\n");
+        assert!(ops.contains("仅 IPv6"), "摘要里该有当前策略:\n{ops}");
     }
 
     /// `[T]` 打开 token 管理,`[r]` 弹重置流量的确认框。
@@ -2260,6 +2345,7 @@ mod tests {
             status: "online".into(),
             agent_version: None,
             arch: Some("amd64".into()),
+            outbound: Default::default(),
             ipv4: None,
             ipv6: None,
             nic_quota_bytes: None,

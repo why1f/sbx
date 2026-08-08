@@ -51,13 +51,30 @@ pub async fn build_agent_config(pool: &SqlitePool, agent_id: i64) -> Result<serd
         inbounds.push(build_inbound(&tag, Protocol::parse(&proto), port, &params, &users)?);
     }
 
-    Ok(serde_json::json!({
+    let mut cfg = serde_json::json!({
         "log": { "level": "warn" },
         "inbounds": inbounds,
         // 出站只要 direct。agent 是落地机,不做链式代理——
         // 中转由 §10 的 RelaySetting 在订阅侧处理,不在 sing-box 配置里。
         "outbounds": [{ "type": "direct", "tag": "direct" }],
-    }))
+    });
+
+    // 出站地址族策略。写的是 `route.default_domain_resolver` 而**不是**
+    // 已被 1.14.0 移除的 `domain_strategy`(见 model/outbound.rs)。
+    // 认不出来的取值退回 Auto —— 库里那一列可能被手改过,而让整台机器的
+    // 配置组装失败远比退回默认行为要糟。
+    let strategy: String =
+        sqlx::query_scalar("SELECT outbound_strategy FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or_default();
+    crate::model::outbound::apply(
+        &mut cfg,
+        crate::model::outbound::OutboundStrategy::parse(&strategy),
+    );
+
+    Ok(cfg)
 }
 
 /// 组一个 inbound(§9.1,八个协议)。
@@ -352,6 +369,37 @@ mod tests {
         id
     }
 
+    /// 出站策略要真的落进下发给 agent 的那份配置里。
+    ///
+    /// 这条走的是**完整组装路径**(建 agent → 改策略 → build_agent_config),
+    /// 而不是只测 `model::outbound::apply`。中间任何一环忘了读那一列,
+    /// 界面上都会显示「已改」而机器上什么都没发生。
+    #[tokio::test]
+    async fn the_outbound_strategy_reaches_the_generated_config() {
+        use crate::model::outbound::OutboundStrategy;
+        let pool = pool().await;
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+
+        // 默认 auto:不该出现 route/dns。
+        let cfg = build_agent_config(&pool, agent_id).await.unwrap();
+        assert!(cfg.get("route").is_none(), "auto 不该写 route:{cfg}");
+        assert!(cfg.get("dns").is_none(), "auto 不该写 dns:{cfg}");
+
+        crate::db::agent_repo::set_outbound_strategy(&pool, agent_id, OutboundStrategy::PreferIpv6)
+            .await
+            .unwrap();
+        let cfg = build_agent_config(&pool, agent_id).await.unwrap();
+        assert_eq!(cfg["route"]["default_domain_resolver"]["strategy"], "prefer_ipv6");
+        // resolver 指向的 tag 必须真的存在,否则 sing-box 起不来。
+        let tag = cfg["route"]["default_domain_resolver"]["server"].as_str().unwrap();
+        assert!(
+            cfg["dns"]["servers"].as_array().unwrap().iter().any(|s| s["tag"] == tag),
+            "{cfg}"
+        );
+        // 1.14.0 已移除的那个字段,一个字都不能出现。
+        assert!(!cfg.to_string().contains("domain_strategy"), "{cfg}");
+    }
+
     #[tokio::test]
     async fn config_contains_one_inbound_per_node_with_its_users() {
         let p = pool().await;
@@ -566,6 +614,53 @@ mod tests {
             "以下协议的生成结果与 testdata/inbounds/ 里的 golden 不一致:{drift:?}\n\
              确认改动是有意的之后,用同目录下的 .actual 覆盖 .json 并提交。\n\
              注意 agent 侧的 Go 测试会拿这些文件喂真正的 sing-box —— 改完记得跑一遍。"
+        );
+    }
+
+    /// 五个出站策略各落一份**完整配置**到 `testdata/outbound/`,由 agent 侧的
+    /// Go 测试喂给真正的 sing-box 校验(`TestOutboundStrategyConfigsAreAccepted`)。
+    ///
+    /// 这组 golden 与上面那组的区别是**范围**:上面只有 inbound,而出站策略写的是
+    /// 顶层的 `route` / `dns`,不进 inbound。少了这一组,`default_domain_resolver`
+    /// 的字段名、`{ "type": "local" }` 的新式写法、以及 server tag 指得到不到,
+    /// 全都要等到线上 `config.apply` 失败才知道 —— 而那时候整台机器的代理已经停了。
+    ///
+    /// 尤其要盯 1.14.0 移除的 `domain_strategy`:写它的表现不是「不生效」,
+    /// 是 `box.New()` 直接失败,而错误只说「配置无效」。
+    #[test]
+    fn outbound_strategies_match_golden_configs() {
+        use crate::model::outbound::{apply, OutboundStrategy};
+
+        let dir = testdata_dir().join("outbound");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut drift = Vec::new();
+
+        for &st in OutboundStrategy::all() {
+            // 一份最小但**完整**的配置:sing-box 要能整份装配起来才算过。
+            let mut cfg = serde_json::json!({
+                "log": { "level": "error" },
+                "inbounds": [],
+                "outbounds": [{ "type": "direct", "tag": "direct" }],
+            });
+            apply(&mut cfg, st);
+            let pretty = serde_json::to_string_pretty(&cfg).unwrap() + "\n";
+
+            let path = dir.join(format!("{}.json", st.key()));
+            match std::fs::read_to_string(&path) {
+                Ok(existing) if existing.replace("\r\n", "\n") == pretty => {}
+                Ok(_) => {
+                    std::fs::write(path.with_extension("json.actual"), &pretty).unwrap();
+                    drift.push(st.key());
+                }
+                Err(_) => std::fs::write(&path, &pretty).unwrap(),
+            }
+        }
+
+        assert!(
+            drift.is_empty(),
+            "以下策略的生成结果与 testdata/outbound/ 里的 golden 不一致:{drift:?}\n\
+             确认改动是有意的之后,用同目录下的 .actual 覆盖 .json 并提交。\n\
+             agent 侧的 Go 测试会拿这些文件喂真正的 sing-box —— 改完记得跑一遍。"
         );
     }
 

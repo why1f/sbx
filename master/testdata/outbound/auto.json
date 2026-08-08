@@ -1,0 +1,12 @@
+{
+  "inbounds": [],
+  "log": {
+    "level": "error"
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ]
+}

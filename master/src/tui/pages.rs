@@ -1304,6 +1304,7 @@ mod tests {
             status: "online".into(),
             agent_version: Some("v0.1.0".into()),
             arch: Some("amd64".into()),
+            outbound: Default::default(),
             ipv4: Some("203.0.113.8".into()),
             ipv6: Some("2001:db8:1:aaaa:1234:5678:9abc:def0".into()),
             nic_quota_bytes: quota,

@@ -618,6 +618,7 @@ mod preview {
             status: "online".into(),
             agent_version: Some("v0.2.1".into()),
             arch: Some("amd64".into()),
+            outbound: Default::default(),
             ipv4: Some("203.0.113.8".into()),
             ipv6: None,
             nic_quota_bytes: None,

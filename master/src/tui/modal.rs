@@ -92,6 +92,8 @@ pub enum Action {
     UpgradeAgents { only: Option<i64>, name: String },
     /// 升级**主控自己**。要挂起 TUI 去跑安装脚本,所以由主循环处理。
     SelfUpgrade,
+    /// 改这台 agent 的出站地址族策略。进 sing-box 配置,会推进 config_revision。
+    SetOutbound { id: i64, name: String, strategy: crate::model::outbound::OutboundStrategy },
 }
 
 /// 节点表单填出来的东西。密钥材料**不在这里** —— 新增时由 `secrets::fill` 生成,

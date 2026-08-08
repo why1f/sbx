@@ -22,6 +22,8 @@ pub struct AgentRow {
     pub agent_version: Option<String>,
     /// `runtime.GOARCH`。升级时靠它挑对产物 —— release 只出 amd64 / arm64。
     pub arch: Option<String>,
+    /// 出站地址族策略。进 sing-box 配置,改它要推进 config_revision。
+    pub outbound: crate::model::outbound::OutboundStrategy,
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub nic_quota_bytes: Option<i64>,
@@ -407,6 +409,7 @@ struct AgentQueryRow {
     status: String,
     agent_version: Option<String>,
     arch: Option<String>,
+    outbound_strategy: String,
     ipv4: Option<String>,
     ipv6: Option<String>,
     nic_quota_bytes: Option<i64>,
@@ -434,7 +437,7 @@ pub async fn load_agents(
     // LEFT JOIN:从没上报过的 agent 也要出现在列表里(值为 0),
     // 否则「加了但还没连上」的那台会直接看不见,而那正是最需要排查的一台。
     let rows: Vec<AgentQueryRow> = sqlx::query_as(
-        "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.arch, a.ipv4, a.ipv6,
+        "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.arch, a.outbound_strategy, a.ipv4, a.ipv6,
                 a.nic_quota_bytes, a.nic_reset_day,
                 a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
                 t.boot_id,
@@ -469,6 +472,7 @@ pub async fn load_agents(
                 status: r.status,
                 agent_version: r.agent_version,
                 arch: r.arch,
+                outbound: crate::model::outbound::OutboundStrategy::parse(&r.outbound_strategy),
                 ipv4: r.ipv4,
                 ipv6: r.ipv6,
                 nic_quota_bytes: r.nic_quota_bytes,
@@ -777,6 +781,7 @@ mod tests {
             status: "online".into(),
             agent_version: None,
             arch: Some("amd64".into()),
+            outbound: Default::default(),
             ipv4: None,
             ipv6: None,
             nic_quota_bytes: None,

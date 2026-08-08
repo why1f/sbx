@@ -1,0 +1,11 @@
+-- 每台 agent 的出站地址族策略(DESIGN.md §9.1)。
+--
+-- 按 agent 存而不是全局:这是「这台落地机怎么解析域名」的问题,天然一台一份 ——
+-- 一台只有 IPv4 出口的机器要 ipv4_only,另一台双栈的可以 prefer_ipv6。
+--
+-- 存**短名**(auto / prefer4 / prefer6 / v4only / v6only)而不是 sing-box 侧的
+-- 取值:sing-box 那边「自动」的表示是「这一项不写」,没有对应字符串,
+-- 而「没设过」和「设成自动」在界面上必须是同一件事。
+--
+-- 默认 'auto' = 不写 route.default_domain_resolver,保持升级前的行为不变。
+ALTER TABLE agents ADD COLUMN outbound_strategy TEXT NOT NULL DEFAULT 'auto';
