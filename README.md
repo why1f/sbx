@@ -27,7 +27,11 @@ GPL 的传染范围是「衍生作品」,而网络通信不构成链接。
 ## 状态
 
 **master 与 agent 都已完成并通过测试,两端在真机上对接跑通过(见下)。**
-仍未实测的只有 agent 自升级(`agent.upgrade`)—— 它要一次真实的发布产物才能验。
+
+agent 自升级(`agent.upgrade`)从 v0.4.0 起整条路都通了:主控侧拼产物地址与
+校验和并排进队列、daemon 侧下发、agent 侧下载校验替换退出,每一段都有测试
+(其中「替换正在运行的二进制」那一步有 8 条,每条失败路径都断言老文件一字节没变)。
+**仍然没有在真机上端到端跑过一次完整升级** —— 那要一台在线的被控机加一次真实发布。
 
 | 部分 | 状态 |
 |---|---|
@@ -57,8 +61,8 @@ GPL 的传染范围是「衍生作品」,而网络通信不构成链接。
 | Telegram 通知(§9.1) | ✅ 已完成,单实例租约 + 阈值告警去重 + 定时播报 |
 | §13.2 / §13.3 端到端 | ✅ **已在真实 ARM Linux 上跑通**(1 主控 + 2 agent + 真流量) |
 
-Rust 侧 394 个测试通过(`cargo test`),
-Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
+Rust 侧 453 个测试通过(`cargo test`),
+Go 侧 54 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 **含 `-race`**,已在 Linux ARM 上跑过)。
 
 > **两端已经真正对接过了。** 在一台 Oracle ARM(Ubuntu 22.04 aarch64)上起 1 个主控
@@ -86,8 +90,9 @@ Go 侧 46 个测试通过(`cd agent && go test -tags with_quic,with_utls ./...`,
 > `-tags with_quic,with_utls`(reality 要 uTLS,hysteria2/tuic 要 QUIC)。
 > 现在 `agent/boxctl/buildtags.go` 有编译期哨兵挡着。
 >
-> 仍未实测的只剩 **agent 自升级**(`agent.upgrade`:下载、校验 sha256、
-> rename 覆盖自己再退出)—— 它需要一个真实的发布产物才能验。
+> **agent 自升级**(`agent.upgrade`:下载、校验 sha256、rename 覆盖自己再退出)
+> 从 v0.4.0 起在界面上可用(服务管理页 `[u]`),各段都有单测;
+> 但**没有在真机上端到端跑过一次** —— 那要一台在线的被控机加一次真实发布。
 
 ## 安装
 
@@ -122,7 +127,7 @@ curl -fsSL .../install.sh | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' S
 ## 已经能跑的东西
 
 ```sh
-cargo test                      # 394 个测试
+cargo test                      # 453 个测试
 cargo build --release           # 产物 target/release/sbx
 
 # 建库 + 加一台被控服务器 + 启动主控
@@ -142,15 +147,29 @@ cargo build --release           # 产物 target/release/sbx
 ./target/release/sbx --config c.toml tui
 ```
 
-TUI 里能做的事(`R` 随时立刻刷新):
+TUI 里能做的事。哪一页都能按的:`1-5` / `Tab` 切页、`↑↓` 或 `jk` 选行、
+`R` 立刻刷新、`U` 升级主控自己、`q` 退出。
 
 | 页 | 键 |
 |---|---|
-| 仪表盘 | 只读:集群概况、上下行盲文折线图、用量 Top、各机器 CPU/内存/配额 |
-| 服务管理 | `[a]` 新增(给出一键接入命令) `[E]` 编辑配额 `[i]` 再看一次接入命令 `[r]` 轮换 token `[d]` 删除 |
+| 仪表盘 | 集群概况、上下行盲文折线图、用量 Top、节点用量。`←/→` 在两张表间换焦点,`[Enter]` 看选中那一项的用量明细 |
+| 服务管理 | `[a]` 新增(给出一键接入命令) `[E]` 编辑配额 `[Enter]` 网卡明细 `[o]` 出站地址族策略 `[i]` 再看一次接入命令 `[u]` 升级 agent `[r]` 轮换 token `[d]` 删除 |
 | 节点 | `[a]` 新增 `[E]` 编辑 `[Enter]` 这个节点上各用户的用量 `[d]` 删除 |
-| 用户 | `[a]` 新增 `[E]` 编辑计费 `[Enter]` 这个用户在各节点的用量 `[n]` 分配节点(多选) `[b]` 订阅按网卡流量报 `[t]` 启/停 `[s]` 订阅 `[d]` 删除 |
+| 用户 | `[a]` 新增 `[E]` 编辑计费 `[Enter]` 这个用户在各节点的用量 `[n]` 分配节点(多选) `[b]` 订阅按网卡流量报 `[T]` token 管理 `[r]` 重置流量 `[t]` 启/停 `[s]` 订阅 `[d]` 删除 |
 | 设置 | `[Enter]` 改这一项。改的是配置文件本身,注释与排版都保留;**改完要重启 daemon** |
+
+`[o]` 的五个取值是「自动(跟随系统解析)/ 优先 IPv4 / 优先 IPv6 / 仅 IPv4 / 仅 IPv6」,
+**按 agent 存**:一台只有 IPv4 出口的机器要「仅 IPv4」,另一台双栈的可以「优先 IPv6」,
+放在全局配置里就没法表达这个差别。它落到 sing-box 的 `route.default_domain_resolver`
+而**不是**已被 1.14.0 移除的 `domain_strategy` —— 后者写了不报错、只是静默失效,
+所以有一条跨语言 golden 专门盯着它(`master/testdata/outbound/`,由真 sing-box 校验)。
+
+`[u]` 升级 agent 可以只升选中的这台、也可以一键升在线的全部。升级目标是**主控自己的版本**
+(§11.1 两边共用一个版本号),产物按每台的架构挑,sha256 取不到就不下发。
+TUI 只把指令排进队列,真正下发由 daemon 做 —— 两者是不同进程,WS 连接在 daemon 手上。
+
+`[U]` 升级主控自己:界面临时退出去跑一键安装脚本,跑完回来。
+**新二进制要退出 TUI 再进才生效**,当前这个进程还是老的。
 
 节点表单里协议和所属机器是 `←/→` 选的,不是手打;`server_name` / `path` 只在
 用得上它们的协议下出现。编辑节点时 tag 与协议不可改 —— 改 tag 会让历史流量和新流量
@@ -216,7 +235,7 @@ cargo test                     # 全部测试
 # -tags with_quic,with_utls 是**必需**的:reality 要 uTLS,hysteria2/tuic 要 QUIC。
 # 漏了会被 boxctl/buildtags.go 的编译期哨兵挡住(不会编出一个跑不了那些协议的二进制)。
 cd agent && go build -tags with_quic,with_utls ./...   # 需要 Go 1.24.7+(见 agent/go.mod)
-cd agent && go test  -tags with_quic,with_utls ./...   # 46 个测试;boxctl 那组会起真的 sing-box 实例
+cd agent && go test  -tags with_quic,with_utls ./...   # 54 个测试;boxctl 那组会起真的 sing-box 实例
 
 # §12.0 spike —— 改了 agent/tracker 就要重跑
 cd spike && go mod tidy && go run .
