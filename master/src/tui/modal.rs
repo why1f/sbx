@@ -90,6 +90,8 @@ pub enum Action {
     ResetUserTraffic { user_id: i64, user: String },
     /// 升级一台 agent(`None` = 在线的全部升)。
     UpgradeAgents { only: Option<i64>, name: String },
+    /// 升级**主控自己**。要挂起 TUI 去跑安装脚本,所以由主循环处理。
+    SelfUpgrade,
 }
 
 /// 节点表单填出来的东西。密钥材料**不在这里** —— 新增时由 `secrets::fill` 生成,

@@ -66,6 +66,14 @@ struct App {
     cfg_path: String,
     page: Page,
     sel: [usize; 5],
+    /// 仪表盘上的焦点:`false` = 左边的用户栏,`true` = 右边的节点栏。
+    ///
+    /// 仪表盘原本是纯只读的。加选中态是为了让那两张表也能按 Enter 下钻,
+    /// 下钻本身复用节点页/用户页那套(`ShowUserNodes` / `ShowNodeUsers`)。
+    dash_on_nodes: bool,
+    /// 两栏各自的选中行。下标是**排过序之后**的行号
+    /// (`pages::dashboard_*_order`),不是 `users` / `nodes` 里的位置。
+    dash_sel: [usize; 2],
     agents: Vec<data::AgentRow>,
     nodes: Vec<data::NodeRow>,
     users: Vec<data::UserRow>,
@@ -88,6 +96,8 @@ struct App {
     /// 还没下发完的升级指令条数。TUI 只入队,真正下发在 daemon 那边(隔一拍),
     /// 不显示的话人按完 [u] 会觉得什么都没发生。
     pending_cmds: i64,
+    /// 主循环下一拍要去跑主控自升级。见 `Action::SelfUpgrade`。
+    want_self_upgrade: bool,
     status: Option<String>,
     status_is_error: bool,
     quit: bool,
@@ -101,6 +111,8 @@ impl App {
             cfg_path,
             page: Page::Dashboard,
             sel: [0; 5],
+            dash_on_nodes: false,
+            dash_sel: [0; 2],
             agents: Vec::new(),
             nodes: Vec::new(),
             users: Vec::new(),
@@ -109,20 +121,40 @@ impl App {
             overlay: None,
             probed_ip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_cmds: 0,
+            want_self_upgrade: false,
             status: None,
             status_is_error: false,
             quit: false,
         }
     }
 
+    /// 仪表盘当前的焦点,交给渲染层画高亮。两张表都空时不给焦点 ——
+    /// 画一个停在空表上的光标只会让人以为界面卡住了。
+    fn dash_focus(&self) -> Option<(bool, usize)> {
+        if self.users.is_empty() && self.nodes.is_empty() {
+            return None;
+        }
+        Some((!self.dash_on_nodes, self.dash_sel[usize::from(self.dash_on_nodes)]))
+    }
+
+    /// 仪表盘当前那一栏有几行。
+    fn dash_len(&self) -> usize {
+        if self.dash_on_nodes { self.nodes.len() } else { self.users.len() }
+    }
+
     fn sel_mut(&mut self) -> &mut usize {
+        // 仪表盘的选中态不在 `sel` 里 —— 它有**两栏**,各自一个光标。
+        if self.page == Page::Dashboard {
+            return &mut self.dash_sel[usize::from(self.dash_on_nodes)];
+        }
         &mut self.sel[self.page as usize]
     }
 
     fn len(&self) -> usize {
         match self.page {
-            // 仪表盘没有可选中的行,上下键在这里就该什么都不做。
-            Page::Dashboard => 0,
+            // 仪表盘现在也有选中态(那两张表能按 Enter 下钻),
+            // 上下键作用在**当前有焦点的那一栏**上。
+            Page::Dashboard => self.dash_len(),
             Page::Agents => self.agents.len(),
             Page::Nodes => self.nodes.len(),
             Page::Users => self.users.len(),
@@ -147,7 +179,7 @@ impl App {
     /// ——当页能做什么——挤到了行尾,窄终端上正好被截掉。
     fn header_line(&self) -> String {
         format!(
-            " sbx v{}  用户:{}  节点:{}  机器:{}  [1-5/Tab]切页  [↑↓/jk]选择  [R]刷新  [q]退出",
+            " sbx v{}  用户:{}  节点:{}  机器:{}  [1-5/Tab]切页  [↑↓/jk]选择  [R]刷新  [U]升级主控  [q]退出",
             env!("CARGO_PKG_VERSION"),
             self.users.len(),
             self.nodes.len(),
@@ -170,7 +202,15 @@ impl App {
     /// 证书私钥、ss 服务端密钥。只准取人自己填过的那几项。
     fn ops_lines(&self) -> Vec<String> {
         match self.page {
-            Page::Dashboard => vec![],
+            // 仪表盘现在有选中态了,所以也要一行提示 —— 否则没人知道
+            // ←/→ 能换栏、Enter 能下钻。
+            Page::Dashboard => {
+                if self.users.is_empty() && self.nodes.is_empty() {
+                    return vec![];
+                }
+                let which = if self.dash_on_nodes { "节点用量" } else { "用量 Top" };
+                vec![format!("  焦点: {which}   ←/→ 换栏   Enter 看明细")]
+            }
             Page::Agents => match self.selected_agent() {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
@@ -283,7 +323,7 @@ impl App {
     /// 只写一处。混在一起会让它们在五个页面里重复五遍,把真正会变的那部分挤走。
     fn ops_keys(&self) -> &'static str {
         match self.page {
-            Page::Dashboard => "",
+            Page::Dashboard => "  [←/→]换栏  [↑↓/jk]选择  [Enter]用量明细",
             Page::Agents => {
                 "  [a]新增  [E]编辑  [Enter]网卡明细  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
             }
@@ -376,6 +416,50 @@ pub async fn run(pool: SqlitePool, cfg: Config, cfg_path: String) -> Result<()> 
     result
 }
 
+/// 挂起 TUI 去跑一键安装脚本,跑完再把界面接回来。
+///
+/// **必须挂起**:脚本会打十几行进度(下载、校验、替换、restart),
+/// 而 alternate screen + raw mode 下那些输出要么看不见、要么排版全乱。
+/// 出问题时那几行恰恰是唯一的线索。
+///
+/// 做法照 sb-manager 的 `run_self_update`:离开 alternate screen → 跑 → 回来。
+/// 无论脚本成功与否都要**把终端接回来** —— 半路 return 会把人扔在一个
+/// raw mode 没关的 shell 里,那时连 Ctrl-C 都不一定好使。
+///
+/// 跑完**不自动重启自己**:当前进程用的还是老二进制,要重进 TUI 才会加载新的。
+/// 悄悄替换掉再假装没事,比明说更糟。
+fn run_self_upgrade<B: ratatui::backend::Backend>(term: &mut Terminal<B>) -> Result<String> {
+    restore_terminal()?;
+    let _ = term.show_cursor();
+
+    println!();
+    println!("=== 升级 sbx(当前 v{}) ===", crate::upgrade::target_version());
+    println!("脚本会比对版本,已是最新就什么都不做;有新版会下载、校验 sha256、替换。");
+    println!();
+
+    let cmd = format!("curl -fsSL {} | bash", crate::install::INSTALL_URL);
+    let status = std::process::Command::new("sh").arg("-c").arg(&cmd).status();
+
+    println!();
+    println!("按 Enter 回到界面…");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+
+    // 先把终端接回来,再判断脚本的结果 —— 顺序反过来的话,
+    // 脚本失败时会从这里 return,把人扔在一个 raw mode 没关的 shell 里。
+    enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    term.clear()?;
+
+    match status {
+        Ok(s) if s.success() => {
+            Ok("升级脚本跑完了。**要按 [q] 退出再重进 TUI**,当前进程还是老二进制".into())
+        }
+        Ok(s) => anyhow::bail!("脚本非零退出(exit {:?}),上面那几行有原因", s.code()),
+        Err(e) => anyhow::bail!("起不来安装脚本:{e}"),
+    }
+}
+
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
@@ -428,6 +512,14 @@ async fn event_loop<B: ratatui::backend::Backend>(term: &mut Terminal<B>, mut ap
                     if k.kind == KeyEventKind::Press {
                         if let Some(action) = on_key(&mut app, k) {
                             perform(&mut app, action).await;
+                            if app.want_self_upgrade {
+                                app.want_self_upgrade = false;
+                                let msg = run_self_upgrade(term);
+                                match msg {
+                                    Ok(m) => app.note(m),
+                                    Err(e) => app.fail(format!("升级失败: {e}")),
+                                }
+                            }
                             app.refresh().await?;
                         }
                     }
@@ -477,11 +569,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Page::Dashboard => pages::dashboard(
             f,
             chunks[1],
-            &app.agents,
-            &app.nodes,
-            &app.users,
-            app.speed.history(),
-            now,
+            &pages::Dash {
+                agents: &app.agents,
+                nodes: &app.nodes,
+                users: &app.users,
+                history: app.speed.history(),
+                now,
+                focus: app.dash_focus(),
+            },
         ),
         Page::Agents => pages::agents(f, chunks[1], &app.agents, app.sel[1], now),
         Page::Nodes => pages::nodes(f, chunks[1], &app.nodes, app.sel[2]),
@@ -530,6 +625,21 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     app.status = None;
 
     match k.code {
+        // 大写 U:升主控自己。小写 u 在服务管理页是「升级 agent」——
+        // 两者影响面差一个数量级(一台被控 vs 主控自己),所以差一个 Shift
+        // 但**分属不同作用域**:U 是全局的,u 只在那一页有。
+        KeyCode::Char('U') => {
+            app.modal = Some(Modal::confirm(
+                "升级主控",
+                vec![
+                    format!("当前 v{}。脚本会比对版本,已是最新就什么都不做。", crate::upgrade::target_version()),
+                    "界面会临时退出去跑脚本,跑完自动回来。".into(),
+                    "**新二进制要重进 TUI 才生效** —— 当前这个进程还是老的。".into(),
+                    "daemon 由脚本自己 restart(它本来就在跑的话)。".into(),
+                ],
+                Action::SelfUpgrade,
+            ));
+        }
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
         // 数字直达。五页里跳来跳去时,Tab 要按四下才到得了最后一页,
@@ -544,6 +654,15 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
         // 要立刻看到结果。`R` 是大写的:小写 r 在服务管理页是「轮换 token」,
         // 那是一个不可撤销的动作,不能和刷新只差一个 Shift 却又长得像。
         KeyCode::Char('R') => return Some(Action::Refresh),
+        // 仪表盘上 ←/→ 换的是**哪一栏有焦点**(左用户 / 右节点)——
+        // 那是它们在这一页最自然的含义,两张表就是左右摆着的。
+        // 换页仍然走 Tab 和 1-5,页脚里写的也是这两个。
+        KeyCode::Right | KeyCode::Char('l') if app.page == Page::Dashboard => {
+            app.dash_on_nodes = true;
+        }
+        KeyCode::Left | KeyCode::Char('h') if app.page == Page::Dashboard => {
+            app.dash_on_nodes = false;
+        }
         KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
             app.page = Page::from_index((app.page as usize + 1) % PAGES.len());
         }
@@ -571,7 +690,35 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
 
 fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     match app.page {
-        Page::Dashboard => {}
+        // 仪表盘的两张表也能下钻,复用节点页/用户页那套明细。
+        //
+        // 选中的下标是**排序后**的行号,必须经同一份次序解回原始行 ——
+        // 两边各排一次的话,光标停在第 1 行、打开的却是另一个人,而且不会报错。
+        Page::Dashboard => {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Char('v')) {
+                if app.dash_on_nodes {
+                    let order = pages::dashboard_node_order(&app.nodes);
+                    match order.get(app.dash_sel[1]).and_then(|&i| app.nodes.get(i)) {
+                        Some(n) => {
+                            return Some(Action::ShowNodeUsers {
+                                id: n.id,
+                                tag: n.tag.clone(),
+                                agent: n.agent_name.clone(),
+                            })
+                        }
+                        None => app.fail("这一栏还没有节点"),
+                    }
+                } else {
+                    let order = pages::dashboard_user_order(&app.users);
+                    match order.get(app.dash_sel[0]).and_then(|&i| app.users.get(i)) {
+                        Some(u) => {
+                            return Some(Action::ShowUserNodes { id: u.id, name: u.name.clone() })
+                        }
+                        None => app.fail("这一栏还没有用户"),
+                    }
+                }
+            }
+        }
 
         Page::Agents => match k.code {
             KeyCode::Char('a') => app.modal = Some(forms::agent_add()),
@@ -1259,6 +1406,13 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
 
         Action::UpgradeAgents { only, name } => upgrade_agents(app, *only, name).await,
 
+        // 这一条**不在这里做**:它要挂起终端(离开 alternate screen、关 raw mode)
+        // 才能让脚本的输出被人看见,而终端句柄在主循环手上。这里只置标记。
+        Action::SelfUpgrade => {
+            app.want_self_upgrade = true;
+            Ok(String::new())
+        }
+
         // 刷新本身在主循环里做(每个动作之后都会 refresh 一次),这里只给回执。
         Action::Refresh => Ok("已刷新".into()),
 
@@ -1792,6 +1946,119 @@ mod tests {
             a.page = page;
             assert!(!a.ops_lines().is_empty(), "{page:?} 该有操作摘要");
         }
+    }
+
+    /// 仪表盘的 Enter 要打开**光标停的那一个**。
+    ///
+    /// 两张表都按用量排过序,而 `users` / `nodes` 本身是按 id 排的。
+    /// 选中的下标是排序后的行号 —— 解析时必须走同一份次序,否则光标停在
+    /// 第 1 行、打开的却是另一个人。这种错不报任何错,只会给出一张
+    /// 「看起来正常但属于别人」的明细表,所以专门钉住。
+    #[tokio::test]
+    async fn the_dashboard_drills_into_the_highlighted_row() {
+        let mut a = app();
+        a.page = Page::Dashboard;
+        // id 顺序 1 → 2;用量顺序 2(大)→ 1(小)。两者刚好相反。
+        a.users = vec![
+            data::UserRow { id: 1, name: "small".into(), cycle_up: 1, ..stub_user(true) },
+            data::UserRow { id: 2, name: "big".into(), cycle_up: 9_999, ..stub_user(true) },
+        ];
+
+        a.dash_sel = [0, 0];
+        match on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Some(Action::ShowUserNodes { id, ref name }) => {
+                assert_eq!((id, name.as_str()), (2, "big"), "第 0 行该是用量最大的那个");
+            }
+            other => panic!("该开用户明细,实际 {}", other.is_some()),
+        }
+
+        a.dash_sel = [1, 0];
+        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::ShowUserNodes { id: 1, .. })), "第 1 行该是 small");
+    }
+
+    /// ←/→ 在仪表盘上换的是**栏**,不是页 —— 两张表就是左右摆着的。
+    /// 换页仍然走 Tab 和 1-5。
+    #[tokio::test]
+    async fn arrows_switch_panes_on_the_dashboard_but_pages_elsewhere() {
+        let mut a = app();
+        a.page = Page::Dashboard;
+        a.users = vec![stub_user(true)];
+        a.nodes = vec![stub_node(1, "n1")];
+
+        assert!(!a.dash_on_nodes, "默认焦点在左边的用户栏");
+        on_key(&mut a, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(a.dash_on_nodes, "→ 该把焦点挪到节点栏");
+        assert_eq!(a.page, Page::Dashboard, "→ 不该顺手翻页");
+
+        let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(act, Some(Action::ShowNodeUsers { id: 1, .. })), "焦点在节点栏就开节点明细");
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!a.dash_on_nodes, "← 该挪回用户栏");
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.page, Page::Agents, "Tab 照旧翻页");
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(a.page, Page::Nodes, "非仪表盘页上 → 仍是翻页");
+    }
+
+    /// 两栏各有自己的光标,上下键只动有焦点的那一栏。
+    #[tokio::test]
+    async fn each_dashboard_pane_keeps_its_own_cursor() {
+        let mut a = app();
+        a.page = Page::Dashboard;
+        a.users = vec![stub_user(true), stub_user(true), stub_user(true)];
+        a.nodes = vec![stub_node(1, "n1"), stub_node(2, "n2")];
+
+        on_key(&mut a, key('j'));
+        assert_eq!(a.dash_sel, [1, 0], "只该动用户栏的光标");
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        on_key(&mut a, key('j'));
+        assert_eq!(a.dash_sel, [1, 1], "节点栏有自己的光标,用户栏那个不该被动");
+
+        // 节点栏只有 2 行,再往下绕回 0(与别的页一致)。
+        on_key(&mut a, key('j'));
+        assert_eq!(a.dash_sel[1], 0, "该绕回第一行");
+    }
+
+    /// `[u]` 开升级框,`[a]` / `[u]` 各自对应「全部」与「这一台」。
+    ///
+    /// TUI **不会**自己发 RPC(它和 daemon 是两个进程),这里只验到
+    /// 「产生了正确的 Action」为止;真正的下发在 daemon 的巡检里。
+    #[tokio::test]
+    async fn the_upgrade_modal_offers_one_or_all() {
+        let mut a = app();
+        a.page = Page::Agents;
+        a.agents = vec![stub_agent(3)];
+
+        assert!(on_key(&mut a, key('u')).is_none(), "[u] 只开框");
+        match &a.modal {
+            Some(Modal::Upgrade { agent_id, online, .. }) => {
+                assert_eq!(*agent_id, 3);
+                assert_eq!(*online, 1, "在线台数要写出来 —— 「全部升」会碰几台得让人看见");
+            }
+            _ => panic!("[u] 该开升级框"),
+        }
+
+        let mut m = Modal::Upgrade {
+            agent_id: 3,
+            name: "tokyo".into(),
+            online: 2,
+            version: "9.9.9".into(),
+        };
+        assert!(
+            matches!(m.handle(key('u')), Outcome::Run(Action::UpgradeAgents { only: Some(3), .. })),
+            "[u] 只升这一台"
+        );
+        assert!(
+            matches!(m.handle(key('a')), Outcome::Run(Action::UpgradeAgents { only: None, .. })),
+            "[a] 升全部"
+        );
+        // 别的键一律取消 —— 「全部升级」会让整个集群依次重启,不该有手滑的可能。
+        assert!(matches!(m.handle(key('x')), Outcome::Close(_)), "别的键该取消");
     }
 
     /// 绑网卡是**多选**,而且打开时已绑的要是勾上的 —— 与分配节点同一个道理:

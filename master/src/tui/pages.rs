@@ -82,15 +82,20 @@ fn pick<T: Copy + PartialEq>(total: u16, all: &[T], width: fn(T) -> u16, drop_or
 ///   3. 用量 Top / 各机器 —— 明细,回答「谁在烧、烧在哪台」。
 ///
 /// 折线图在矮终端上整块让掉:一条挤成两行的曲线不如把地方给下面的条形和数字。
-pub fn dashboard(
-    f: &mut Frame,
-    area: Rect,
-    agents: &[AgentRow],
-    nodes: &[NodeRow],
-    users: &[UserRow],
-    history: &VecDeque<(f64, f64)>,
-    now: i64,
-) {
+/// 仪表盘要画的东西。打成一个结构体而不是摊成一串参数:
+/// 三张表 + 历史 + 时间 + 焦点已经是 6 个,再摊下去调用处就只能靠位置记谁是谁。
+pub struct Dash<'a> {
+    pub agents: &'a [AgentRow],
+    pub nodes: &'a [NodeRow],
+    pub users: &'a [UserRow],
+    pub history: &'a VecDeque<(f64, f64)>,
+    pub now: i64,
+    /// `(焦点是否在左边那栏, 该栏选中第几行)`。`None` = 没有选中态。
+    pub focus: Option<(bool, usize)>,
+}
+
+pub fn dashboard(f: &mut Frame, area: Rect, d: &Dash<'_>) {
+    let Dash { agents, nodes, users, history, now, focus } = *d;
     let chart_h = if area.height >= 24 { 9 } else { 0 };
     let c = Layout::default()
         .direction(Direction::Vertical)
@@ -106,11 +111,16 @@ pub fn dashboard(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(c[2]);
-    top_users(f, mid[0], users, now);
+    let (u_sel, n_sel) = match focus {
+        Some((true, i)) => (Some(i), None),
+        Some((false, i)) => (None, Some(i)),
+        None => (None, None),
+    };
+    top_users(f, mid[0], users, now, u_sel);
     // 右边是**节点视图**,不是被控机视图。每台机器的网卡明细搬去了服务管理页的
     // 二级页面(按 Enter)—— 网卡是整机口径,和这里两张表用的用户口径不是一回事,
     // 摆在同一屏上并排比只会让人把两个数字当成同一个数字的两次统计(§6.4)。
-    top_nodes(f, mid[1], nodes, !agents.is_empty());
+    top_nodes(f, mid[1], nodes, !agents.is_empty(), n_sel);
 }
 
 fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], users: &[UserRow]) {
@@ -274,9 +284,27 @@ fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title
     );
 }
 
-fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
-    let mut top: Vec<&UserRow> = users.iter().collect();
-    top.sort_by_key(|u| std::cmp::Reverse(u.used()));
+/// 仪表盘「用量 Top」的行序:按计费用量从大到小。
+///
+/// 单独抽出来是因为**渲染和「Enter 打开谁」必须用同一份次序**。
+/// 两边各排一次的话,光标停在第 2 行、打开的却是另一个用户 ——
+/// 而这种错不会报任何错,只会给出一张属于别人的明细表。
+pub fn dashboard_user_order(users: &[UserRow]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..users.len()).collect();
+    idx.sort_by_key(|&i| std::cmp::Reverse(users[i].used()));
+    idx
+}
+
+/// 仪表盘「节点用量」的行序:按本周期用量从大到小。理由同上。
+pub fn dashboard_node_order(nodes: &[NodeRow]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..nodes.len()).collect();
+    idx.sort_by_key(|&i| std::cmp::Reverse(nodes[i].cycle_up.saturating_add(nodes[i].cycle_down)));
+    idx
+}
+
+fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option<usize>) {
+    let order = dashboard_user_order(users);
+    let top: Vec<&UserRow> = order.iter().map(|&i| &users[i]).collect();
     let rows = area.height.saturating_sub(2) as usize;
     let bar_w = (area.width.saturating_sub(46)).clamp(0, 16) as usize;
 
@@ -287,9 +315,13 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
             Style::default().fg(theme::DIM),
         )));
     }
-    for u in top.into_iter().take(rows) {
+    for (i, u) in top.into_iter().take(rows).enumerate() {
+        let picked = sel == Some(i);
         let mut spans = vec![
-            Span::styled(format!("  {}", theme::pad(&u.name, 12)), Style::default().fg(state_color(u))),
+            Span::styled(
+                format!("{}{}", if picked { "▸ " } else { "  " }, theme::pad(&u.name, 12)),
+                Style::default().fg(state_color(u)),
+            ),
             Span::styled(format!("↑{:>9} ", theme::bytes(u.cycle_up)), Style::default().fg(theme::UP)),
             Span::styled(
                 format!("↓{:>9} ", theme::bytes(u.cycle_down)),
@@ -327,11 +359,13 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64) {
                 }
             }
         }
-        lines.push(Line::from(spans));
+        let line = Line::from(spans);
+        lines.push(if picked { line.style(Style::default().bg(theme::ROW_BG)) } else { line });
     }
 
+    let title = if sel.is_some() { " 用量 Top(Enter 看明细) " } else { " 用量 Top " };
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" 用量 Top ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -345,9 +379,15 @@ const HOST_METRICS_STALE_AFTER: i64 = 90;
 /// 条形画的是**占全部节点总量的份额**,不是配额比例 —— 节点没有配额,
 /// 这里回答的问题是「量都堆在哪个节点上」。tag 后面必须跟机器名:
 /// tag 在不同机器上可以重名,只有 tag 的两行会长得一模一样。
-fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool) {
-    let mut top: Vec<&NodeRow> = nodes.iter().collect();
-    top.sort_by_key(|n| std::cmp::Reverse(n.cycle_up.saturating_add(n.cycle_down)));
+fn top_nodes(
+    f: &mut Frame,
+    area: Rect,
+    nodes: &[NodeRow],
+    has_agents: bool,
+    sel: Option<usize>,
+) {
+    let order = dashboard_node_order(nodes);
+    let top: Vec<&NodeRow> = order.iter().map(|&i| &nodes[i]).collect();
     let rows = area.height.saturating_sub(2) as usize;
     let total: i64 = nodes.iter().map(|n| n.cycle_up.saturating_add(n.cycle_down)).sum();
 
@@ -379,12 +419,14 @@ fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool) {
             Style::default().fg(theme::DIM),
         )));
     }
-    for n in top.into_iter().take(rows) {
+    for (i, n) in top.into_iter().take(rows).enumerate() {
+        let picked = sel == Some(i);
         let used = n.cycle_up.saturating_add(n.cycle_down);
         let share = if total > 0 { used as f64 / total as f64 } else { 0.0 };
         let mut spans = vec![
             Span::raw(format!(
-                "  {}",
+                "{}{}",
+                if picked { "▸ " } else { "  " },
                 theme::pad(&format!("{}@{}", n.tag, n.agent_name), label_w)
             )),
             Span::styled(format!("↑{:>9} ", theme::bytes(n.cycle_up)), Style::default().fg(theme::UP)),
@@ -401,12 +443,17 @@ fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool) {
                 Style::default().fg(theme::DIM),
             ));
         }
-        lines.push(Line::from(spans));
+        let line = Line::from(spans);
+        lines.push(if picked { line.style(Style::default().bg(theme::ROW_BG)) } else { line });
     }
 
+    let title = if sel.is_some() {
+        " 节点用量(% = 占全网份额,Enter 看明细) "
+    } else {
+        " 节点用量(% = 占全网份额) "
+    };
     f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" 节点用量(% = 占全网份额) ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
 }
@@ -1406,7 +1453,7 @@ mod tests {
             draw_to_string(w, h, |f| users(f, f.area(), &[user()], 0, "https://x.example", NOW));
             let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
             draw_to_string(w, h, |f| {
-                dashboard(f, f.area(), &[agent(None, None)], &[node()], &[user()], &hist, NOW)
+                dashboard(f, f.area(), &Dash { agents: &[agent(None, None)], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
             });
             draw_to_string(w, h, |f| {
                 settings(f, f.area(), &crate::tui::settings::all(&crate::config::Config::default()), 0)
@@ -1589,7 +1636,7 @@ mod tests {
         let hist: VecDeque<(f64, f64)> =
             (0..40).map(|i| (1000.0 * (i % 7) as f64, 800.0 * (i % 5) as f64)).collect();
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &[agent(Some(1000), Some(1)), offline], &[node()], &[user()], &hist, NOW)
+            dashboard(f, f.area(), &Dash { agents: &[agent(Some(1000), Some(1)), offline], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
         });
         assert!(has_cjk(&out, "在线 1"), "{out}");
         assert!(has_cjk(&out, "离线 1"), "{out}");
@@ -1605,7 +1652,7 @@ mod tests {
     fn a_chart_with_one_point_says_it_is_collecting() {
         let hist: VecDeque<(f64, f64)> = VecDeque::from(vec![(1.0, 2.0)]);
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &[agent(None, None)], &[], &[], &hist, NOW)
+            dashboard(f, f.area(), &Dash { agents: &[agent(None, None)], nodes: &[], users: &[], history: &hist, now: NOW, focus: None })
         });
         assert!(has_cjk(&out, "还在攒数据"), "{out}");
     }
@@ -1615,7 +1662,7 @@ mod tests {
     fn a_short_terminal_drops_the_chart_not_the_numbers() {
         let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
         let out = draw_to_string(120, 18, |f| {
-            dashboard(f, f.area(), &[agent(None, None)], &[node()], &[user()], &hist, NOW)
+            dashboard(f, f.area(), &Dash { agents: &[agent(None, None)], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
         });
         assert!(!has_cjk(&out, "上行  "), "矮屏不该画折线图:\n{out}");
         assert!(out.contains("alice"), "但明细必须留着:\n{out}");
@@ -1629,7 +1676,7 @@ mod tests {
     fn dashboard_bottom_row_is_users_and_nodes() {
         let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &[agent(Some(1 << 40), Some(22))], &[node()], &[user()], &hist, NOW)
+            dashboard(f, f.area(), &Dash { agents: &[agent(Some(1 << 40), Some(22))], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
         });
         assert!(has_cjk(&out, "用量 Top"), "用户视图要在:
 {out}");
@@ -1654,7 +1701,7 @@ mod tests {
         for w in [50u16, 57, 80, 100, 120, 160] {
             let out = draw_to_string(w, 10, |f| {
                 let a = f.area();
-                super::top_nodes(f, a, &rows, true)
+                super::top_nodes(f, a, &rows, true, None)
             });
             assert!(out.contains("100%"), "{w} 列下百分比被切了:
 {out}");
@@ -1751,7 +1798,7 @@ mod tests {
         for w in [60u16, 80, 120, 160] {
             let out = draw_to_string(w, 8, |f| {
                 let a = f.area();
-                super::top_nodes(f, a, &rows, true)
+                super::top_nodes(f, a, &rows, true, None)
             });
             assert!(
                 !out.contains('█') && !out.contains('░'),
@@ -1772,13 +1819,13 @@ mod tests {
     fn node_view_points_at_adding_a_machine_first() {
         let out = draw_to_string(60, 6, |f| {
             let a = f.area();
-            super::top_nodes(f, a, &[], false)
+            super::top_nodes(f, a, &[], false, None)
         });
         assert!(has_cjk(&out, "按 [2] 去服务管理页"), "{out}");
 
         let out = draw_to_string(60, 6, |f| {
             let a = f.area();
-            super::top_nodes(f, a, &[], true)
+            super::top_nodes(f, a, &[], true, None)
         });
         assert!(has_cjk(&out, "按 [3] 去节点页"), "{out}");
     }
@@ -1822,7 +1869,7 @@ mod tests {
     #[test]
     fn empty_dashboard_tells_you_what_to_do_next() {
         let empty: VecDeque<(f64, f64)> = VecDeque::new();
-        let out = draw_to_string(120, 30, |f| dashboard(f, f.area(), &[], &[], &[], &empty, NOW));
+        let out = draw_to_string(120, 30, |f| dashboard(f, f.area(), &Dash { agents: &[], nodes: &[], users: &[], history: &empty, now: NOW, focus: None }));
         assert!(has_cjk(&out, "按 [2] 去服务管理页"), "{out}");
         assert!(has_cjk(&out, "按 [4] 去用户页"), "{out}");
     }
@@ -1934,11 +1981,14 @@ mod tests {
             draw_to_string(120, 30, |f| dashboard(
                 f,
                 f.area(),
-                &agents_rows,
-                &node_rows,
-                &user_rows,
-                &hist,
-                NOW
+                &Dash {
+                    agents: &agents_rows,
+                    nodes: &node_rows,
+                    users: &user_rows,
+                    history: &hist,
+                    now: NOW,
+                    focus: Some((true, 0)),
+                },
             ))
         );
         println!(
