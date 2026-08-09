@@ -23,7 +23,7 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use super::data::{AgentRow, BreakdownRow, NodeRow, UserRow};
+use super::data::{self, AgentRow, BreakdownRow, NodeRow, UserRow};
 use super::forms;
 use super::theme;
 
@@ -285,6 +285,36 @@ fn net_chart(f: &mut Frame, area: Rect, data: &[(f64, f64)], color: Color, title
     );
 }
 
+/// 上下行那一对数字的显示宽度。
+///
+/// `theme::bytes` 最长吐 10 列(`1023.99 MB`),所以数字栏就是 10 ——
+/// 早先按 9 算,一旦落进 1000~1024 那一段(`1012.98 MB`)就撑破格子,
+/// 把右边的进度条和百分比整体推歪。
+const BYTES_COLS: usize = 10;
+
+/// 一对「↑ x  ↓ y」占多少列。`(箭头 + 空格 + 数字 + 分隔空格) × 2`。
+const TRAFFIC_PAIR_COLS: usize = (1 + 1 + BYTES_COLS + 1) * 2;
+
+/// 渲染「↑ 上行  ↓ 下行」这一对。
+///
+/// **数字左对齐,不是右对齐。** 右对齐(早先的 `↑{:>9}`)会让箭头到数字的
+/// 间距随数字长度变:8 位的 `20.00 GB` 前面空一格,9 位的 `110.00 GB` 一格不空。
+/// 而下行通常比上行大一位,于是同一行里系统性地「上行离箭头远、下行贴着箭头」,
+/// 看起来像两栏没对齐。左对齐后箭头后面恒定一个空格,数字起点也恒定 ——
+/// 右边那些列照样对得齐,因为整块宽度是固定的。
+fn traffic_pair(up: i64, down: i64) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("↑ {:<width$} ", theme::bytes(up), width = BYTES_COLS),
+            Style::default().fg(theme::UP),
+        ),
+        Span::styled(
+            format!("↓ {:<width$} ", theme::bytes(down), width = BYTES_COLS),
+            Style::default().fg(theme::DOWN),
+        ),
+    ]
+}
+
 /// 仪表盘「用量 Top」的行序:按计费用量从大到小。
 ///
 /// 单独抽出来是因为**渲染和「Enter 打开谁」必须用同一份次序**。
@@ -303,13 +333,26 @@ pub fn dashboard_node_order(nodes: &[NodeRow]) -> Vec<usize> {
     idx
 }
 
+/// 仪表盘用户视图里名字栏的宽度。
+///
+/// 比用户页那张表窄(12)—— 这里只占半屏,而右边还要摆倍率标记、上下行、
+/// 进度条和百分比。名字长了会被截,但截掉的名字看得出来(有 `…`),
+/// 被挤没的进度条看不出来(§13.4)。
+const TOP_NAME_COLS: usize = 10;
+
 fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option<usize>) {
     let order = dashboard_user_order(users);
     let top: Vec<&UserRow> = order.iter().map(|&i| &users[i]).collect();
     let rows = area.height.saturating_sub(2) as usize;
-    // 倍率标记占了名字栏右边 4 列(` x2 `),条子就得跟着让出来 ——
-    // 不减的话最窄的终端上会先切掉最右边的百分比,而那正是这一栏的重点。
-    let bar_w = (area.width.saturating_sub(50)).clamp(0, 16) as usize;
+    // 进度条从内框宽度往回算:缩进 + 名字 + 倍率标记 + 上下行那一对 + 百分比,
+    // 剩下的才是条的地方。拍一个常数的话,标记或数字栏一改宽度就对不上,
+    // 而对不上的表现是最右边的百分比被静默切掉(§13.4)。
+    let fixed =
+        2 + TOP_NAME_COLS + (data::MULT_TAG_COLS + 1) + TRAFFIC_PAIR_COLS + PCT_LABEL_COLS as usize;
+    // **内框宽**,不是 `area.width` —— 后者含左右两条边框。
+    // 多算这 2 列的表现就是最右边的百分比被切掉(`100%` 变成 `10`)。
+    let inner = area.width.saturating_sub(2) as usize;
+    let bar_w = inner.saturating_sub(fixed).clamp(0, 16);
 
     let mut lines: Vec<Line> = Vec::new();
     if top.is_empty() {
@@ -322,22 +365,22 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option
         let picked = sel == Some(i);
         let mut spans = vec![
             Span::styled(
-                format!("{}{}", if picked { "▸ " } else { "  " }, theme::pad(&u.name, 12)),
+                format!(
+                    "{}{}",
+                    if picked { "▸ " } else { "  " },
+                    theme::pad(&u.name, TOP_NAME_COLS)
+                ),
                 Style::default().fg(state_color(u)),
             ),
             // 倍率标记紧跟名字。摆在这里而不是行尾:这两栏上下行是**乘过倍率的**,
             // 标记要挨着它解释的那个数字,否则看到 `↓ 132 MB` 的人无从知道
             // 那已经是 ×2 之后的值(§6.3)。
-            Span::styled(theme::pad(&u.mult_tag(), 4), Style::default().fg(theme::DIM)),
             Span::styled(
-                format!("↑{:>9} ", theme::bytes(u.billed_up())),
-                Style::default().fg(theme::UP),
-            ),
-            Span::styled(
-                format!("↓{:>9} ", theme::bytes(u.billed_down())),
-                Style::default().fg(theme::DOWN),
+                theme::pad(&u.mult_tag(), data::MULT_TAG_COLS + 1),
+                Style::default().fg(theme::DIM),
             ),
         ];
+        spans.extend(traffic_pair(u.billed_up(), u.billed_down()));
         match u.quota_ratio() {
             Some(r) => {
                 if bar_w >= 4 {
@@ -411,7 +454,7 @@ fn top_nodes(
     // 于是一个跑了 90% 流量的健康节点看起来像「快爆了」。
     // 份额只留那个百分比,并在标题里写明是占比。
     let inner = area.width.saturating_sub(2) as usize;
-    let fixed = 2 + 11 + 11; // 缩进 + `↑{:>9} ` + `↓{:>9} `
+    let fixed = 2 + TRAFFIC_PAIR_COLS; // 缩进 + 「↑ 上行  ↓ 下行」
     let label_w = inner.saturating_sub(fixed + 5).clamp(8, 22);
     let rest = inner.saturating_sub(fixed + label_w);
     let show_pct = rest >= 5;
@@ -439,12 +482,8 @@ fn top_nodes(
                 if picked { "▸ " } else { "  " },
                 theme::pad(&format!("{}@{}", n.tag, n.agent_name), label_w)
             )),
-            Span::styled(format!("↑{:>9} ", theme::bytes(n.cycle_up)), Style::default().fg(theme::UP)),
-            Span::styled(
-                format!("↓{:>9} ", theme::bytes(n.cycle_down)),
-                Style::default().fg(theme::DOWN),
-            ),
         ];
+        spans.extend(traffic_pair(n.cycle_up, n.cycle_down));
         if show_pct {
             // 份额用中性色。跟着比例变红会把「这个节点承载得多」染成告警,
             // 而它恰恰是正常的 —— 只有配额才有「超了」这回事。
@@ -1079,16 +1118,21 @@ enum UCol {
 fn ucol_width(c: UCol) -> u16 {
     match c {
         UCol::Name => 12,
-        UCol::State => 11,
-        UCol::Up => 9,
-        UCol::Down => 9,
+        // 最长的是「◐ 自动停用」= 1+1+8 = 10 列(◐/●/○ 都是半角)。
+        UCol::State => 10,
+        // 10 而不是 9:`theme::bytes` 最长吐 10 列(`1012.98 MB` 这种落在
+        // 1000~1024 之间的值)。给 9 的话 ratatui 会静默截成 `1012.98 M`,
+        // 而「M」和「MB」差 1024 倍 —— 这种截断比对不齐危险得多。
+        UCol::Up => 10,
+        UCol::Down => 10,
         UCol::Usage => 20,
         UCol::Bar => 8,
         UCol::Reset => 6,
         // 「2025-12-04 3天」按终端列宽算 14(中文占两格),留一格余量。
         // 少一格的表现是「天」被切掉,而那正是这一列多出来的那点信息。
         UCol::Expire => 15,
-        UCol::Mult => 5,
+        // 内容 `2.0x` 和表头「倍率」都正好 4 列。
+        UCol::Mult => 4,
         UCol::Nodes => 4,
         UCol::Nic => 8,
     }
@@ -1155,7 +1199,8 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
             let cells: Vec<Cell> = cols
                 .iter()
                 .map(|col| match col {
-                    UCol::Name => Cell::from(theme::truncate(&u.name, 11)),                    UCol::State => {
+                    UCol::Name => Cell::from(theme::truncate(&u.name, 11)),
+                    UCol::State => {
                         Cell::from(Span::styled(mark.to_string(), Style::default().fg(color)))
                     }
                     UCol::Up => Cell::from(Span::styled(
@@ -1350,15 +1395,21 @@ pub fn breakdown(
         // 「这些量里谁占大头」,而配额比例在列表页已经有了。
         let share = if total > 0 { r.cycle() as f64 / total as f64 } else { 0.0 };
         let bar = if w >= 80 { theme::gradient_bar(share, 10) } else { Vec::new() };
-        let mut spans = vec![
-            Span::raw("  "),
-            Span::raw(theme::pad(&r.label, 22)),
-            Span::styled(format!("↑{:>9} ", theme::bytes(r.cycle_up)), Style::default().fg(theme::UP)),
-            Span::styled(
-                format!("↓{:>9}  ", theme::bytes(r.cycle_down)),
-                Style::default().fg(theme::DOWN),
-            ),
-        ];
+        // 名字和倍率标记分两个 span:标记是灰的,名字跟着主色 ——
+        // 与仪表盘用户视图同一个观感。拼成一个字符串就只能整体一个颜色。
+        //
+        // 两者合起来占 22 列(名字 + 空格 + 标记),没有标记的那一维
+        // (用户视图、网卡明细)名字独占这 22 列 —— 于是不管哪个方向,
+        // 右边的上下行都从同一列起。
+        let name_w = match &r.mult {
+            Some(_) => 22 - 1 - data::MULT_TAG_COLS,
+            None => 22,
+        };
+        let mut spans = vec![Span::raw("  "), Span::raw(theme::pad(&r.label, name_w))];
+        if let Some(m) = &r.mult {
+            spans.push(Span::styled(format!("{m} "), Style::default().fg(theme::DIM)));
+        }
+        spans.extend(traffic_pair(r.cycle_up, r.cycle_down));
         spans.extend(bar);
         spans.push(Span::styled(
             format!(" {:>3.0}%  ", share * 100.0),
@@ -1946,10 +1997,51 @@ mod tests {
         let out = draw_to_string(120, 30, |f| {
             dashboard(f, f.area(), &Dash { agents: &[], nodes: &[node()], users: &[double, single], history: &hist, now: NOW, focus: None })
         });
-        assert!(flat(&out).contains("alicex2"), "x2 该紧跟在名字后面:\n{out}");
-        // x1 也要标出来:省掉的话「没标记」有两种含义,而人分不出来。
-        assert!(flat(&out).contains("bobx1"), "单倍也要标:\n{out}");
+        assert!(flat(&out).contains("alice[2.0x]"), "[2.0x] 该紧跟在名字后面:\n{out}");
+        // 1.0x 也要标出来:省掉的话「没标记」有两种含义,而人分不出来。
+        assert!(flat(&out).contains("bob[1.0x]"), "单倍也要标:\n{out}");
         assert!(out.contains("40.00 GB") && out.contains("110.00 GB"), "上下行该乘过倍率:\n{out}");
+    }
+
+    /// **箭头到数字的距离恒定一格**,不随数字长短变。
+    ///
+    /// 早先用的是 `↑{:>9}`(右对齐):8 位的 `20.00 GB` 前面空一格,
+    /// 9 位的 `110.00 GB` 一格不空。而下行通常比上行大一位,于是同一行里
+    /// 系统性地「上行离箭头远、下行贴着箭头」,看着像两栏没对齐。
+    ///
+    /// 顺带盯住 10 位数(`1012.98 MB`,落在 1000~1024 那一段):
+    /// 9 列的格子装不下它,会把右边的条和百分比整体推歪。
+    #[test]
+    fn the_gap_after_each_arrow_never_changes() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        // 三种长度都摆上:7 位、9 位、10 位。
+        let rows = vec![
+            // 1_062_185_533 B = 1012.98 MB —— 正好 10 列,9 列的格子装不下。
+            NodeRow { cycle_up: 2_759_000, cycle_down: 1_062_185_533, ..node() },
+            NodeRow { id: 2, tag: "osaka".into(), cycle_up: 3 << 30, cycle_down: 1 << 30, ..node() },
+        ];
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &Dash { agents: &[], nodes: &rows, users: &[], history: &hist, now: NOW, focus: None })
+        });
+        for line in out.lines().filter(|l| l.contains('↑') && !l.contains("上行")) {
+            for arrow in ['↑', '↓'] {
+                let rest: String = match line.find(arrow) {
+                    Some(i) => line[i..].chars().skip(1).take(2).collect(),
+                    None => continue,
+                };
+                // 恰好一个空格:第一个是空格,第二个已经是数字了。
+                // 只断言「第一个是空格」是不够的 —— 右对齐短数字(`↑  2.63 MB`)
+                // 也满足那一条,而它正是要防的那种参差。
+                let mut c = rest.chars();
+                assert_eq!(c.next(), Some(' '), "{arrow} 后面要有一个空格:\n{line}");
+                assert!(
+                    !matches!(c.next(), Some(' ')),
+                    "{arrow} 后面只该有一个空格,多出来的是右对齐留的:\n{line}"
+                );
+            }
+        }
+        // 10 位的数字要完整,不能被截成 `1012.98 M`(M 和 MB 差 1024 倍)。
+        assert!(out.contains("1012.98 MB"), "10 位数该完整显示:\n{out}");
     }
 
     /// 概览页要能一眼看出有机器掉线、有人快超额。
@@ -2329,7 +2421,8 @@ mod tests {
         // 预览要照着生产的样子造,否则它会替一个不存在的界面背书。
         let bd = vec![
             BreakdownRow {
-                label: "alice x2".into(),
+                label: "alice".into(),
+                mult: Some("[2.0x]".into()),
                 note: "启用".into(),
                 cycle_up: 40 * 1_073_741_824,
                 cycle_down: 110 * 1_073_741_824,
@@ -2337,7 +2430,8 @@ mod tests {
                 total_down: 600 * 1_073_741_824,
             },
             BreakdownRow {
-                label: "bob x1".into(),
+                label: "bob".into(),
+                mult: Some("[1.0x]".into()),
                 note: "自动停用".into(),
                 cycle_up: 3 * 1_073_741_824,
                 cycle_down: 1_073_741_824,
@@ -2361,6 +2455,7 @@ mod tests {
         let nic_rows = vec![
             BreakdownRow {
                 label: "tokyo-reality".into(),
+                mult: None,
                 note: "2 人 · vless-reality".into(),
                 cycle_up: 20 * 1_073_741_824,
                 cycle_down: 55 * 1_073_741_824,
@@ -2369,6 +2464,7 @@ mod tests {
             },
             BreakdownRow {
                 label: "tokyo-ws".into(),
+                mult: None,
                 note: "0 人 · vless-ws".into(),
                 cycle_up: 0,
                 cycle_down: 0,

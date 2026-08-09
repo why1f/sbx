@@ -125,26 +125,31 @@ impl UserRow {
         self.node_ids.len()
     }
 
-    /// 用户名后面跟的那个倍率标记(`x2` / `x1` / `x1.5`)。
+    /// 用户名后面跟的那个倍率标记(`[2.0x]` / `[1.0x]` / `[1.5x]`)。
     ///
-    /// **不省略 `x1`。** 省了的话「没标记」有两种含义 —— 单倍、或者这一版
-    /// 还没做倍率显示 —— 而人分不出来。一律标出来,一列里全是 `x1` 也无妨,
+    /// **不省略 `[1.0x]`。** 省了的话「没标记」有两种含义 —— 单倍、或者这一版
+    /// 还没做倍率显示 —— 而人分不出来。一律标出来,一列里全是 `[1.0x]` 也无妨,
     /// 那本身就是「这些人都是单倍」的信息。
     pub fn mult_tag(&self) -> String {
         mult_tag(self.traffic_multiplier)
     }
 }
 
-/// 倍率标记的统一写法。整数倍不带小数点(`x2` 而不是 `x2.0`)——
-/// 这个标记要挤在用户名后面,省一个字符就是省一个字符。
+/// 倍率标记的统一写法:`[2.0x]`。
+///
+/// **一律带一位小数**,`[2.0x]` 而不是 `[2x]` —— 宽度恒定 6 列,
+/// 于是它右边那一栏在每一行都从同一个位置起,不会随倍率是不是整数而抖动。
+/// 1.5 这样的倍率也不用特殊处理。
+///
+/// 数字在前、`x` 在后,和口语「两倍」同序;方括号是为了让它读起来像个标签,
+/// 而不是黏在用户名尾巴上的一截乱码(`alice2.0x` 会被当成名字的一部分)。
 pub fn mult_tag(m: f64) -> String {
-    let m = m.max(0.0);
-    if (m - m.round()).abs() < 0.05 {
-        format!("x{:.0}", m)
-    } else {
-        format!("x{m:.1}")
-    }
+    format!("[{:.1}x]", m.max(0.0))
 }
+
+/// `mult_tag` 的显示宽度。恒定 6 列(`[9.9x]` 到 `[2.0x]` 都是)——
+/// 布局按它算预留,别在渲染处再写一遍字面量 6。
+pub const MULT_TAG_COLS: usize = 6;
 
 /// 原始字节数 × 倍率。负数(不该出现,但库里可能有)当 0 —— 一个负的
 /// 用量会让进度条和百分比一起变成负数,而那比显示 0 更难看懂。
@@ -190,6 +195,13 @@ impl UserRow {
 pub struct BreakdownRow {
     /// 对面那一维的名字:节点视图里是用户名,用户视图里是「tag(所属机器)」。
     pub label: String,
+    /// 名字后面那个灰色的倍率标记(`[2.0x]`)。**节点视图才有** ——
+    /// 那一维每行是一个用户,各有各的倍率;用户视图整张表同一个倍率,
+    /// 逐行重复只是噪声(它写在标题里)。
+    ///
+    /// 与 `label` 分开存,是因为两者**颜色不同**:名字跟着主色,标记是灰的。
+    /// 拼成一个字符串就只能整体一个颜色了。
+    pub mult: Option<String>,
     /// 灰色副标题:节点视图里是用户状态,用户视图里是协议与端口。
     pub note: String,
     pub cycle_up: i64,
@@ -231,9 +243,11 @@ pub async fn node_breakdown(pool: &SqlitePool, node_id: i64) -> Result<Vec<Break
     Ok(rows
         .into_iter()
         .map(|(name, enabled, auto, mult, cu, cd, tu, td)| BreakdownRow {
+            label: name,
             // 倍率标记跟在名字后面 —— 这一行的四个数字都乘过它,
             // 不标的话看到的人无从知道 `↓ 132 MB` 已经是 ×2 之后的值。
-            label: format!("{name} {}", mult_tag(mult)),
+            // 单独一个字段是为了让它渲染成灰色,和仪表盘用户视图一致。
+            mult: Some(mult_tag(mult)),
             note: match (enabled, auto) {
                 (true, _) => "启用".into(),
                 (false, true) => "自动停用".into(),
@@ -276,6 +290,8 @@ pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<Break
             // tag 在不同机器上可以重名,所以标签里必须带机器名 ——
             // 否则两行长得一模一样,只能靠顺序猜是哪一台。
             label: format!("{tag} @ {agent}"),
+            // 整张表同一个用户,倍率写在标题里(见 `ShowUserNodes`)。
+            mult: None,
             note: format!("{proto} · :{port}"),
             cycle_up: billed(cu, mult),
             cycle_down: billed(cd, mult),
@@ -322,6 +338,8 @@ pub async fn agent_breakdown(pool: &SqlitePool, agent_id: i64) -> Result<Vec<Bre
         .into_iter()
         .map(|(tag, proto, _port, users, cu, cd, tu, td)| BreakdownRow {
             label: tag,
+            // 一行是一个节点,上面混着多个倍率不同的用户 —— 没有单一倍率可标。
+            mult: None,
             // 人数排在最前面:这一页问的是「量堆在哪」,而「几个人在用」是
             // 紧接着的下一个问题。端口不写 —— 它是节点页的事,和流量对账无关,
             // 而这一栏窄到装不下所有东西时,先被截掉的正是最右边那一段。
@@ -1021,13 +1039,18 @@ mod tests {
         assert_eq!(nodes[0].cycle_down, 900);
 
         // 节点二级页面:每行是一个用户,各自带自己的标记和乘过的数字。
+        // 标记与名字**分开存**(渲染时颜色不同),所以这里分开断言。
         let by_user = node_breakdown(&p, node_id).await.unwrap();
-        let d = by_user.iter().find(|r| r.label.starts_with("double")).unwrap();
-        assert_eq!(d.label, "double x2", "名字后面要带倍率标记:{}", d.label);
+        let d = by_user.iter().find(|r| r.label == "double").unwrap();
+        assert_eq!(d.mult.as_deref(), Some("[2.0x]"), "名字后面要带倍率标记");
         assert_eq!((d.cycle_up, d.cycle_down), (200, 600));
-        let s = by_user.iter().find(|r| r.label.starts_with("alice")).unwrap();
-        assert_eq!(s.label, "alice x1", "单倍也要标出来:{}", s.label);
+        let s = by_user.iter().find(|r| r.label == "alice").unwrap();
+        assert_eq!(s.mult.as_deref(), Some("[1.0x]"), "单倍也要标出来");
         assert_eq!((s.cycle_up, s.cycle_down), (100, 300));
+
+        // 用户方向整张表同一个倍率,标记在标题里,行上不带。
+        let by_node = user_breakdown(&p, double).await.unwrap();
+        assert!(by_node.iter().all(|r| r.mult.is_none()), "用户视图的行不该逐行重复倍率");
     }
 
     async fn set_mult(p: &SqlitePool, user_id: i64, mult: f64) {

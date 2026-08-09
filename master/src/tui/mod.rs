@@ -2491,11 +2491,12 @@ mod tests {
         assert_eq!(app.users[0].node_ids, vec![node_id]);
 
         // 用量明细两个方向都要查得出来(节点页 / 用户页的 Enter)。
-        // 节点方向的行名带倍率标记 —— 同一个节点上的用户可以各是各的倍率,
+        // 节点方向每行带倍率标记 —— 同一个节点上的用户可以各是各的倍率,
         // 而那一行的数字都乘过它,不标就没法解释(§6.3)。
         let by_node = data::node_breakdown(&app.pool, node_id).await.unwrap();
         assert_eq!(by_node.len(), 1);
-        assert_eq!(by_node[0].label, "alice x2", "{}", by_node[0].label);
+        assert_eq!(by_node[0].label, "alice");
+        assert_eq!(by_node[0].mult.as_deref(), Some("[2.0x]"));
         let by_user = data::user_breakdown(&app.pool, uid).await.unwrap();
         assert_eq!(by_user.len(), 1);
         assert!(by_user[0].label.starts_with("tokyo-reality @ tokyo-1"), "{}", by_user[0].label);
