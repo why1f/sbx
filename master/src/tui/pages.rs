@@ -600,8 +600,17 @@ fn state_color(u: &UserRow) -> Color {
 
 // ─────────────────────────── agents(两行式)───────────────────────────
 
-/// 「流量」列在宽屏下的目标宽度。
+/// 「流量」列在**重置日还跟在它后面**时的宽度(窄屏回退那条路)。
+/// 第二行要装下「条 + 百分比 + 每月 22 日重置」。
 const TRAFFIC_COL: u16 = 38;
+
+/// 「流量」列在**重置日已经有自己一列**时的宽度。
+///
+/// 那时第二行只剩「一格缩进 + 条(20) + 百分比(5)」= 26,第一行
+/// 「999.99 GB / 999.99 GB」也就 21。再宽出去的部分是纯空白 ——
+/// 而空白会把后面的重置/出站/主机白白推远(拆列之后就是这个毛病:
+/// 百分比和重置日中间隔着十几格,看起来像两块不相干的东西)。
+const TRAFFIC_COL_TIGHT: u16 = 26;
 /// 「主机」列(CPU / 内存)。只在**宽到有余量**时才出现 ——
 /// 它是最锦上添花的一列,不该从流量或重置日那里抢地方。
 const HOST_COL: u16 = 22;
@@ -676,6 +685,11 @@ fn columns(total_width: u16) -> Cols {
     // 重置列排在出站之后、主机之前让位:它比 CPU/内存要紧(「这个号什么时候
     // 清零」是运营信息),但比出站策略次要 —— 后者是个能当场改的开关。
     let reset = if avail > ideal_sum + OUTBOUND_COL + RESET_COL { RESET_COL } else { 0 };
+
+    // 重置日搬进自己那一列之后,流量列不必再给那句话留位置 —— **收窄它**。
+    // 不收的话右边会空出十几格,把重置/出站/主机整体推远,而百分比和重置日
+    // 本来该是挨着的。这一行是那个「太远了」的直接修法。
+    let traffic = if reset > 0 { traffic.min(TRAFFIC_COL_TIGHT) } else { traffic };
 
     // 进度条用流量列里除去重置日之后剩下的地方。剩不下 4 格就别画了:
     // 三四格的条读不出比例,只是占地方 —— 那时改用文字百分比。
@@ -1618,6 +1632,46 @@ mod tests {
         assert_eq!((c.outbound, c.host), (0, 0), "70 列该把两个都让掉");
         let out = draw_to_string(70, 6, |f| agents(f, f.area(), &[agent(None, None)], 0, NOW));
         assert!(!out.is_empty());
+    }
+
+    /// 重置日拆出去之后,流量列要**跟着收窄**。
+    ///
+    /// 不收的话它还按「重置日跟在后面」那会儿的 38 列算,而实际内容只有 25 ——
+    /// 右边空出十几格,把重置 / 出站 / 主机整体推远,百分比和重置日中间隔着
+    /// 一大片空白,看起来像两块不相干的东西。用户就是这么报的。
+    ///
+    /// 反过来,窄屏回退(重置日回到流量列第二行)时**不能**收窄:
+    /// 那时那一行要装下「条 + 百分比 + 每月 22 日重置」。
+    #[test]
+    fn the_traffic_column_tightens_once_reset_moves_out() {
+        // 宽屏:重置列在,流量列该收到 TIGHT。
+        let wide = columns(140);
+        assert!(wide.reset > 0, "140 列该有重置列");
+        assert_eq!(wide.traffic, super::TRAFFIC_COL_TIGHT, "重置搬走了,流量列该收窄");
+
+        // 窄屏:重置列没了,流量列得留着原来的宽度装那句话。
+        let narrow = columns(100);
+        assert_eq!(narrow.reset, 0, "100 列放不下重置列");
+        assert_eq!(narrow.traffic, super::TRAFFIC_COL, "回退时不该收窄");
+
+        // 收窄之后条仍然画得出来(收过头会把条挤没,那是另一种退化)。
+        assert!(wide.bar >= 4, "收窄后仍该画得下进度条:bar={}", wide.bar);
+
+        // 渲染出来核对:百分比和「每月」之间不该隔着一大片空白。
+        let out = draw_to_string(140, 6, |f| {
+            agents(f, f.area(), &[agent(Some(500 * 1_073_741_824), Some(22))], 0, NOW)
+        });
+        let line = out
+            .lines()
+            .find(|l| l.contains('%') && l.contains('█'))
+            .expect("该有一行同时带条和百分比");
+        // 从**进度条**往右找那个百分比。用 rfind('%') 会命中主机列的
+        // 「内存 38%」,而那在重置日右边 —— 切片会反过来直接 panic。
+        let bar_end = line.rfind('░').or_else(|| line.rfind('█')).expect("该有条");
+        let pct_end = bar_end + line[bar_end..].find('%').expect("条右边该是百分比");
+        let reset_at = pct_end + line[pct_end..].find("22").expect("再往右该是重置日");
+        let gap = line[pct_end + 1..reset_at].chars().filter(|c| *c == ' ').count();
+        assert!(gap <= 6, "百分比和重置日之间空了 {gap} 格,太远:\n{out}");
     }
 
     /// **任何宽度下重置日都得看得见**(§13.4)。
