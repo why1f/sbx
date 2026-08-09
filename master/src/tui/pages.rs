@@ -295,6 +295,27 @@ const BYTES_COLS: usize = 10;
 /// 一对「↑ x  ↓ y」占多少列。`(箭头 + 空格 + 数字 + 分隔空格) × 2`。
 const TRAFFIC_PAIR_COLS: usize = (1 + 1 + BYTES_COLS + 1) * 2;
 
+/// 「名字 + 倍率标记」这一段,整体占 `total` 列。
+///
+/// **标记紧跟名字,空位补在标记右边。** 反过来(先把名字补满再接标记)
+/// 会让短名字后面空出一大片、标记反而贴到右边的箭头上 ——
+/// `admin     [2.0x] ↑ 5.26 MB` 里那个标记看起来是在解释箭头,
+/// 而它解释的是左边那个名字。
+///
+/// 两个 span 而不是一个字符串:名字跟着状态色(启用/停用),标记恒定是灰的。
+fn name_with_mult(name: &str, mult: &str, total: usize, name_style: Style) -> Vec<Span<'static>> {
+    // 名字最多占「总宽 - 标记 - 中间那一格」,长了截断(带 `…`,看得出来)。
+    let name_w = total.saturating_sub(mult.chars().count() + 1);
+    let shown = theme::truncate(name, name_w);
+    // 补的空格数按**实际画出来的宽度**算,不是按 `name_w` ——
+    // 名字短的时候两者差很多,按后者补会把标记又推回右边去。
+    let pad = total.saturating_sub(theme::cols(&shown) + 1 + mult.chars().count());
+    vec![
+        Span::styled(shown, name_style),
+        Span::styled(format!(" {mult}{}", " ".repeat(pad)), Style::default().fg(theme::DIM)),
+    ]
+}
+
 /// 渲染「↑ 上行  ↓ 下行」这一对。
 ///
 /// **数字左对齐,不是右对齐。** 右对齐(早先的 `↑{:>9}`)会让箭头到数字的
@@ -333,22 +354,25 @@ pub fn dashboard_node_order(nodes: &[NodeRow]) -> Vec<usize> {
     idx
 }
 
-/// 仪表盘用户视图里名字栏的宽度。
+/// 仪表盘用户视图里「名字 + 倍率标记」整段的宽度。
 ///
-/// 比用户页那张表窄(12)—— 这里只占半屏,而右边还要摆倍率标记、上下行、
-/// 进度条和百分比。名字长了会被截,但截掉的名字看得出来(有 `…`),
+/// 比用户页那张表窄 —— 这里只占半屏,而右边还要摆上下行、进度条和百分比。
+/// 名字长了会被截,但截掉的名字看得出来(有 `…`),
 /// 被挤没的进度条看不出来(§13.4)。
-const TOP_NAME_COLS: usize = 10;
+///
+/// 名字实际能占的是这个减去标记和中间那一格,即 10 列。
+const NAME_MULT_COLS: usize = 10 + 1 + data::MULT_TAG_COLS;
 
 fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option<usize>) {
     let order = dashboard_user_order(users);
     let top: Vec<&UserRow> = order.iter().map(|&i| &users[i]).collect();
     let rows = area.height.saturating_sub(2) as usize;
-    // 进度条从内框宽度往回算:缩进 + 名字 + 倍率标记 + 上下行那一对 + 百分比,
+    // 进度条从内框宽度往回算:缩进 + 名字段 + 上下行那一对 + 百分比,
     // 剩下的才是条的地方。拍一个常数的话,标记或数字栏一改宽度就对不上,
     // 而对不上的表现是最右边的百分比被静默切掉(§13.4)。
-    let fixed =
-        2 + TOP_NAME_COLS + (data::MULT_TAG_COLS + 1) + TRAFFIC_PAIR_COLS + PCT_LABEL_COLS as usize;
+    //
+    // 名字段右边再留一格 —— 标记和箭头之间总得有个缝。
+    let fixed = 2 + NAME_MULT_COLS + 1 + TRAFFIC_PAIR_COLS + PCT_LABEL_COLS as usize;
     // **内框宽**,不是 `area.width` —— 后者含左右两条边框。
     // 多算这 2 列的表现就是最右边的百分比被切掉(`100%` 变成 `10`)。
     let inner = area.width.saturating_sub(2) as usize;
@@ -363,23 +387,16 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option
     }
     for (i, u) in top.into_iter().take(rows).enumerate() {
         let picked = sel == Some(i);
-        let mut spans = vec![
-            Span::styled(
-                format!(
-                    "{}{}",
-                    if picked { "▸ " } else { "  " },
-                    theme::pad(&u.name, TOP_NAME_COLS)
-                ),
-                Style::default().fg(state_color(u)),
-            ),
-            // 倍率标记紧跟名字。摆在这里而不是行尾:这两栏上下行是**乘过倍率的**,
-            // 标记要挨着它解释的那个数字,否则看到 `↓ 132 MB` 的人无从知道
-            // 那已经是 ×2 之后的值(§6.3)。
-            Span::styled(
-                theme::pad(&u.mult_tag(), data::MULT_TAG_COLS + 1),
-                Style::default().fg(theme::DIM),
-            ),
-        ];
+        let mut spans = vec![Span::raw(if picked { "▸ " } else { "  " })];
+        // 倍率标记紧跟名字。摆在这里而不是行尾:这两栏上下行是**乘过倍率的**,
+        // 标记要挨着它解释的那个数字,否则看到 `↓ 132 MB` 的人无从知道
+        // 那已经是 ×2 之后的值(§6.3)。
+        spans.extend(name_with_mult(
+            &u.name,
+            &u.mult_tag(),
+            NAME_MULT_COLS,
+            Style::default().fg(state_color(u)),
+        ));
         spans.extend(traffic_pair(u.billed_up(), u.billed_down()));
         match u.quota_ratio() {
             Some(r) => {
@@ -1360,6 +1377,12 @@ pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], s
 /// 两个方向共用一个渲染:它们查的是 `user_traffic` 的同一张表,只是分组的那一维不同。
 /// 表里同时给**本周期**和**累计**:本周期是计费口径(会被月重置清零),
 /// 累计是从建账起的总量 —— 只给其中一个,总会有人拿它去回答另一个问题。
+/// 二级页面里「名字(+ 倍率标记)」整段的宽度。
+///
+/// 带标记和不带标记的行占一样宽 —— 二级页面上下两块可能是不同的维度
+/// (节点视图列用户、用户视图列节点),宽度不一致的话上下行会错开一格。
+const BD_NAME_COLS: usize = 22;
+
 pub fn breakdown(
     f: &mut Frame,
     area: Rect,
@@ -1398,17 +1421,15 @@ pub fn breakdown(
         // 名字和倍率标记分两个 span:标记是灰的,名字跟着主色 ——
         // 与仪表盘用户视图同一个观感。拼成一个字符串就只能整体一个颜色。
         //
-        // 两者合起来占 22 列(名字 + 空格 + 标记),没有标记的那一维
-        // (用户视图、网卡明细)名字独占这 22 列 —— 于是不管哪个方向,
-        // 右边的上下行都从同一列起。
-        let name_w = match &r.mult {
-            Some(_) => 22 - 1 - data::MULT_TAG_COLS,
-            None => 22,
-        };
-        let mut spans = vec![Span::raw("  "), Span::raw(theme::pad(&r.label, name_w))];
-        if let Some(m) = &r.mult {
-            spans.push(Span::styled(format!("{m} "), Style::default().fg(theme::DIM)));
+        // 两者合起来占 22 列;没有标记的那一维(用户视图、网卡明细)
+        // 名字独占这 22 列 —— 于是不管哪个方向,右边的上下行都从同一列起。
+        let mut spans = vec![Span::raw("  ")];
+        match &r.mult {
+            Some(m) => spans.extend(name_with_mult(&r.label, m, BD_NAME_COLS, Style::default())),
+            None => spans.push(Span::raw(theme::pad(&r.label, BD_NAME_COLS))),
         }
+        // 名字段和箭头之间留一格,和仪表盘那边一致。
+        spans.push(Span::raw(" "));
         spans.extend(traffic_pair(r.cycle_up, r.cycle_down));
         spans.extend(bar);
         spans.push(Span::styled(
@@ -1997,10 +2018,43 @@ mod tests {
         let out = draw_to_string(120, 30, |f| {
             dashboard(f, f.area(), &Dash { agents: &[], nodes: &[node()], users: &[double, single], history: &hist, now: NOW, focus: None })
         });
-        assert!(flat(&out).contains("alice[2.0x]"), "[2.0x] 该紧跟在名字后面:\n{out}");
+        // **按原样断言,不走 `flat`。** `flat` 把空白全删掉,于是
+        // `alice     [2.0x]`(标记被推到箭头旁边)和 `alice [2.0x]` 一样能过 ——
+        // 而这条测试要盯的正是这两者的区别。
+        assert!(out.contains("alice [2.0x]"), "[2.0x] 该紧跟在名字后面:\n{out}");
         // 1.0x 也要标出来:省掉的话「没标记」有两种含义,而人分不出来。
-        assert!(flat(&out).contains("bob[1.0x]"), "单倍也要标:\n{out}");
+        assert!(out.contains("bob [1.0x]"), "单倍也要标:\n{out}");
         assert!(out.contains("40.00 GB") && out.contains("110.00 GB"), "上下行该乘过倍率:\n{out}");
+    }
+
+    /// 名字长短不同的两行,标记都紧跟各自的名字,而**右边的箭头仍然对齐**。
+    ///
+    /// 这两件事看着矛盾,做法是把空位补在标记右边而不是名字右边。
+    /// 反过来(先把名字补满再接标记)就是 v0.4.6 那个观感问题:
+    /// `admin     [2.0x] ↑ 5.26 MB` —— 标记贴着箭头,看起来像在解释箭头,
+    /// 而它解释的是左边那个名字。
+    #[test]
+    fn the_multiplier_tag_hugs_the_name_while_the_arrows_stay_aligned() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        let short = UserRow { id: 1, name: "ad".into(), traffic_multiplier: 2.0, ..user() };
+        let long = UserRow { id: 2, name: "a-long-name".into(), traffic_multiplier: 1.0, ..user() };
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &Dash { agents: &[], nodes: &[], users: &[short, long], history: &hist, now: NOW, focus: None })
+        });
+
+        let rows: Vec<&str> =
+            out.lines().filter(|l| l.contains("[2.0x]") || l.contains("[1.0x]")).collect();
+        assert_eq!(rows.len(), 2, "该有两行用户:\n{out}");
+        let mut arrow_at = Vec::new();
+        for line in &rows {
+            let ch: Vec<char> = line.chars().collect();
+            let at = ch.iter().position(|&c| c == '[').unwrap();
+            // 标记前恰好一格空白,而再往左不是空白 —— 即标记贴着名字末尾。
+            assert_eq!(ch[at - 1], ' ', "标记前该有一格:{line}");
+            assert_ne!(ch[at - 2], ' ', "标记前只该有一格,名字长短都一样:{line}");
+            arrow_at.push(ch.iter().position(|&c| c == '↑').unwrap());
+        }
+        assert_eq!(arrow_at[0], arrow_at[1], "名字长短不同,箭头仍要对齐:\n{out}");
     }
 
     /// **箭头到数字的距离恒定一格**,不随数字长短变。
