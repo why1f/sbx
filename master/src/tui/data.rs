@@ -83,9 +83,12 @@ pub struct NodeRow {
     pub protocol: String,
     pub listen_port: i64,
     pub user_count: i64,
-    /// 这个节点上**所有用户**本周期用量之和。仪表盘的节点视图按它排序。
+    /// 这个节点上**所有用户**本周期用量之和,**已含各自的计费倍率**。
     ///
-    /// 与 `agents` 上的网卡数字是两个口径:这里是 sing-box 记的账,
+    /// 倍率在 SQL 里就乘进去了(`SUM(t.cycle_up * u.traffic_multiplier)`),
+    /// 因为一个节点上的用户各有各的倍率 —— 先求和再乘一个「平均倍率」是算不出来的。
+    ///
+    /// 与 `agents` 上的网卡数字仍是两个口径:这里是 sing-box 记的账 × 倍率,
     /// 网卡是整机进出(§6.4 / §7.2)。两个数对不上是正常的,不是 bug。
     pub cycle_up: i64,
     pub cycle_down: i64,
@@ -122,11 +125,55 @@ impl UserRow {
         self.node_ids.len()
     }
 
+    /// 用户名后面跟的那个倍率标记(`x2` / `x1` / `x1.5`)。
+    ///
+    /// **不省略 `x1`。** 省了的话「没标记」有两种含义 —— 单倍、或者这一版
+    /// 还没做倍率显示 —— 而人分不出来。一律标出来,一列里全是 `x1` 也无妨,
+    /// 那本身就是「这些人都是单倍」的信息。
+    pub fn mult_tag(&self) -> String {
+        mult_tag(self.traffic_multiplier)
+    }
+}
+
+/// 倍率标记的统一写法。整数倍不带小数点(`x2` 而不是 `x2.0`)——
+/// 这个标记要挤在用户名后面,省一个字符就是省一个字符。
+pub fn mult_tag(m: f64) -> String {
+    let m = m.max(0.0);
+    if (m - m.round()).abs() < 0.05 {
+        format!("x{:.0}", m)
+    } else {
+        format!("x{m:.1}")
+    }
+}
+
+/// 原始字节数 × 倍率。负数(不该出现,但库里可能有)当 0 —— 一个负的
+/// 用量会让进度条和百分比一起变成负数,而那比显示 0 更难看懂。
+fn billed(raw: i64, mult: f64) -> i64 {
+    (raw.max(0) as f64 * mult.max(0.0)) as i64
+}
+
+impl UserRow {
+    /// 计费口径的上行/下行。**界面上一律显示这两个**,不显示 `cycle_up/cycle_down`。
+    ///
+    /// 原始字段留着不动:它们是库里的真值,也是订阅头、明细对账要回溯的东西。
+    /// 但摆在人眼前的数字必须和配额判定同一个口径 —— 早先上下行是单倍、
+    /// 总量是倍率后的,于是「↑ 2.63 MB ↓ 132.03 MB」加起来对不上旁边的「累计 269 MB」,
+    /// 看着像统计坏了,实际上只是两栏在用两套账。
+    pub fn billed_up(&self) -> i64 {
+        billed(self.cycle_up, self.traffic_multiplier)
+    }
+
+    pub fn billed_down(&self) -> i64 {
+        billed(self.cycle_down, self.traffic_multiplier)
+    }
+
     /// 计费口径的已用量:含倍率。与 §6.3 的配额判定一致 ——
     /// 两处口径不同会让「列表显示 80%」和「已经被停用」同时出现。
+    ///
+    /// 分别乘再相加,**不是**相加再乘:后者会和上下行两栏差最多 1 字节,
+    /// 而这一栏就摆在那两栏旁边,差一个字节也是肉眼可见的对不上。
     pub fn used(&self) -> i64 {
-        let raw = self.cycle_up.saturating_add(self.cycle_down);
-        (raw as f64 * self.traffic_multiplier.max(0.0)) as i64
+        self.billed_up().saturating_add(self.billed_down())
     }
 
     pub fn quota_ratio(&self) -> Option<f64> {
@@ -157,51 +204,63 @@ impl BreakdownRow {
     }
 }
 
-/// 某个节点上,各用户的用量。
+/// `user_nodes` × `users` × `user_traffic` 的一行(节点视图)。
+type NodeUserRow = (String, bool, bool, f64, i64, i64, i64, i64);
+
+/// 某个节点上,各用户的用量。**数字含各用户自己的计费倍率**,名字后面带 `x2` 标记。
 ///
 /// `LEFT JOIN`:分配了但还没跑过流量的用户也要出现(全 0)——
 /// 「分配了没生效」正是最需要看见的一种情况,内连接会把它整行藏起来。
 pub async fn node_breakdown(pool: &SqlitePool, node_id: i64) -> Result<Vec<BreakdownRow>> {
-    let rows: Vec<(String, bool, bool, i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT u.name, u.enabled, u.auto_disabled,
+    // 倍率取出来在 Rust 里乘,不在 SQL 里:这一行只关联一个用户,
+    // 而标记 `x2` 也要用到这个值,查一次比查两次好。
+    let rows: Vec<NodeUserRow> = sqlx::query_as(
+        "SELECT u.name, u.enabled, u.auto_disabled, u.traffic_multiplier,
                 COALESCE(t.cycle_up, 0), COALESCE(t.cycle_down, 0),
                 COALESCE(t.total_up, 0), COALESCE(t.total_down, 0)
            FROM user_nodes un
            JOIN users u ON u.id = un.user_id
            LEFT JOIN user_traffic t ON t.user_id = un.user_id AND t.node_id = un.node_id
           WHERE un.node_id = ?
-          ORDER BY (COALESCE(t.cycle_up, 0) + COALESCE(t.cycle_down, 0)) DESC, u.name",
+          ORDER BY (COALESCE(t.cycle_up, 0) + COALESCE(t.cycle_down, 0))
+                     * u.traffic_multiplier DESC, u.name",
     )
     .bind(node_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(name, enabled, auto, cu, cd, tu, td)| BreakdownRow {
-            label: name,
+        .map(|(name, enabled, auto, mult, cu, cd, tu, td)| BreakdownRow {
+            // 倍率标记跟在名字后面 —— 这一行的四个数字都乘过它,
+            // 不标的话看到的人无从知道 `↓ 132 MB` 已经是 ×2 之后的值。
+            label: format!("{name} {}", mult_tag(mult)),
             note: match (enabled, auto) {
                 (true, _) => "启用".into(),
                 (false, true) => "自动停用".into(),
                 (false, false) => "手动停用".into(),
             },
-            cycle_up: cu,
-            cycle_down: cd,
-            total_up: tu,
-            total_down: td,
+            cycle_up: billed(cu, mult),
+            cycle_down: billed(cd, mult),
+            total_up: billed(tu, mult),
+            total_down: billed(td, mult),
         })
         .collect())
 }
 
 /// `user_nodes` × `nodes` × `agents` × `user_traffic` 的一行。
-type UserNodeRow = (String, String, String, i64, i64, i64, i64, i64);
+type UserNodeRow = (String, String, String, i64, f64, i64, i64, i64, i64);
 
-/// 某个用户在各节点上的用量。
+/// 某个用户在各节点上的用量。**数字含这个用户的计费倍率。**
+///
+/// 这里的行不带 `x2` 标记:整张表都是同一个用户,标记会在每一行重复一遍 ——
+/// 它属于标题(调用方会写进 `head`),不属于行。
 pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<BreakdownRow>> {
     let rows: Vec<UserNodeRow> = sqlx::query_as(
-        "SELECT n.tag, a.name, n.protocol, n.listen_port,
+        "SELECT n.tag, a.name, n.protocol, n.listen_port, u.traffic_multiplier,
                 COALESCE(t.cycle_up, 0), COALESCE(t.cycle_down, 0),
                 COALESCE(t.total_up, 0), COALESCE(t.total_down, 0)
            FROM user_nodes un
+           JOIN users u  ON u.id = un.user_id
            JOIN nodes n  ON n.id = un.node_id
            JOIN agents a ON a.id = n.agent_id
            LEFT JOIN user_traffic t ON t.user_id = un.user_id AND t.node_id = un.node_id
@@ -213,15 +272,15 @@ pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<Break
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(tag, agent, proto, port, cu, cd, tu, td)| BreakdownRow {
+        .map(|(tag, agent, proto, port, mult, cu, cd, tu, td)| BreakdownRow {
             // tag 在不同机器上可以重名,所以标签里必须带机器名 ——
             // 否则两行长得一模一样,只能靠顺序猜是哪一台。
             label: format!("{tag} @ {agent}"),
             note: format!("{proto} · :{port}"),
-            cycle_up: cu,
-            cycle_down: cd,
-            total_up: tu,
-            total_down: td,
+            cycle_up: billed(cu, mult),
+            cycle_down: billed(cd, mult),
+            total_up: billed(tu, mult),
+            total_down: billed(td, mult),
         })
         .collect())
 }
@@ -229,25 +288,32 @@ pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<Break
 /// `nodes` × `user_traffic` 聚合后的一行。
 type AgentNodeRow = (String, String, i64, i64, i64, i64, i64, i64);
 
-/// 某台被控机上,各节点的用量。
+/// 某台被控机上,各节点的用量。**节点那几个数含各用户自己的计费倍率**,
+/// 与页头几行的网卡口径**不是**一回事 —— 这正是这一页要并排给出两者的原因。
 ///
 /// 这是「网卡明细」二级页面的主体:先看整机网卡烧了多少(在 head 那几行),
 /// 再看这台机器上是哪个节点在跑量。两个口径不同,**必须并排看**才有意义 ——
-/// 网卡是整机进出(含系统更新、别的服务),节点是 sing-box 记的账(§6.4)。
+/// 网卡是整机进出(含系统更新、别的服务),节点是 sing-box 记的账 × 倍率(§6.4)。
 ///
 /// `LEFT JOIN`:建了但一次没跑过的节点也要出现(全 0)。
 /// 「配了没生效」正是最需要看见的情况,内连接会把它整行藏起来。
 pub async fn agent_breakdown(pool: &SqlitePool, agent_id: i64) -> Result<Vec<BreakdownRow>> {
+    // 一个节点上的用户各有各的倍率,所以要逐用户乘完再 SUM(理由同 `load_nodes`)。
+    // `users` 走 LEFT JOIN 是为了保住上面那条「没跑过的节点也要出现」——
+    // 内连接会在 `user_traffic` 为空时把整行滤掉。
     let rows: Vec<AgentNodeRow> = sqlx::query_as(
         "SELECT n.tag, n.protocol, n.listen_port,
                 (SELECT COUNT(*) FROM user_nodes un WHERE un.node_id = n.id),
-                COALESCE(SUM(t.cycle_up), 0),   COALESCE(SUM(t.cycle_down), 0),
-                COALESCE(SUM(t.total_up), 0),   COALESCE(SUM(t.total_down), 0)
+                COALESCE(CAST(SUM(t.cycle_up   * u.traffic_multiplier) AS INTEGER), 0),
+                COALESCE(CAST(SUM(t.cycle_down * u.traffic_multiplier) AS INTEGER), 0),
+                COALESCE(CAST(SUM(t.total_up   * u.traffic_multiplier) AS INTEGER), 0),
+                COALESCE(CAST(SUM(t.total_down * u.traffic_multiplier) AS INTEGER), 0)
            FROM nodes n
            LEFT JOIN user_traffic t ON t.node_id = n.id
+           LEFT JOIN users u        ON u.id = t.user_id
           WHERE n.agent_id = ?
           GROUP BY n.id
-          ORDER BY (COALESCE(SUM(t.cycle_up), 0) + COALESCE(SUM(t.cycle_down), 0)) DESC, n.id",
+          ORDER BY COALESCE(SUM((t.cycle_up + t.cycle_down) * u.traffic_multiplier), 0) DESC, n.id",
     )
     .bind(agent_id)
     .fetch_all(pool)
@@ -513,11 +579,19 @@ pub async fn load_agents(
 type NodeQueryRow = (i64, i64, String, String, String, i64, i64, i64, i64, String);
 
 pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
+    // 倍率要**逐用户**乘进去再求和:一个节点上的用户各有各的倍率,
+    // 先 SUM 再乘一个数是算不出来的。`CAST(... AS INTEGER)` 不能省 ——
+    // `traffic_multiplier` 是 REAL,乘出来的和也是 REAL,而这一列要解成 i64,
+    // 少了 CAST 会在解码时报「invalid type」而不是给出一个近似值。
     let rows: Vec<NodeQueryRow> = sqlx::query_as(
         "SELECT n.id, n.agent_id, a.name, n.tag, n.protocol, n.listen_port,
                 (SELECT COUNT(*) FROM user_nodes un WHERE un.node_id = n.id),
-                COALESCE((SELECT SUM(t.cycle_up)   FROM user_traffic t WHERE t.node_id = n.id), 0),
-                COALESCE((SELECT SUM(t.cycle_down) FROM user_traffic t WHERE t.node_id = n.id), 0),
+                COALESCE((SELECT CAST(SUM(t.cycle_up   * u.traffic_multiplier) AS INTEGER)
+                            FROM user_traffic t JOIN users u ON u.id = t.user_id
+                           WHERE t.node_id = n.id), 0),
+                COALESCE((SELECT CAST(SUM(t.cycle_down * u.traffic_multiplier) AS INTEGER)
+                            FROM user_traffic t JOIN users u ON u.id = t.user_id
+                           WHERE t.node_id = n.id), 0),
                 n.params_json
            FROM nodes n JOIN agents a ON a.id = n.agent_id
           ORDER BY n.agent_id, n.id",
@@ -899,14 +973,18 @@ mod tests {
         assert!(idle.note.contains("0 人"), "没人用的节点要写明白:{}", idle.note);
     }
 
-    /// 一个节点上多个用户的量要**加起来**。
+    /// 一个节点上多个用户的量要**加起来**,而且是**各乘完自己的倍率再加**。
+    ///
     /// 不聚合的话同一个 tag 会出现好几行,看起来像建重了。
+    /// 而倍率必须逐用户乘 —— 见下面那条专门盯着混合倍率的测试。
     #[tokio::test]
     async fn agent_breakdown_sums_every_user_on_the_node() {
         let p = pool().await;
         let (agent_id, node_id, alice) = fixture(&p, "tokyo").await;
         let bob = crate::db::node_repo::add_user(&p, "bob", 0, 0).await.unwrap();
         crate::db::node_repo::set_user_nodes(&p, bob, &[node_id]).await.unwrap();
+        set_mult(&p, alice, 1.0).await;
+        set_mult(&p, bob, 1.0).await;
         traffic(&p, alice, node_id, 100, 200).await;
         traffic(&p, bob, node_id, 30, 70).await;
 
@@ -915,6 +993,50 @@ mod tests {
         assert_eq!(rows[0].cycle_up, 130);
         assert_eq!(rows[0].cycle_down, 270);
         assert!(rows[0].note.contains("2 人"), "{}", rows[0].note);
+    }
+
+    /// 倍率要**逐用户**乘。
+    ///
+    /// 这条是整轮改动里最容易写错的一处:先 SUM 再乘一个数,
+    /// 在同一个节点上混着 x1 和 x2 的用户时怎么都算不对 ——
+    /// 而算错的表现只是「一个略微偏大的数字」,没人看得出来。
+    #[tokio::test]
+    async fn a_node_mixing_multipliers_bills_each_user_at_their_own_rate() {
+        let p = pool().await;
+        let (agent_id, node_id, single) = fixture(&p, "tokyo").await;
+        let double = crate::db::node_repo::add_user(&p, "double", 0, 0).await.unwrap();
+        crate::db::node_repo::set_user_nodes(&p, double, &[node_id]).await.unwrap();
+        set_mult(&p, single, 1.0).await;
+        set_mult(&p, double, 2.0).await;
+        traffic(&p, single, node_id, 100, 300).await;
+        traffic(&p, double, node_id, 100, 300).await;
+
+        // 100×1 + 100×2 = 300。先加再乘的话:200×(某个平均倍率),怎么取都不是 300。
+        let rows = agent_breakdown(&p, agent_id).await.unwrap();
+        assert_eq!(rows[0].cycle_up, 300, "上行该是 100×1 + 100×2");
+        assert_eq!(rows[0].cycle_down, 900, "下行该是 300×1 + 300×2");
+
+        let nodes = load_nodes(&p).await.unwrap();
+        assert_eq!(nodes[0].cycle_up, 300, "load_nodes 要和 agent_breakdown 同一个口径");
+        assert_eq!(nodes[0].cycle_down, 900);
+
+        // 节点二级页面:每行是一个用户,各自带自己的标记和乘过的数字。
+        let by_user = node_breakdown(&p, node_id).await.unwrap();
+        let d = by_user.iter().find(|r| r.label.starts_with("double")).unwrap();
+        assert_eq!(d.label, "double x2", "名字后面要带倍率标记:{}", d.label);
+        assert_eq!((d.cycle_up, d.cycle_down), (200, 600));
+        let s = by_user.iter().find(|r| r.label.starts_with("alice")).unwrap();
+        assert_eq!(s.label, "alice x1", "单倍也要标出来:{}", s.label);
+        assert_eq!((s.cycle_up, s.cycle_down), (100, 300));
+    }
+
+    async fn set_mult(p: &SqlitePool, user_id: i64, mult: f64) {
+        sqlx::query("UPDATE users SET traffic_multiplier = ? WHERE id = ?")
+            .bind(mult)
+            .bind(user_id)
+            .execute(p)
+            .await
+            .unwrap();
     }
 
     /// 别台机器的节点不能混进来。
@@ -944,6 +1066,9 @@ mod tests {
 
     /// 仪表盘的节点视图靠 `load_nodes` 带回来的 cycle_up/down 排序。
     /// 这两列一旦忘了填,整栏会全是 0 —— 而那看起来像「真的没流量」。
+    ///
+    /// fixture 的新用户默认倍率 2.0,所以 111 字节的原始量到这里是 222:
+    /// 这一列给界面的是**计费口径**,不是原始量(原始量那列不喂排序)。
     #[tokio::test]
     async fn load_nodes_carries_per_node_cycle_traffic() {
         let p = pool().await;
@@ -952,7 +1077,7 @@ mod tests {
 
         let rows = load_nodes(&p).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].cycle_up, 111);
-        assert_eq!(rows[0].cycle_down, 222);
+        assert_eq!(rows[0].cycle_up, 222, "111 原始 × 2.0 倍率");
+        assert_eq!(rows[0].cycle_down, 444, "222 原始 × 2.0 倍率");
     }
 }

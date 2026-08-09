@@ -17,6 +17,11 @@
 use crate::sub::ShareLink;
 use qrcode::{render::svg, QrCode};
 
+/// 原始字节数 × 倍率。负数当 0 —— 一个负的用量会让进度条和百分比一起变成负数。
+fn billed(raw: i64, mult: f64) -> i64 {
+    (raw.max(0) as f64 * mult.max(0.0)) as i64
+}
+
 /// 渲染这一页需要的用户信息。
 pub struct StatsView {
     pub name: String,
@@ -71,11 +76,32 @@ impl StatsView {
         }
     }
 
+    /// 页面上那两个上行/下行数字。绑了网卡就是网卡口径,否则是**计费口径**(含倍率)。
+    ///
+    /// 早先未绑网卡时这里给的是单倍原始值,而正上方的「已用」是乘过倍率的 ——
+    /// 于是上行加下行对不上已用,用户会照着这个差额来问是不是算错了。
+    fn shown_up(&self) -> i64 {
+        match &self.nic {
+            Some(n) => n.up.max(0),
+            None => billed(self.cycle_up, self.traffic_multiplier),
+        }
+    }
+
+    fn shown_down(&self) -> i64 {
+        match &self.nic {
+            Some(n) => n.down.max(0),
+            None => billed(self.cycle_down, self.traffic_multiplier),
+        }
+    }
+
     /// 账号自己的计费用量(含倍率)。与 §6.3 的配额判定、TUI 的用量列同一个口径 ——
     /// 三处显示不同的数字会让用户来问「到底哪个准」。
+    ///
+    /// 分别乘再相加,与 `shown_up + shown_down` 严格相等 ——
+    /// 先加再乘会差最多 1 字节,而这两个数就摆在同一屏上。
     fn used(&self) -> i64 {
-        let raw = self.cycle_up.saturating_add(self.cycle_down);
-        (raw.max(0) as f64 * self.traffic_multiplier.max(0.0)) as i64
+        billed(self.cycle_up, self.traffic_multiplier)
+            .saturating_add(billed(self.cycle_down, self.traffic_multiplier))
     }
 
     fn percent(&self) -> f64 {
@@ -269,8 +295,8 @@ function copy(btn,text){{
         total = total_str,
         reset = reset_desc,
         expire = describe_expire(v.expire_at),
-        up = fmt_bytes(v.nic.map(|n| n.up).unwrap_or(v.cycle_up).max(0)),
-        down = fmt_bytes(v.nic.map(|n| n.down).unwrap_or(v.cycle_down).max(0)),
+        up = fmt_bytes(v.shown_up()),
+        down = fmt_bytes(v.shown_down()),
         billing = billing,
         own_row = own_row,
         n_nodes = links.len(),
@@ -506,6 +532,37 @@ mod tests {
         assert!(html.contains("75.00 GB"), "该显示账号自己的计费用量");
         assert!(!html.contains("网卡口径"), "没绑就不该出现网卡的说法:\n{html}");
         assert!(!html.contains("账号自身"), "没绑就不需要那一行补充说明");
+    }
+
+    /// **上行 + 下行要等于「已用」。**
+    ///
+    /// 这一页是用户唯一能自己看到的账,而它上面同时摆着三个数。
+    /// 早先上下行给的是单倍原始值、已用是乘过倍率的,于是 x2 的用户看到
+    /// 「上行 20 GB + 下行 55 GB」下面写着「已用 150 GB」—— 差了整整一倍,
+    /// 只能来问是不是算错了。
+    #[test]
+    fn the_two_directions_add_up_to_the_used_figure() {
+        let v = StatsView { traffic_multiplier: 2.0, ..view() };
+        let html = render(&v, &[], "https://sub.example.com");
+        assert!(html.contains("40.00 GB"), "上行该是 20 GiB × 2:\n{html}");
+        assert!(html.contains("110.00 GB"), "下行该是 55 GiB × 2:\n{html}");
+        assert!(html.contains("150.00 GB"), "已用该是两者之和:\n{html}");
+        // 单倍原始值不该再出现 —— 它就是那个让人对不上账的数。
+        assert!(!html.contains("20.00 GB"), "不该再露出单倍上行:\n{html}");
+    }
+
+    /// 绑了网卡的话,上下行仍然是**网卡口径** —— 那是这个功能的全部意义。
+    ///
+    /// 倍率只作用在账号自己那本账上;把倍率乘到网卡数字上,
+    /// 得到的既不是厂商的账也不是用户的账。
+    #[test]
+    fn a_bound_nic_is_reported_raw_regardless_of_the_multiplier() {
+        let v = StatsView { traffic_multiplier: 2.0, ..nic_view() };
+        let html = render(&v, &[], "https://sub.example.com");
+        assert!(html.contains("300.00 GB"), "上行还是网卡上行,不乘倍率:\n{html}");
+        assert!(html.contains("600.00 GB"), "下行还是网卡下行,不乘倍率:\n{html}");
+        // 账号自己那一行照旧按倍率算(20+55)×2 = 150。
+        assert!(html.contains("150.00 GB"), "账号自身那行该含倍率:\n{html}");
     }
 
     /// 只要有一台机器没设配额,总量就报「不限」。

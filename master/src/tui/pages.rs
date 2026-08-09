@@ -147,8 +147,6 @@ fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], us
         ]
     };
 
-    let nic_up: i64 = agents.iter().map(|a| a.cycle_rx).sum();
-    let nic_down: i64 = agents.iter().map(|a| a.cycle_tx).sum();
     let billed: i64 = users.iter().map(|u| u.used()).sum();
 
     let mut head = vec![
@@ -180,16 +178,19 @@ fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], us
     let mut speed_line = vec![Span::raw("  当前网速    ")];
     speed_line.extend(speed);
 
+    // 网卡是整机进出(含系统更新、别的服务、协议开销)、从加入集群那一刻从 0 计,
+    // 而用户用量是 sing-box tracker 记的账、含倍率、会被月重置清零。两个口径不同,
+    // 放一起就是两套账,而概况回答的是「这个月用户用了多少」——
+    // 厂商账单上的那个数看服务管理页,或拆开查各台机器的网卡明细(§6.4 / §7.2)。
+    let billed_up: i64 = users.iter().map(|u| u.billed_up()).sum();
+    let billed_down: i64 = users.iter().map(|u| u.billed_down()).sum();
     let usage = vec![
         Span::raw("  本周期用量  "),
-        Span::styled("网卡 ", Style::default().fg(theme::DIM)),
-        Span::styled(format!("↑ {}", theme::bytes(nic_up)), Style::default().fg(theme::UP)),
-        Span::raw(" "),
-        Span::styled(format!("↓ {}", theme::bytes(nic_down)), Style::default().fg(theme::DOWN)),
-        Span::styled("   计费 ", Style::default().fg(theme::DIM)),
+        Span::styled(format!("↑ {}", theme::bytes(billed_up)), Style::default().fg(theme::UP)),
+        Span::raw("  "),
+        Span::styled(format!("↓ {}", theme::bytes(billed_down)), Style::default().fg(theme::DOWN)),
+        Span::styled("   总计 ", Style::default().fg(theme::DIM)),
         Span::styled(theme::bytes(billed), Style::default().fg(theme::ACCENT)),
-        // 两个数字口径不同,不写清楚会被当成对不上的 bug(§6.4 / §7.2)。
-        Span::styled("   (网卡 = 整机进出;计费 = 用户用量 × 倍率)", Style::default().fg(theme::DIM)),
     ];
 
     f.render_widget(
@@ -306,7 +307,9 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option
     let order = dashboard_user_order(users);
     let top: Vec<&UserRow> = order.iter().map(|&i| &users[i]).collect();
     let rows = area.height.saturating_sub(2) as usize;
-    let bar_w = (area.width.saturating_sub(46)).clamp(0, 16) as usize;
+    // 倍率标记占了名字栏右边 4 列(` x2 `),条子就得跟着让出来 ——
+    // 不减的话最窄的终端上会先切掉最右边的百分比,而那正是这一栏的重点。
+    let bar_w = (area.width.saturating_sub(50)).clamp(0, 16) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
     if top.is_empty() {
@@ -322,9 +325,16 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option
                 format!("{}{}", if picked { "▸ " } else { "  " }, theme::pad(&u.name, 12)),
                 Style::default().fg(state_color(u)),
             ),
-            Span::styled(format!("↑{:>9} ", theme::bytes(u.cycle_up)), Style::default().fg(theme::UP)),
+            // 倍率标记紧跟名字。摆在这里而不是行尾:这两栏上下行是**乘过倍率的**,
+            // 标记要挨着它解释的那个数字,否则看到 `↓ 132 MB` 的人无从知道
+            // 那已经是 ×2 之后的值(§6.3)。
+            Span::styled(theme::pad(&u.mult_tag(), 4), Style::default().fg(theme::DIM)),
             Span::styled(
-                format!("↓{:>9} ", theme::bytes(u.cycle_down)),
+                format!("↑{:>9} ", theme::bytes(u.billed_up())),
+                Style::default().fg(theme::UP),
+            ),
+            Span::styled(
+                format!("↓{:>9} ", theme::bytes(u.billed_down())),
                 Style::default().fg(theme::DOWN),
             ),
         ];
@@ -1088,8 +1098,10 @@ fn ucol_title(c: UCol) -> &'static str {
     match c {
         UCol::Name => "用户",
         UCol::State => "状态",
-        UCol::Up => "上行",
-        UCol::Down => "下行",
+        // 「计费」两个字不能省:这两列是乘过倍率的,而人手上往往有一份客户端
+        // 自己记的单倍数字 —— 表头不写清口径,对不上时只会当成统计坏了。
+        UCol::Up => "计费上行",
+        UCol::Down => "计费下行",
         UCol::Usage => "本周期计费用量",
         UCol::Bar => "",
         UCol::Reset => "重置",
@@ -1147,11 +1159,11 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
                         Cell::from(Span::styled(mark.to_string(), Style::default().fg(color)))
                     }
                     UCol::Up => Cell::from(Span::styled(
-                        theme::bytes(u.cycle_up),
+                        theme::bytes(u.billed_up()),
                         Style::default().fg(theme::UP),
                     )),
                     UCol::Down => Cell::from(Span::styled(
-                        theme::bytes(u.cycle_down),
+                        theme::bytes(u.billed_down()),
                         Style::default().fg(theme::DOWN),
                     )),
                     UCol::Usage => Cell::from(if u.quota_bytes > 0 {
@@ -1861,6 +1873,85 @@ mod tests {
         assert!(has_cjk(&out, "不重置"), "加了主机列不该把别的列挤掉:\n{out}");
     }
 
+    /// 概况的「本周期用量」是**计费口径**的上行/下行/总计,不再有网卡那一段。
+    ///
+    /// 整机网卡的总和在这里没有意义:它把系统更新、别的服务、协议开销全算进来,
+    /// 而这一行旁边就是用户数和节点数 —— 人读到的是「这些用户用了多少」。
+    /// 两个口径并排摆了几个版本,结果是每次都要一句注释去解释它们为什么对不上。
+    /// 厂商账单上的那个数在服务管理页(每台机器一行)和它的网卡明细里。
+    #[test]
+    fn the_overview_reports_billed_traffic_not_nic_traffic() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        // 倍率 2.0,原始 20 GiB↑ / 55 GiB↓ → 计费 40 GiB↑ / 110 GiB↓ / 150 GiB 总计。
+        let u = UserRow { traffic_multiplier: 2.0, ..user() };
+        // 网卡数字给一个**极其显眼**的值:它要是漏在页面上,一眼就能看见。
+        let a = AgentRow { cycle_rx: 777 * 1_073_741_824, cycle_tx: 888 * 1_073_741_824, ..agent(None, None) };
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &Dash { agents: &[a], nodes: &[node()], users: &[u], history: &hist, now: NOW, focus: None })
+        });
+
+        assert!(has_cjk(&out, "本周期用量"), "{out}");
+        assert!(out.contains("↑ 40.00 GB"), "上行该是 20 GiB × 2:\n{out}");
+        assert!(out.contains("↓ 110.00 GB"), "下行该是 55 GiB × 2:\n{out}");
+        assert!(has_cjk(&out, "总计") && out.contains("150.00 GB"), "总计该是两者之和:\n{out}");
+        // 网卡的数字和「网卡」这个词都不该再出现在概况里。
+        assert!(!out.contains("777.00 GB") && !out.contains("888.00 GB"), "网卡流量该整块去掉:\n{out}");
+        assert!(!has_cjk(&out, "网卡 = 整机进出"), "那句注释跟着一起去掉:\n{out}");
+    }
+
+    /// 上行 + 下行必须**正好**等于总计。
+    ///
+    /// 先加再乘会和分别乘再加差最多 1 字节 —— 而这三个数就摆在同一行上,
+    /// 差一个字节也是肉眼可见的「加不起来」。
+    #[test]
+    fn the_overview_three_numbers_add_up_exactly() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        // 故意选会产生小数的倍率和奇数字节。
+        let users: Vec<UserRow> = [(1.5, 333, 777), (2.0, 101, 202), (1.0, 55, 7)]
+            .iter()
+            .enumerate()
+            .map(|(i, &(m, up, down))| UserRow {
+                id: i as i64 + 1,
+                name: format!("u{i}"),
+                traffic_multiplier: m,
+                cycle_up: up,
+                cycle_down: down,
+                ..user()
+            })
+            .collect();
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &Dash { agents: &[], nodes: &[], users: &users, history: &hist, now: NOW, focus: None })
+        });
+        // 499 + 202 + 55 = 756 上行;1165 + 404 + 7 = 1576 下行;合计 2332。
+        assert!(out.contains("756 B"), "上行:\n{out}");
+        assert!(out.contains("1.54 KB"), "下行 1576 B:\n{out}");
+        assert!(out.contains("2.28 KB"), "总计 2332 B 该正好是两者之和:\n{out}");
+    }
+
+    /// 仪表盘用户视图:名字后面跟倍率标记,上下行是乘过倍率的数。
+    ///
+    /// 标记必须在**名字旁边**,不是行尾 —— 它解释的是紧接着的那两个数字。
+    #[test]
+    fn the_dashboard_user_view_tags_the_multiplier_next_to_the_name() {
+        let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
+        let double = UserRow { traffic_multiplier: 2.0, ..user() };
+        let single = UserRow {
+            id: 2,
+            name: "bob".into(),
+            traffic_multiplier: 1.0,
+            cycle_up: 1_073_741_824,
+            cycle_down: 1_073_741_824,
+            ..user()
+        };
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(f, f.area(), &Dash { agents: &[], nodes: &[node()], users: &[double, single], history: &hist, now: NOW, focus: None })
+        });
+        assert!(flat(&out).contains("alicex2"), "x2 该紧跟在名字后面:\n{out}");
+        // x1 也要标出来:省掉的话「没标记」有两种含义,而人分不出来。
+        assert!(flat(&out).contains("bobx1"), "单倍也要标:\n{out}");
+        assert!(out.contains("40.00 GB") && out.contains("110.00 GB"), "上下行该乘过倍率:\n{out}");
+    }
+
     /// 概览页要能一眼看出有机器掉线、有人快超额。
     #[test]
     fn dashboard_summarises_the_cluster() {        let mut offline = agent(None, None);
@@ -2234,17 +2325,19 @@ mod tests {
                 2
             ))
         );
+        // 行名带倍率标记、数字乘过倍率 —— 与 `data::node_breakdown` 出来的一致。
+        // 预览要照着生产的样子造,否则它会替一个不存在的界面背书。
         let bd = vec![
             BreakdownRow {
-                label: "alice".into(),
+                label: "alice x2".into(),
                 note: "启用".into(),
-                cycle_up: 20 * 1_073_741_824,
-                cycle_down: 55 * 1_073_741_824,
-                total_up: 120 * 1_073_741_824,
-                total_down: 300 * 1_073_741_824,
+                cycle_up: 40 * 1_073_741_824,
+                cycle_down: 110 * 1_073_741_824,
+                total_up: 240 * 1_073_741_824,
+                total_down: 600 * 1_073_741_824,
             },
             BreakdownRow {
-                label: "bob".into(),
+                label: "bob x1".into(),
                 note: "自动停用".into(),
                 cycle_up: 3 * 1_073_741_824,
                 cycle_down: 1_073_741_824,
@@ -2258,7 +2351,7 @@ mod tests {
                 f,
                 f.area(),
                 "节点 tokyo-reality 上的用户",
-                "tokyo-reality(在 tokyo-1 上)· 2 个用户",
+                "tokyo-reality(在 tokyo-1 上)· 2 个用户 · 数字含各自倍率",
                 &[],
                 &bd
             ))

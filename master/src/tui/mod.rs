@@ -1356,7 +1356,9 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             let n = rows.len();
             app.overlay = Some(Overlay {
                 title: format!("节点 {tag} 上的用户"),
-                head: format!("{tag}(在 {agent} 上)· {n} 个用户"),
+                // 各行倍率不同,标记跟在每个用户名后面(见 `node_breakdown`),
+                // 标题只说明这些数字是哪个口径。
+                head: format!("{tag}(在 {agent} 上)· {n} 个用户 · 数字含各自倍率"),
                 info: vec![],
                 rows,
             });
@@ -1366,9 +1368,18 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         Action::ShowUserNodes { id, name } => {
             let rows = data::user_breakdown(&app.pool, *id).await?;
             let n = rows.len();
+            // 倍率写在标题里,不写在每一行:整张表都是这一个用户,
+            // 逐行重复 `x2` 只是噪声。但**必须写在某处** —— 表里的数字
+            // 都乘过它,不说的话对不上客户端自己记的单倍数。
+            let mult = app
+                .users
+                .iter()
+                .find(|u| u.id == *id)
+                .map(|u| format!(" · 计费 {}", u.mult_tag()))
+                .unwrap_or_default();
             app.overlay = Some(Overlay {
                 title: format!("{name} 的节点用量"),
-                head: format!("{name} · {n} 个节点"),
+                head: format!("{name} · {n} 个节点{mult}"),
                 info: vec![],
                 rows,
             });
@@ -1389,7 +1400,10 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             };
             app.overlay = Some(Overlay {
                 title: format!("{name} 的网卡明细"),
-                head: format!("{name} · {n} 个节点 · 网卡按厂商口径计费"),
+                // 这一页同屏摆着两个口径:上面几行是整机网卡(厂商按它开账单),
+                // 下面每行是节点上各用户的用量 × 倍率。不写明的话两组数对不上,
+                // 看起来像其中一组坏了(§6.4 / §7.2)。
+                head: format!("{name} · {n} 个节点 · 上=整机网卡,下=节点计费用量"),
                 info,
                 rows,
             });
@@ -2477,9 +2491,11 @@ mod tests {
         assert_eq!(app.users[0].node_ids, vec![node_id]);
 
         // 用量明细两个方向都要查得出来(节点页 / 用户页的 Enter)。
+        // 节点方向的行名带倍率标记 —— 同一个节点上的用户可以各是各的倍率,
+        // 而那一行的数字都乘过它,不标就没法解释(§6.3)。
         let by_node = data::node_breakdown(&app.pool, node_id).await.unwrap();
         assert_eq!(by_node.len(), 1);
-        assert_eq!(by_node[0].label, "alice");
+        assert_eq!(by_node[0].label, "alice x2", "{}", by_node[0].label);
         let by_user = data::user_breakdown(&app.pool, uid).await.unwrap();
         assert_eq!(by_user.len(), 1);
         assert!(by_user[0].label.starts_with("tokyo-reality @ tokyo-1"), "{}", by_user[0].label);
