@@ -1305,20 +1305,24 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已删除节点 {tag},由 daemon 下发生效"))
         }
 
-        Action::AddUser { name, quota_gb } => {
+        Action::AddUser { name, quota_gb, multiplier, expire, reset_day } => {
+            // **先把输入全解析完再动库。** 顺序反过来的话,一个填错的日期会留下
+            // 一个已经建好、但计费设置没写进去的用户 —— 而界面上只会显示一句
+            // 报错,没人知道那个号已经躺在库里了。
             let quota = parse_quota(quota_gb)?;
+            let mult = parse_multiplier(multiplier)?;
+            let expire_at = forms::parse_expire(expire).map_err(|e| anyhow::anyhow!(e))?;
+            let day = forms::parse_reset_day(reset_day).map_err(|e| anyhow::anyhow!(e))?;
+
             let id = node_repo::add_user(&app.pool, name, quota, now).await?;
+            // add_user 只认名称与配额(它是 CLI 也在用的那条路),其余项建完再写一次。
+            node_repo::update_user(&app.pool, id, quota, mult, expire_at, day).await?;
             Ok(format!("已新增用户 #{id} {name};按 [n] 给它分配节点,否则订阅是空的"))
         }
 
         Action::EditUser { id, name, quota_gb, multiplier, expire, reset_day } => {
             let quota = parse_quota(quota_gb)?;
-            let mult: f64 = multiplier
-                .parse()
-                .map_err(|_| anyhow::anyhow!("计费倍率 {multiplier} 不是数字"))?;
-            if mult < 0.0 {
-                anyhow::bail!("计费倍率不能是负数");
-            }
+            let mult = parse_multiplier(multiplier)?;
             let expire_at = forms::parse_expire(expire).map_err(|e| anyhow::anyhow!(e))?;
             let day = forms::parse_reset_day(reset_day).map_err(|e| anyhow::anyhow!(e))?;
             node_repo::update_user(&app.pool, *id, quota, mult, expire_at, day).await?;
@@ -1446,14 +1450,25 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             if affected.is_empty() {
                 return Ok(format!("{user} 的节点分配没有变化"));
             }
-            let detail = affected
-                .iter()
-                .map(|(a, r)| format!("#{a}→rev {r}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            Ok(format!("{user} 现在有 {} 个节点({detail})", node_ids.len()))
+            // 与别处一致:**不印 revision**。那是个内部计数器,每改一次加一,
+            // 摆给人看只是噪音。改说「碰到了几台机器」——那才是这次操作的影响面。
+            Ok(format!(
+                "{user} 现在有 {} 个节点,{} 台机器会重建 box",
+                node_ids.len(),
+                affected.len()
+            ))
         }
     }
+}
+
+/// 计费倍率。新增与编辑共用一份 —— 两处各写一遍的话,校验迟早会漂开
+/// (一边挡住负数、另一边没挡)。
+fn parse_multiplier(s: &str) -> Result<f64> {
+    let v: f64 = s.parse().map_err(|_| anyhow::anyhow!("计费倍率 {s} 不是数字"))?;
+    if v < 0.0 {
+        anyhow::bail!("计费倍率不能是负数");
+    }
+    Ok(v)
 }
 
 fn parse_quota(gb: &str) -> Result<i64> {

@@ -250,26 +250,46 @@ fn none_if_empty(s: String) -> Option<String> {
 // ─────────────────────────── 用户 ───────────────────────────
 
 pub fn user_add() -> Modal {
+    // 字段与「编辑用户」**一一对应**(除了名称)。
+    //
+    // 早先这里只有名称和配额,倍率/到期/重置日都得建完再进一次编辑框改 ——
+    // 而这三项恰恰是建号时就该定的:到期和重置日决定这个号什么时候停,
+    // 漏填一次就是一个「永不过期、永不重置」的号悄悄躺在那里。
+    //
+    // 留空的默认值写在括号里,和编辑框保持同一套措辞。
     Modal::Form(
         Form::new(
             "新增用户",
             vec![
                 Field::text("name", "名称 *必填", ""),
                 Field::text("quota", "配额 GB (0 = 不限)", "0"),
+                Field::text(
+                    "mult",
+                    "计费倍率 (2.0 双向 / 1.0 单向)",
+                    &format!("{:.1}", crate::db::node_repo::DEFAULT_TRAFFIC_MULTIPLIER),
+                ),
+                Field::text("expire", "到期 (YYYY-MM-DD,留空 = 永久)", ""),
+                Field::text("reset", "重置日 (1-31,留空 = 不重置)", ""),
             ],
             Box::new(|f| {
                 let name = val(f, "name");
                 if name.is_empty() {
                     return Err("名称不能为空".into());
                 }
-                Ok(Action::AddUser { name, quota_gb: val(f, "quota") })
+                Ok(Action::AddUser {
+                    name,
+                    quota_gb: val(f, "quota"),
+                    multiplier: val(f, "mult"),
+                    expire: val(f, "expire"),
+                    reset_day: val(f, "reset"),
+                })
             }),
         )
         .with_note(Box::new(|_| {
             vec![
                 "名称唯一,也是 inbound 里的用户名,建好之后不能改。".into(),
                 "建完记得按 [n] 分配节点:没分配节点的用户,订阅是空的。".into(),
-                "计费倍率默认 2.0(双向,与 VPS 厂商的网卡口径一致),建好后按 [E] 可改。".into(),
+                "倍率 2.0 = 双向(与 VPS 厂商的网卡口径一致);到期按当天 23:59:59 算。".into(),
             ]
         })),
     )

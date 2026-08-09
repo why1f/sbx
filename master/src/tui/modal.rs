@@ -67,7 +67,13 @@ pub enum Action {
     AddNode(NodeDraft),
     EditNode { id: i64, draft: NodeDraft },
     DeleteNode { id: i64, tag: String },
-    AddUser { name: String, quota_gb: String },
+    AddUser {
+        name: String,
+        quota_gb: String,
+        multiplier: String,
+        expire: String,
+        reset_day: String,
+    },
     EditUser {
         id: i64,
         name: String,

@@ -625,12 +625,25 @@ struct Cols {
     /// 它值得占一列而不是只写在底部摘要里:摘要那一行会被操作回执顶掉,
     /// 于是「按完 [o] 想确认改对没有」恰恰是看不到它的那一刻。
     outbound: u16,
-    /// 0 = 窄到画不下,只显示重置日文字。
+    /// 重置日列。0 = 放不下,整列不画。
+    ///
+    /// 从流量列里拆出来的:原来「进度条 + 每月 22 日重置」挤在同一行,
+    /// 那行长得离谱,而这两件事本来无关 —— 一个是「用了多少」,
+    /// 一个是「什么时候清零」。
+    reset: u16,
+    /// 0 = 窄到画不下,改用文字百分比。
     bar: usize,
 }
 
-/// 「每月 22 日重置」按终端列宽算约 14 列,留两格余量。
-const RESET_LABEL_COLS: u16 = 16;
+/// 重置日列。两行式(「每月」/「22 日」)只要 8 列;
+/// 写成一行的「每月 22 日重置」要 14,那正是它原来把流量那行撑长的原因。
+const RESET_COL: u16 = 8;
+
+/// 进度条右边给百分比留的地方(「 100%」= 5 列,留一格余量)。
+const PCT_LABEL_COLS: u16 = 6;
+
+/// 窄屏回退时,「每月 22 日重置」跟在百分比后面要占的地方(中文按两列算)。
+const RESET_LABEL_COLS: u16 = 15;
 
 fn columns(total_width: u16) -> Cols {
     // 减掉左右边框(2),以及 ratatui 在各列之间插的间隔(五列 = 四个;
@@ -660,10 +673,19 @@ fn columns(total_width: u16) -> Cols {
     // 而出站策略是一个「改了就得确认」的设置项 —— 窄屏上先保它。
     let outbound = if avail > ideal_sum + OUTBOUND_COL { OUTBOUND_COL } else { 0 };
 
+    // 重置列排在出站之后、主机之前让位:它比 CPU/内存要紧(「这个号什么时候
+    // 清零」是运营信息),但比出站策略次要 —— 后者是个能当场改的开关。
+    let reset = if avail > ideal_sum + OUTBOUND_COL + RESET_COL { RESET_COL } else { 0 };
+
     // 进度条用流量列里除去重置日之后剩下的地方。剩不下 4 格就别画了:
     // 三四格的条读不出比例,只是占地方 —— 那时改用文字百分比。
-    let bar = traffic.saturating_sub(RESET_LABEL_COLS).min(20) as usize;
-    Cols { name, ip, speed, traffic, host, outbound, bar: if bar < 4 { 0 } else { bar } }
+    // 条要给「百分比」和(窄屏回退时)「每月 22 日重置」让地方。
+    //
+    // 重置列被让掉时那句话回到这一行,它要 14 列 —— 不预留的话条会把它挤出去,
+    // 表现是「每月」后面被切掉,而 §13.4 要防的正是这种静默截断。
+    let tail = PCT_LABEL_COLS + if reset == 0 { RESET_LABEL_COLS } else { 0 };
+    let bar = traffic.saturating_sub(tail).min(20) as usize;
+    Cols { name, ip, speed, traffic, host, outbound, reset, bar: if bar < 4 { 0 } else { bar } }
 }
 
 pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now: i64) {
@@ -723,41 +745,64 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
             //
             // **没有配额时不画进度条**(§8.2)。画一根满条会被读成「用完了」,
             // 而实际含义正相反 —— 是「不限」。
+            // 重置日通常在自己那一列(reset_cell)。但**窄屏上那一列会被让掉**,
+            // 而 §13.4 要求它在任何宽度下都看得见 —— 所以那时把它退回流量列的
+            // 第二行(就是拆分之前的样子)。
+            //
+            // 少了这条回退,120 列以下重置日会整个消失:那正是 §13.4 要防的
+            // 「静默丢信息」——界面看起来毫无异常,只是少了一项。
+            let inline_reset = if c.reset == 0 {
+                Some(Span::styled(
+                    format!(" {}", reset_text(a.nic_reset_day)),
+                    Style::default().fg(theme::DIM),
+                ))
+            } else {
+                None
+            };
             let used = theme::bytes(a.used());
-            let reset = Span::styled(
-                format!(" {}", reset_label(a.nic_reset_day)),
-                Style::default().fg(theme::DIM),
-            );
             let (line1, line2): (Line, Line) = match a.quota_ratio() {
                 Some(ratio) if c.bar > 0 => {
                     let quota = theme::bytes(a.nic_quota_bytes.unwrap_or(0));
                     let mut bar = vec![Span::raw(" ")];
                     bar.extend(theme::gradient_bar(ratio, c.bar));
-                    bar.push(reset);
+                    bar.push(Span::styled(
+                        format!(" {:.0}%", ratio * 100.0),
+                        Style::default().fg(theme::gradient_at(ratio)),
+                    ));
+                    bar.extend(inline_reset);
                     (Line::from(format!("{used} / {quota}")), Line::from(bar))
                 }
-                // 有配额但画不下条:百分比改用文字,挪到第二行接在重置日前面。
+                // 有配额但画不下条:百分比改用文字。
                 Some(ratio) => {
                     let quota = theme::bytes(a.nic_quota_bytes.unwrap_or(0));
-                    (
-                        Line::from(format!("{used}/{quota}")),
-                        Line::from(vec![
-                            Span::styled(
-                                format!(" {:.0}%", ratio * 100.0),
-                                Style::default().fg(theme::gradient_at(ratio)),
-                            ),
-                            reset,
-                        ]),
-                    )
+                    let mut second = vec![Span::styled(
+                        format!(" {:.0}%", ratio * 100.0),
+                        Style::default().fg(theme::gradient_at(ratio)),
+                    )];
+                    second.extend(inline_reset);
+                    (Line::from(format!("{used}/{quota}")), Line::from(second))
                 }
                 None => (
                     Line::from(vec![
                         Span::raw(used),
                         Span::styled(" · 不限流量", Style::default().fg(theme::DIM)),
                     ]),
-                    Line::from(reset),
+                    Line::from(inline_reset.into_iter().collect::<Vec<_>>()),
                 ),
             };
+
+            // 重置列:两行式,跟着表格本来的两行走。
+            let reset_cell = Cell::from(Text::from(match a.nic_reset_day {
+                Some(d) if (1..=31).contains(&d) => vec![
+                    Line::from(Span::styled("每月", Style::default().fg(theme::DIM))),
+                    Line::from(format!("{d} 日")),
+                ],
+                // 越界值(手改过库)当作没设,而不是显示「每月 99 日」。
+                _ => vec![
+                    Line::from(Span::styled("不重置", Style::default().fg(theme::DIM))),
+                    Line::from(""),
+                ],
+            }));
 
             // 主机列:CPU 一行、内存一行。指标过期时是 `--` 而不是 0 ——
             // 一台离线三天的机器显示「CPU 0%」看起来和闲着的在线机器一模一样。
@@ -798,6 +843,9 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
             ]));
 
             let mut cells = vec![name_cell, ip_cell, speed_cell, Cell::from(Text::from(vec![line1, line2]))];
+            if c.reset > 0 {
+                cells.push(reset_cell);
+            }
             if c.outbound > 0 {
                 cells.push(outbound_cell);
             }
@@ -816,6 +864,10 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
         Constraint::Length(c.traffic),
     ];
     let mut titles = vec!["名称 / 版本", "IP 地址", "网速", "流量"];
+    if c.reset > 0 {
+        constraints.push(Constraint::Length(c.reset));
+        titles.push("重置");
+    }
     if c.outbound > 0 {
         constraints.push(Constraint::Length(c.outbound));
         titles.push("出站");
@@ -836,7 +888,11 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
     );
 }
 
-fn reset_label(day: Option<i64>) -> String {
+/// 重置日的一行式说法。**只给窄屏回退用** —— 宽屏上重置日有自己一列,
+/// 走的是两行式(「每月」/「22 日」)。
+///
+/// 越界的值(库被手改过)当作没设,不能显示成「每月 99 日重置」。
+fn reset_text(day: Option<i64>) -> String {
     match day {
         Some(d) if (1..=31).contains(&d) => format!("每月 {d} 日重置"),
         _ => "无需重置".into(),
@@ -1315,13 +1371,31 @@ mod tests {
 
     const NOW: i64 = 1_764_547_200; // 2025-12-01 前后,测试里只当一个固定基准用
 
+    /// 重置日**单独一列、两行式**:上面「每月」、下面「22 日」。
+    ///
+    /// 原来它是接在进度条后面的一整句「每月 22 日重置」,那一行长得离谱 ——
+    /// 而「用了多少」和「什么时候清零」本来就是两件事。
+    ///
+    /// 越界的值(库被手改过)当作没设,不能显示成「每月 99 日」。
+    /// 这条规则是从原来的 `reset_label` 搬过来的,函数没了但规则还在。
     #[test]
-    fn reset_label_covers_the_null_case() {
-        assert_eq!(reset_label(Some(22)), "每月 22 日重置");
-        assert_eq!(reset_label(None), "无需重置");
-        // 库里存了越界的值时不该显示「每月 99 日重置」。
-        assert_eq!(reset_label(Some(0)), "无需重置");
-        assert_eq!(reset_label(Some(32)), "无需重置");
+    fn the_reset_column_is_two_lines_and_rejects_out_of_range_days() {
+        let out = draw_to_string(140, 6, |f| {
+            agents(f, f.area(), &[agent(Some(500 * 1_073_741_824), Some(22))], 0, NOW)
+        });
+        assert!(has_cjk(&out, "重置"), "该有表头:\n{out}");
+        assert!(has_cjk(&out, "每月"), "第一行该是「每月」:\n{out}");
+        assert!(has_cjk(&out, "22 日"), "第二行该是日期:\n{out}");
+        // 拆出去之后,流量那一行不该再带着这一整句。
+        assert!(!flat(&out).contains(&flat("日重置")), "流量列不该再拖着重置文字:\n{out}");
+
+        for bad in [Some(0), Some(32), Some(99), None] {
+            let out = draw_to_string(140, 6, |f| {
+                agents(f, f.area(), &[agent(Some(1 << 30), bad)], 0, NOW)
+            });
+            assert!(has_cjk(&out, "不重置"), "{bad:?} 该显示「不重置」:\n{out}");
+            assert!(!has_cjk(&out, "每月"), "{bad:?} 不该显示「每月」:\n{out}");
+        }
     }
 
     // ─────────── 渲染快照 ───────────
@@ -1437,7 +1511,9 @@ mod tests {
         assert!(out.contains("203.0.113.8"), "{out}");
         assert!(out.contains("2001:db8:1"), "第二行的 IPv6 没画出来\n{out}");
         assert!(out.contains('↑') && out.contains('↓'), "上下行速率\n{out}");
-        assert!(has_cjk(&out, "每月 22 日重置"), "重置日被截断了\n{out}");
+        // 重置日现在有自己一列(两行式:「每月」/「22 日」),
+        // 不再是拖在进度条后面的那一整句。
+        assert!(has_cjk(&out, "每月") && has_cjk(&out, "22 日"), "重置日没画出来\n{out}");
     }
 
     /// 有配额 → 画进度条;`nic_quota_bytes IS NULL` → **不画**(§8.2)。
@@ -1453,7 +1529,8 @@ mod tests {
         let unlimited = render_agents(&[agent(None, None)]);
         assert!(!unlimited.contains('█'), "不限流量时不该画进度条\n{unlimited}");
         assert!(has_cjk(&unlimited, "不限流量"), "{unlimited}");
-        assert!(has_cjk(&unlimited, "无需重置"), "{unlimited}");
+        // 没设重置日时,重置那一列写「不重置」(它已经不在流量列里了)。
+        assert!(has_cjk(&unlimited, "不重置"), "{unlimited}");
     }
 
     /// 还没有两次采样时速率显示 `--`,不是 0 —— 0 会被读成「这台机器闲着」。
@@ -1541,6 +1618,27 @@ mod tests {
         assert_eq!((c.outbound, c.host), (0, 0), "70 列该把两个都让掉");
         let out = draw_to_string(70, 6, |f| agents(f, f.area(), &[agent(None, None)], 0, NOW));
         assert!(!out.is_empty());
+    }
+
+    /// **任何宽度下重置日都得看得见**(§13.4)。
+    ///
+    /// 拆成独立一列之后差点丢掉这条:那一列在 120 列以下会被让掉,
+    /// 而我一开始没做回退 —— 表现是窄屏上重置日**整个消失**,
+    /// 界面看起来毫无异常,只是少了一项。§13.4 要防的正是这种静默丢信息。
+    ///
+    /// 现在宽屏走独立列(两行式),窄屏退回流量列第二行(一行式),
+    /// 两条路都得有。
+    #[test]
+    fn the_reset_day_survives_every_width() {
+        for w in [70u16, 80, 100, 110, 120, 140, 160, 200] {
+            let out = draw_to_string(w, 6, |f| {
+                agents(f, f.area(), &[agent(Some(500 * 1_073_741_824), Some(22))], 0, NOW)
+            });
+            let flat_out = flat(&out);
+            let two_line = flat_out.contains(&flat("每月")) && flat_out.contains(&flat("22 日"));
+            let one_line = flat_out.contains(&flat("每月 22 日重置"));
+            assert!(two_line || one_line, "{w} 列下重置日不见了:\n{out}");
+        }
     }
 
     /// §13.4:80 列的窄终端下,**重置日不能被截断**,IPv6 要留住省略号。
@@ -1705,7 +1803,8 @@ mod tests {
         let out = draw_to_string(140, 6, |f| agents(f, f.area(), &[agent(None, None)], 0, NOW));
         assert!(out.contains("CPU 37%"), "{out}");
         assert!(has_cjk(&out, "内存 38%"), "{out}");
-        assert!(has_cjk(&out, "无需重置"), "加了主机列不该把流量列挤掉:\n{out}");
+        // 加了主机列之后前面几列都还得在(重置列写「不重置」)。
+        assert!(has_cjk(&out, "不重置"), "加了主机列不该把别的列挤掉:\n{out}");
     }
 
     /// 概览页要能一眼看出有机器掉线、有人快超额。
