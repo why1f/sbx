@@ -373,9 +373,39 @@ async fn recv_loop(
             // 版本不匹配必须断开(§4)。
             anyhow::bail!("信封校验失败:{reason}");
         }
+        // **上报之前先确认这个 agent 还在库里。**
+        //
+        // TUI 与 daemon 是两个进程,只共享库。在 TUI 里删掉一台 agent 不会动
+        // daemon 内存里那条 WebSocket —— 它会继续上报,而上报路径只按 agent_id
+        // 做 UPSERT,不查 `agents` 表。于是那些数字落到一个已经不存在的 agent
+        // 头上;更糟的是 id 一旦被复用(009 之前 agents.id 没有 AUTOINCREMENT),
+        // 它们会落进**下一台新加的机器**的行里 ——
+        // 现场表现是「新机器还没装,页面上流量就在涨」。
+        //
+        // 只在**上报**这一步查,不是每条消息都查:上报按固定间隔来(默认 30s),
+        // 一次主键命中的开销可以忽略;resp / log 这些消息不该为此多查一次库。
+        if matches!(env.method.as_str(), method::STATS_REPORT | method::SYSINFO_REPORT)
+            && !agent_exists(&state.pool, agent_id).await
+        {
+            anyhow::bail!("agent 已从库里删除,断开这条连接");
+        }
         dispatch(env, agent_id, state).await;
     }
     Ok(())
+}
+
+/// 这个 agent 还在库里吗。
+///
+/// **查库失败时返回 `true`(当作还在)。** 一次磁盘忙不该把一台正常的机器
+/// 踢下线 —— 它下一个上报周期还会再来。反过来(失败即断开)会让数据库的
+/// 短暂抖动变成一场集体掉线。
+async fn agent_exists(pool: &SqlitePool, agent_id: i64) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT 1 FROM agents WHERE id = ?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await
+        .map(|r| r.is_some())
+        .unwrap_or(true)
 }
 
 /// 分发一条已校验的信封。
@@ -555,6 +585,34 @@ mod tests {
             ipv4: Some("203.0.113.7".into()),
             ipv6: None,
         }
+    }
+
+    /// 被删掉的 agent 上再来的上报要被认出来(连接随即断开)。
+    ///
+    /// 这是「删掉一台机器、重新添加同一台」那个 bug 的另一半:TUI 删行时
+    /// 动不了 daemon 内存里的 WebSocket,那台 VPS 上的老 agent 进程还在跑、
+    /// 还在按原来的 agent_id 上报。009 让 id 不再复用之后,这些上报会落到
+    /// 一个不存在的 id 上;这里负责把连接断掉,而不是静默写进流量表。
+    #[tokio::test]
+    async fn reports_from_a_deleted_agent_are_refused() {
+        let p = pool().await;
+        let (id, _) = crate::db::agent_repo::create(&p, "gone", 0).await.unwrap();
+        assert!(agent_exists(&p, id).await, "刚建好的 agent 该在");
+
+        crate::db::agent_repo::delete(&p, id).await.unwrap();
+        assert!(!agent_exists(&p, id).await, "删掉之后就不该认它了");
+    }
+
+    /// 查库失败时**当作还在**。
+    ///
+    /// 反过来(失败即断开)会把数据库的一次短暂抖动放大成一场集体掉线,
+    /// 而这些 agent 本来什么毛病都没有。
+    #[tokio::test]
+    async fn a_broken_database_does_not_kick_everyone_offline() {
+        let p = pool().await;
+        let (id, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        p.close().await; // 池关掉 = 之后每次查询都失败
+        assert!(agent_exists(&p, id).await, "查不动库时不该把 agent 判死");
     }
 
     #[tokio::test]

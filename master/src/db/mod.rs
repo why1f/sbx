@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/006_default_multiplier_two.sql"),
     include_str!("migrations/007_agent_commands.sql"),
     include_str!("migrations/008_agent_outbound_strategy.sql"),
+    include_str!("migrations/009_agents_autoincrement.sql"),
 ];
 
 /// 当前程序期望的 schema 版本(= 迁移脚本数量),供 doctor 比对实际库版本。
@@ -45,27 +46,49 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool> {
         .await
         .with_context(|| format!("迁移数据库 {} 失败", db_path))?;
 
+    // 连接级 pragma **必须挂在 ConnectOptions 上**,不能建完池再
+    // `execute(&pool)` 发一遍 —— 那样只会作用在池随手给出的**那一条**连接上,
+    // 其余连接各自保持默认值。
+    //
+    // `foreign_keys` 默认是 **OFF**,而这个库有四张表靠 `ON DELETE CASCADE`
+    // 清理(agent_nic_traffic / nodes / user_nic_bindings / agent_commands)。
+    // 早先那种写法的后果:删 agent 时若这条 DELETE 落在没开外键的连接上,
+    // 级联不发生,残留数据留在库里 —— 而 SQLite 的 `INTEGER PRIMARY KEY`
+    // 没有 AUTOINCREMENT 会**复用被删掉的 id**,于是下一台新加的机器
+    // 一上来就顶着上一台的流量和节点(v0.4.9 修的就是这个)。
+    //
+    // `journal_mode` / `synchronous` 是库级的(写进文件头),挂在这里也无妨,
+    // 顺带省掉建池后那几条语句。
+    let opts = SqliteConnectOptions::from_str(&url)?
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5));
+
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
-        .connect(&url)
+        .connect_with(opts)
         .await
         .with_context(|| format!("打开数据库 {} 失败", db_path))?;
-    for pragma in [
-        "PRAGMA journal_mode=WAL",
-        "PRAGMA synchronous=NORMAL",
-        "PRAGMA busy_timeout=5000",
-        "PRAGMA foreign_keys=ON",
-    ] {
-        sqlx::query(pragma).execute(&pool).await?;
-    }
     Ok(pool)
 }
 
 /// 线性迁移:每个版本的所有语句在一个事务里跑,要么整版生效要么整版回滚。
 /// ALTER TABLE 的重复列错误单独放行,兼容历史上被手工 ALTER 过的库。
+///
+/// **迁移连接上外键是关的。** 这是重建表(建新表、搬数据、丢旧表、改名)
+/// 唯一可行的前提:外键开着时 `DROP TABLE agents` 会先做一次隐式
+/// DELETE,顺着 `ON DELETE CASCADE` 把 nodes / agent_nic_traffic / user_traffic
+/// 全部清空 —— 一次改属性的迁移会把所有节点和流量删干净(009 就是这种迁移)。
+///
+/// 在这里关而不在 SQL 里关,是因为 `PRAGMA foreign_keys` **在事务内是空操作**,
+/// 而每一版都跑在事务里;写在 SQL 里只会让人以为关掉了。
+///
+/// 只影响这条临时连接,业务池那边照常开着(见 `init_pool`)。
 async fn migrate(url: &str) -> Result<()> {
     let mut conn = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
+        .foreign_keys(false)
         .disable_statement_logging()
         .connect()
         .await?;
@@ -239,6 +262,103 @@ mod tests {
         migrate(&url).await.unwrap();
     }
 
+    /// 009 重建 `agents` 表 —— 重建后的列必须与「从零建库」**完全一致**。
+    ///
+    /// 重建表的经典事故就是漏列:009 的 CREATE 是照着 001 抄的,而 004 后来
+    /// 又 ALTER 加了六个主机指标列。漏掉它们时,库能建起来、迁移也不报错,
+    /// 只有跑到那条 SQL 才炸「no such column: cpu_pct」。
+    ///
+    /// 所以这里不逐个点名列,而是拿**升级上来的库**和**全新建的库**对比整份
+    /// 列清单 —— 以后再往 agents 上加列,忘了同步 009 的话这条会直接失败。
+    #[tokio::test]
+    async fn the_rebuilt_agents_table_matches_a_fresh_one() {
+        async fn columns(pool: &SqlitePool) -> Vec<(String, String)> {
+            let rows = sqlx::query("PRAGMA table_info(agents)").fetch_all(pool).await.unwrap();
+            let mut cols: Vec<(String, String)> =
+                rows.iter().map(|r| (r.get::<String, _>(1), r.get::<String, _>(2))).collect();
+            cols.sort();
+            cols
+        }
+
+        // 一路迁上来的库(009 重建过)。
+        let upgraded = init_pool(&tmp_db()).await.unwrap();
+        // 全新建的库 —— 同样跑完 009,但表里没有历史数据。
+        let fresh = init_pool(&tmp_db()).await.unwrap();
+
+        assert_eq!(columns(&upgraded).await, columns(&fresh).await);
+        // 再钉一遍那几个最容易漏的:光比「两边一致」的话,两边一起漏了也发现不了。
+        let names: Vec<String> = columns(&fresh).await.into_iter().map(|(n, _)| n).collect();
+        for must in
+            ["cpu_pct", "mem_used", "mem_total", "load1", "uptime_secs", "sysinfo_at", "outbound_strategy"]
+        {
+            assert!(names.contains(&must.to_string()), "重建后的 agents 缺列 {must}:{names:?}");
+        }
+    }
+
+    /// 回归(v0.4.9):`agents.id` **不能复用**。
+    ///
+    /// 现场表现是「TUI 里删掉一台机器、重新添加,新机器还没装 agent,
+    /// 页面上流量就已经在涨」—— 因为被删的 id 被重发给了新机器,而 daemon
+    /// 里那条旧 WebSocket 还活着,继续往这个 id 上报。
+    #[tokio::test]
+    async fn a_deleted_agent_id_is_never_handed_out_again() {
+        let pool = init_pool(&tmp_db()).await.unwrap();
+        let (first, _) = agent_repo::create(&pool, "old", 0).await.unwrap();
+        agent_repo::delete(&pool, first).await.unwrap();
+
+        let (second, _) = agent_repo::create(&pool, "new", 0).await.unwrap();
+        assert_ne!(second, first, "删掉的 id 又发出去了 —— 新机器会顶着旧机器的流量");
+    }
+
+    /// 009 重建 `agents` 表。**外键必须在迁移连接上关掉** ——
+    /// 开着的话 `DROP TABLE agents` 会顺着 `ON DELETE CASCADE` 做一次隐式 DELETE,
+    /// 把 nodes / 流量全部清空:一次「改 id 属性」的迁移会删掉用户所有数据。
+    ///
+    /// 这里造出 009 之前的状态(带数据),跑完整套迁移,再确认数据还在。
+    #[tokio::test]
+    async fn rebuilding_agents_keeps_nodes_and_traffic() {
+        let path = tmp_db();
+        let url = format!("sqlite://{}?mode=rwc", path);
+        {
+            // 先迁到 008 —— 也就是 009 要重建的那个 agents 表。
+            let pool = init_pool(&path).await.unwrap();
+            let (agent, _) = agent_repo::create(&pool, "keep-me", 0).await.unwrap();
+            sqlx::query(
+                "INSERT INTO nodes (agent_id, tag, protocol, listen_port, params_json)
+                 VALUES (?, 'n1', 'vless', 443, '{}')",
+            )
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO agent_nic_traffic
+                   (agent_id, boot_id, cycle_rx, cycle_tx, cycle_start, updated_at)
+                 VALUES (?, 'b', 111, 222, 0, 1)",
+            )
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+            // 把版本退回 008,让 009 在有数据的库上重跑一次。
+            sqlx::query("PRAGMA user_version = 8").execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+
+        migrate(&url).await.unwrap();
+
+        let pool = init_pool(&path).await.unwrap();
+        let nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes").fetch_one(&pool).await.unwrap();
+        assert_eq!(nodes, 1, "重建 agents 表把节点一起删了");
+        let rx: i64 = sqlx::query_scalar("SELECT cycle_rx FROM agent_nic_traffic")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rx, 111, "重建 agents 表把流量一起删了");
+        let agents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents").fetch_one(&pool).await.unwrap();
+        assert_eq!(agents, 1, "agent 自己也得留着");
+    }
+
     /// 跨 agent 求和视图(§13.1 第二条)。
     ///
     /// 造 2 个 agent × 3 个节点,验证 `user_traffic_total` 等于逐节点手算之和,
@@ -367,5 +487,137 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(n, 1, "删除 agent 不应删掉用户");
+    }
+
+    /// 探针:把池里**每一条**连接上的 `PRAGMA foreign_keys` 实际值查出来。
+    ///
+    /// 留着它是因为这个开关是连接级的,而排查时唯一可信的是实测值 ——
+    /// 靠读文档猜 sqlx 的默认行为容易猜错。
+    #[tokio::test]
+    async fn foreign_keys_is_on_for_every_connection_in_the_pool() {
+        let pool = init_pool(&tmp_db()).await.unwrap();
+        // 同时占住 4 条连接(= max_connections),逐条问它自己的 pragma。
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(pool.acquire().await.unwrap());
+        }
+        for (i, conn) in held.iter_mut().enumerate() {
+            let on: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+                .fetch_one(&mut **conn)
+                .await
+                .unwrap();
+            assert_eq!(on, 1, "第 {i} 条连接上的 foreign_keys 是关的");
+        }
+    }
+
+    /// **池里的每一条连接都要开着外键。**
+    ///
+    /// `foreign_keys` 是**连接级**开关且默认 OFF。早先的写法是建完池再
+    /// `PRAGMA foreign_keys=ON` `execute(&pool)` 发一遍 —— 那只作用在池
+    /// 随手给出的那一条连接上,其余三条仍是关的。
+    ///
+    /// 后果不是报错,是**静默不级联**:删 agent 时若那条 DELETE 落在没开外键的
+    /// 连接上,`agent_nic_traffic` 等四张表的行会留下来。而 SQLite 的
+    /// `INTEGER PRIMARY KEY` 不带 AUTOINCREMENT 会**复用被删掉的 id**,
+    /// 于是下一台新加的机器一上来就顶着上一台的流量(v0.4.9 修的就是这个:
+    /// 「刚加的 agent 还没装就在涨流量」)。
+    ///
+    /// 这条测试**并发**发起远多于池容量的查询,逼 sqlx 把每条连接都用上;
+    /// 只要有一条没开外键,插入孤儿行就会成功,断言随即失败。
+    #[tokio::test]
+    async fn every_pooled_connection_enforces_foreign_keys() {
+        let path =
+            std::env::temp_dir().join(format!("sbx-fk-all-conns-{}.db", uuid::Uuid::new_v4()));
+        let pool = init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+
+        // 32 个并发探针 ≫ max_connections(4),每条连接都会被轮到。
+        // 每个探针插一行指向不存在的 agent —— 外键开着就必须失败。
+        let probes = (0..32).map(|i| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                sqlx::query(
+                    "INSERT INTO nodes (agent_id, tag, protocol, listen_port, params_json)
+                     VALUES (99999, ?, 'trojan', 443, '{}')",
+                )
+                .bind(format!("orphan-{i}"))
+                .execute(&pool)
+                .await
+                .is_ok()
+            })
+        });
+        let accepted = futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .filter(|r| *r.as_ref().unwrap_or(&false))
+            .count();
+        assert_eq!(accepted, 0, "有连接没开外键:{accepted} 个孤儿节点被插进去了");
+
+        // 反过来确认这个探针本身是有效的 —— agent 存在时同样的插入要成功,
+        // 否则上面的「全部失败」可能只是因为 SQL 写错了。
+        sqlx::query(
+            "INSERT INTO agents (id, name, token_hash, token_prefix, status, created_at)
+             VALUES (1, 'a', 'h', 'p', 'never', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO nodes (agent_id, tag, protocol, listen_port, params_json)
+             VALUES (1, 'real', 'trojan', 443, '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("agent 存在时这一插入该成功,否则上面的断言是假阳性");
+    }
+
+    /// 删 agent 要把**网卡流量**也带走。
+    ///
+    /// 漏掉它的表现最迷惑:因为 SQLite 会复用被删掉的 id,下一台新加的机器
+    /// 会继承这一行,于是「还没装 agent,服务管理页上就开始涨流量」。
+    #[tokio::test]
+    async fn deleting_an_agent_clears_its_nic_traffic() {
+        let path = std::env::temp_dir().join(format!("sbx-fk-nic-{}.db", uuid::Uuid::new_v4()));
+        let pool = init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, token_hash, token_prefix, status, created_at)
+             VALUES (1, 'azure', 'h', 'p', 'online', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_nic_traffic
+               (agent_id, boot_id, last_rx, last_tx, cycle_rx, cycle_tx, cycle_start, updated_at)
+             VALUES (1, 'b', 1, 2, 111, 222, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        crate::db::agent_repo::delete(&pool, 1).await.unwrap();
+
+        let n: i64 = sqlx::query("SELECT COUNT(*) FROM agent_nic_traffic")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 0, "删除 agent 后网卡流量必须一起清掉");
+
+        // 复用 id=1 建一台新的:它必须是干净的。
+        let (id, _) = crate::db::agent_repo::create(&pool, "new-box", 0).await.unwrap();
+        let rev: i64 = sqlx::query_scalar("SELECT config_revision FROM agents WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rev, 0, "新建 agent 的 config_revision 该从 0 起");
+        let n: i64 = sqlx::query("SELECT COUNT(*) FROM agent_nic_traffic WHERE agent_id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(n, 0, "新 agent 不该继承上一台的流量");
     }
 }
