@@ -337,8 +337,12 @@ async fn nic_usage(pool: &SqlitePool, user_id: i64) -> Result<Option<(u64, u64, 
     let mut quota: u64 = 0;
     let mut all_capped = true;
     for (rx, tx, q) in rows {
-        up = up.saturating_add(rx.max(0) as u64);
-        down = down.saturating_add(tx.max(0) as u64);
+        // **tx 是上行,rx 是下行**(站在被控机上看):`/proc/net/dev` 的
+        // Transmit 是它发出去的,Receive 是它收进来的。这两个值最终进
+        // `subscription-userinfo` 的 upload/download,客户端直接照着显示 ——
+        // 接反了就是每个用户的客户端里上下行都是反的。
+        up = up.saturating_add(tx.max(0) as u64);
+        down = down.saturating_add(rx.max(0) as u64);
         match q.filter(|v| *v > 0) {
             Some(v) => quota = quota.saturating_add(v as u64),
             None => all_capped = false,
@@ -411,8 +415,10 @@ mod tests {
 
         crate::db::node_repo::set_user_nics(&p, uid, &[a1, a2]).await.unwrap();
         let h = usage_header(&p, uid).await.unwrap();
-        assert!(h.contains("upload=1030"), "两台的 rx 之和,且不乘倍率: {h}");
-        assert!(h.contains("download=2040"), "{h}");
+        // `fixture(…, rx, tx)`:两台是 (1000, 2000) 和 (30, 40)。
+        // **upload 取 tx、download 取 rx** —— Transmit 是机器发出去的。
+        assert!(h.contains("upload=2040"), "两台的 tx 之和,且不乘倍率: {h}");
+        assert!(h.contains("download=1030"), "两台的 rx 之和: {h}");
         assert!(h.contains("total=500"), "两台配额之和: {h}");
     }
 
@@ -428,7 +434,8 @@ mod tests {
         crate::db::node_repo::set_user_nics(&p, uid, &[a1, a2]).await.unwrap();
         let h = usage_header(&p, uid).await.unwrap();
         assert!(h.contains("total=0"), "有一台不限就该整体报不限: {h}");
-        assert!(h.contains("upload=1005"), "{h}");
+        // 两台的 tx 都是 0,所以 upload=0;rx 之和 1005 进 download。
+        assert!(h.contains("download=1005"), "{h}");
     }
 
     /// 解绑之后必须**立刻**回到原来的口径 —— 空列表是一个正当操作。
@@ -437,7 +444,8 @@ mod tests {
         let p = nic_pool().await;
         let (uid, a1) = fixture(&p, Some(100), 1_000, 2_000).await;
         crate::db::node_repo::set_user_nics(&p, uid, &[a1]).await.unwrap();
-        assert!(usage_header(&p, uid).await.unwrap().contains("upload=1000"));
+        // rx=1000 / tx=2000 → upload 取 tx。
+        assert!(usage_header(&p, uid).await.unwrap().contains("upload=2000"));
 
         crate::db::node_repo::set_user_nics(&p, uid, &[]).await.unwrap();
         let h = usage_header(&p, uid).await.unwrap();

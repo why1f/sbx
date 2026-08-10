@@ -460,8 +460,12 @@ impl SpeedTracker {
                     None
                 } else {
                     Some(Rate {
-                        up: (s.rx - p.rx) as f64 / dt as f64,
-                        down: (s.tx - p.tx) as f64 / dt as f64,
+                        // **rx 是下行,tx 是上行。** 站在这台被控机上看:
+                        // `/proc/net/dev` 的 Receive 是它**收**进来的字节(下载),
+                        // Transmit 是它**发**出去的(上传)。早先这里接反了,
+                        // 表现是 agent 自升级(纯下载)时界面上涨的是 ↑。
+                        up: (s.tx - p.tx) as f64 / dt as f64,
+                        down: (s.rx - p.rx) as f64 / dt as f64,
                         at: s.at,
                     })
                 }
@@ -764,8 +768,8 @@ mod tests {
         t.feed(1, sample(9_000_000, 9_000_000, 100, "old-boot"), 100);
         t.feed(1, sample(9_003_000, 9_003_000, 130, "old-boot"), 130);
         assert_eq!(t.feed(1, sample(10, 10, 160, "new-boot"), 160), (None, None));
-        // 重启之后仍然能重新建立基准。
-        let (up, _) = t.feed(1, sample(310, 10, 190, "new-boot"), 190);
+        // 重启之后仍然能重新建立基准。tx 涨了 300 → 上行 10 B/s。
+        let (up, _) = t.feed(1, sample(10, 310, 190, "new-boot"), 190);
         assert_eq!(up, Some(10.0));
     }
 
@@ -784,8 +788,26 @@ mod tests {
         let mut t = SpeedTracker::default();
         t.feed(1, sample(0, 0, 100, "b1"), 100);
         t.feed(2, sample(0, 0, 100, "b2"), 100);
-        assert_eq!(t.feed(1, sample(300, 0, 130, "b1"), 130).0, Some(10.0));
-        assert_eq!(t.feed(2, sample(600, 0, 130, "b2"), 130).0, Some(20.0));
+        // `sample(rx, tx, …)` —— 动的是 tx,所以看上行。
+        assert_eq!(t.feed(1, sample(0, 300, 130, "b1"), 130).0, Some(10.0));
+        assert_eq!(t.feed(2, sample(0, 600, 130, "b2"), 130).0, Some(20.0));
+    }
+
+    /// **rx 是下行,tx 是上行。** 站在被控机上看:`/proc/net/dev` 的 Receive
+    /// 是它收进来的字节(下载),Transmit 是它发出去的(上传)。
+    ///
+    /// 这条是 v0.4.8 的回归锚点。接反了平时看不出来 —— 代理流量两个方向都有,
+    /// 数字都在涨。只有 agent 自升级这种**纯下载**的时刻才露馅:
+    /// 界面上涨的是 ↑,而机器明明在下载。
+    #[test]
+    fn receive_is_download_and_transmit_is_upload() {
+        let mut t = SpeedTracker::default();
+        t.feed(1, sample(0, 0, 100, "b"), 100);
+        // 30 秒里 rx 涨 3000、tx 涨 300 —— 就是「在下载」的样子。
+        let (up, down) = t.feed(1, sample(3_000, 300, 130, "b"), 130);
+        assert_eq!(down, Some(100.0), "rx 的增量该算成**下行**");
+        assert_eq!(up, Some(10.0), "tx 的增量该算成**上行**");
+        assert!(down > up, "纯下载时下行必须大于上行,反了就是这个 bug");
     }
 
     /// 折线图**只在真的来了新读数时**才推进一格。

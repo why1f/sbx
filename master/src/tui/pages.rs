@@ -540,8 +540,12 @@ pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
     let nic_total = a.cycle_rx.saturating_add(a.cycle_tx);
     out.push(Line::from(vec![
         Span::styled("  网卡本周期  ", Style::default().fg(theme::DIM)),
-        Span::styled(format!("↑ {:<10}", theme::bytes(a.cycle_rx)), Style::default().fg(theme::UP)),
-        Span::styled(format!("↓ {:<10}", theme::bytes(a.cycle_tx)), Style::default().fg(theme::DOWN)),
+        // **tx 是上行,rx 是下行**(站在这台被控机上看):`/proc/net/dev` 的
+        // Transmit 是它发出去的,Receive 是它收进来的。接反过的后果很隐蔽 ——
+        // 平时代理流量两个方向都有,看不出来;只有 agent 自升级这种纯下载的
+        // 时刻才露馅(涨的是 ↑)。
+        Span::styled(format!("↑ {:<10}", theme::bytes(a.cycle_tx)), Style::default().fg(theme::UP)),
+        Span::styled(format!("↓ {:<10}", theme::bytes(a.cycle_rx)), Style::default().fg(theme::DOWN)),
         Span::styled("合计 ", Style::default().fg(theme::DIM)),
         Span::styled(theme::bytes(nic_total), Style::default().add_modifier(Modifier::BOLD)),
     ]));
