@@ -724,6 +724,13 @@ const PCT_LABEL_COLS: u16 = 6;
 /// 窄屏回退时,「每月 22 日重置」跟在百分比后面要占的地方(中文按两列算)。
 const RESET_LABEL_COLS: u16 = 15;
 
+/// 完整 IPv6 的最大显示宽度:8 组 4 位十六进制 + 7 个冒号 = 39。
+///
+/// **IP 那一列必须按它算,不能按 IPv4 的 15 算** —— 两个地址是上下两行
+/// 共用同一列的。早先给 22,于是 `2605:52c0:2:3525:505…` 被从**尾巴**截掉,
+/// 而尾部恰恰是主机位:同一个 /64 下的两台机器,截完长得一模一样。
+const IPV6_COLS: u16 = 39;
+
 fn columns(total_width: u16) -> Cols {
     // 减掉左右边框(2),以及 ratatui 在各列之间插的间隔(五列 = 四个;
     // 加上主机列就是五个)。漏算的话总宽超出可用空间,ratatui 会静默压缩各列。
@@ -769,6 +776,24 @@ fn columns(total_width: u16) -> Cols {
     // 表现是「每月」后面被切掉,而 §13.4 要防的正是这种静默截断。
     let tail = PCT_LABEL_COLS + if reset == 0 { RESET_LABEL_COLS } else { 0 };
     let bar = traffic.saturating_sub(tail).min(20) as usize;
+
+    // **把右边剩下的地方补给 IP 列,让 IPv6 完整显示。**
+    //
+    // 完整 IPv6 要 39 列,而这一列的常规宽度只有 22 —— 于是
+    // `2605:52c0:2:3525:505…` 从**尾巴**被截掉,而尾部恰恰是主机位:
+    // 同一个 /64 下的两台机器截完长得一模一样,这一列就白占了。
+    //
+    // 放在最后做:前面那些「够不够宽就加一列」的判断都基于常规宽度,
+    // 先把 IP 撑宽会把出站/重置/主机列挤掉 —— 那几列比「看全 IPv6」更常用。
+    //
+    // `avail` 在函数开头按 5 列扣了间隔,而这里实际最多 7 列。
+    // 少扣的那部分不能算进可用余量,否则会把总宽撑过边框、
+    // 让 ratatui 静默压缩各列(§13.4 要防的正是这个)。
+    let shown_cols = 4 + u16::from(host > 0) + u16::from(outbound > 0) + u16::from(reset > 0);
+    let gaps_unaccounted = shown_cols.saturating_sub(5);
+    let used = name + ip + speed + traffic + host + outbound + reset + gaps_unaccounted;
+    let ip = ip + avail.saturating_sub(used).min(IPV6_COLS.saturating_sub(ip));
+
     Cols { name, ip, speed, traffic, host, outbound, reset, bar: if bar < 4 { 0 } else { bar } }
 }
 
@@ -1387,6 +1412,80 @@ pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], s
 /// (节点视图列用户、用户视图列节点),宽度不一致的话上下行会错开一格。
 const BD_NAME_COLS: usize = 22;
 
+/// 长文本二级页面一屏能显示几行。
+///
+/// 单独拎出来是因为**按键那一侧也要用它**:滚动的上界、翻页的步长都得按
+/// 真实可视行数算,而那个数只有布局知道。两边各写一遍「减 4」的话,
+/// 改一次边框就会滚过头 —— 表现是翻一页跳掉两行,而人不会发现。
+pub fn config_view_h(total_h: u16) -> usize {
+    // 边框 2 + 标题行 1 + 空行 1 = 4。
+    (total_h as usize).saturating_sub(4)
+}
+
+/// 一个只读的长文本二级页面(现在用来看 sing-box 配置)。
+///
+/// 铺满可用区域而不是像明细表那样居中留边:配置是宽的
+/// (缩进 + 长 base64),挤在 104 列里会到处折行。
+pub fn config_text(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    head: &str,
+    lines: &[String],
+    scroll: usize,
+) {
+    let rect = area;
+    f.render_widget(ratatui::widgets::Clear, rect);
+
+    let view_h = config_view_h(rect.height);
+    let shown: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(view_h)
+        .map(|l| {
+            // JSON 里 `"key":` 的键名着色,让两三百行里能扫到结构。
+            // 值不着色 —— 那样满屏彩字反而看不出层次。
+            let trimmed = l.trim_start();
+            if let Some(rest) = trimmed.strip_prefix('"').and_then(|r| r.split_once("\":")) {
+                let indent = &l[..l.len() - trimmed.len()];
+                return Line::from(vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(
+                        format!("\"{}\":", rest.0),
+                        Style::default().fg(theme::ACCENT),
+                    ),
+                    Span::raw(rest.1.to_string()),
+                ]);
+            }
+            Line::from(l.clone())
+        })
+        .collect();
+
+    let mut body = vec![Line::from(Span::styled(
+        format!("  {head}"),
+        Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+    ))];
+    body.push(Line::from(""));
+    body.extend(shown);
+
+    // 标题里带滚动位置。没有它,在一份两百行的配置中间完全不知道自己在哪 ——
+    // 也分不出「到底了」和「卡住了」。
+    let pos = if lines.len() > view_h {
+        format!(
+            " {title} [{}-{}/{}] ",
+            scroll + 1,
+            (scroll + view_h).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        format!(" {title} ")
+    };
+    f.render_widget(
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(pos)),
+        rect,
+    );
+}
+
 pub fn breakdown(
     f: &mut Frame,
     area: Rect,
@@ -1645,10 +1744,47 @@ mod tests {
         assert!(out.contains("↑ --") && out.contains("↓ --"), "{out}");
     }
 
+    /// **宽屏上 IPv6 要完整显示,一个字符都不能少。**
+    ///
+    /// 早先 IP 列写死 22 列,而运营商给的地址普遍 25~30 列 —— 于是
+    /// `2605:52c0:2:3525:505…` 从**尾巴**被截掉。尾部恰恰是主机位:
+    /// 同一个 /64 下的两台机器截完长得一模一样,这一列就白占了。
+    /// 而那时表格右边还空着十几列。
+    ///
+    /// 理论最长的 IPv6(8 组 4 位 + 7 个冒号 = 39)要到 ~145 列才排得下,
+    /// 所以这里用一个**真实形状**的地址(压缩过、去了前导零)。
     #[test]
-    fn long_addresses_are_truncated() {
-        let out = render_agents(&[agent(None, None)]);
-        assert!(out.contains('…'), "超宽的 IPv6 应当被截断\n{out}");
+    fn a_real_ipv6_is_shown_in_full_at_common_widths() {
+        const ADDR: &str = "2605:52c0:2:3525:505:1:0:1234";
+        let mut a = agent(None, None);
+        a.ipv6 = Some(ADDR.into());
+        for w in [140, 160, 200] {
+            let out = draw_to_string(w, 12, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
+            assert!(out.contains(ADDR), "{w} 列上 IPv6 该完整显示:\n{out}");
+            // 不能为它牺牲别的列 —— 出站/重置都得还在。
+            let c = super::columns(w);
+            assert!(c.outbound > 0 && c.reset > 0, "{w} 列:撑宽 IP 不该把别的列挤掉");
+        }
+    }
+
+    /// 理论最长的 IPv6 在足够宽的终端上也要完整显示。
+    #[test]
+    fn the_longest_possible_ipv6_fits_on_a_wide_terminal() {
+        const MAX: &str = "2605:52c0:2:3525:aaaa:bbbb:cccc:dddd";
+        let mut a = agent(None, None);
+        a.ipv6 = Some(MAX.into());
+        let out = draw_to_string(170, 12, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
+        assert!(out.contains(MAX), "170 列该放得下最长的 IPv6:\n{out}");
+    }
+
+    /// 窄屏放不下时仍然截断,而且**看得出来被截了**(带 `…`)。
+    /// §13.4 要防的是静默截断,不是截断本身。
+    #[test]
+    fn a_long_address_is_visibly_truncated_when_narrow() {
+        let mut a = agent(None, None);
+        a.ipv6 = Some("2605:52c0:2:3525:aaaa:bbbb:cccc:dddd".into());
+        let out = draw_to_string(90, 12, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
+        assert!(out.contains('…'), "窄屏截断要带省略号\n{out}");
     }
 
     #[test]
@@ -1674,7 +1810,36 @@ mod tests {
                 settings(f, f.area(), &crate::tui::settings::all(&crate::config::Config::default()), 0)
             });
             draw_to_string(w, h, |f| breakdown(f, f.area(), "t", "h", &[], &[]));
+            // 配置页在 1×1 上也不能炸:它要减掉边框/标题算可视行数,
+            // 再按那个数去切一份两百行的文本 —— 高度不够时两处都会越界。
+            let cfg: Vec<String> = (0..200).map(|i| format!("  \"key{i}\": {i},")).collect();
+            draw_to_string(w, h, |f| config_text(f, f.area(), "t", "h", &cfg, 0));
+            // 滚到底那一屏是最容易切过头的地方。
+            draw_to_string(w, h, |f| config_text(f, f.area(), "t", "h", &cfg, 199));
         }
+    }
+
+    /// **配置页的标题里要带滚动位置。**
+    ///
+    /// 没有它,在一份两百行的配置中间完全不知道自己在哪 —— 更要紧的是
+    /// 分不出「已经到底了」和「按键卡住了」:两种情况下按 ↓ 都是屏幕不动。
+    #[test]
+    fn the_config_page_shows_where_you_are() {
+        let lines: Vec<String> = (0..200).map(|i| format!("\"key{i}\": {i}")).collect();
+        let out =
+            draw_to_string(80, 24, |f| config_text(f, f.area(), "tokyo 的配置", "h", &lines, 40));
+        // 24 行高 → 一屏 20 行,从第 41 行起。
+        assert!(out.contains("[41-60/200]"), "标题该带滚动位置:\n{out}");
+        assert!(out.contains("\"key40\""), "该从第 41 行开始显示:\n{out}");
+        assert!(!out.contains("\"key60\""), "不该越过这一屏往下多画:\n{out}");
+    }
+
+    /// 一屏放得下的时候标题里**不带**位置 —— 那时它只是噪音。
+    #[test]
+    fn a_short_config_gets_no_scroll_indicator() {
+        let lines: Vec<String> = (0..3).map(|i| format!("\"key{i}\": {i}")).collect();
+        let out = draw_to_string(80, 24, |f| config_text(f, f.area(), "小配置", "h", &lines, 0));
+        assert!(!out.contains('/'), "一屏放得下就不该有 x-y/z:\n{out}");
     }
 
     /// 出站策略要有**自己一列**,不能只写在底部摘要里。

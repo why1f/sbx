@@ -62,6 +62,12 @@ pub enum Action {
     ShowUserNodes { id: i64, name: String },
     /// 打开「这台机器的网卡明细」:整机网卡用量 + 配额 + 各节点跑了多少。
     ShowAgentNics { id: i64, name: String },
+    /// 打开「这台机器上 sing-box 跑的是什么配置」。
+    ///
+    /// 配置由主控**现场组装**(`service::build_agent_config`),不向 agent 要 ——
+    /// 下发给它的就是这份字节,所以两边必然一致;而且离线的机器也能看,
+    /// 那恰恰是最需要看的时候(「为什么这台一直连不上/没生效」)。
+    ShowAgentConfig { id: i64, name: String },
     /// 立刻刷一遍。常规刷新是每秒一次,但改完配置或另一个进程动了库时要马上看到。
     Refresh,
     AddNode(NodeDraft),

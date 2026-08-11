@@ -92,6 +92,14 @@ struct App {
     /// 与 `modal` 分开是因为它**是只读的、且数据要异步查**:走 `Modal` 的话
     /// 得让弹窗持有一个 pool,而弹窗那一层现在是纯渲染 + 纯按键,没有 IO。
     overlay: Option<Overlay>,
+    /// 上一帧的终端高度。**按键那一侧要靠它算滚动**:一屏是多少行、滚到哪儿
+    /// 算到底,都得按真实高度来,而 `on_key` 手里没有 frame。
+    ///
+    /// 存上一帧而不是现场问终端:两者只在「按键和改窗口大小同时发生」的那一拍
+    /// 不同,而下一帧就会纠正回来 —— 为这点误差把 crossterm 的查询塞进按键路径
+    /// 不划算。0 表示还没画过第一帧(测试里构造的 App 就是这样),
+    /// 由 `overlay_view_h` 兜一个保守值。
+    term_h: u16,
     /// 一次性消息(某个操作的结果)。为 `None` 时状态栏显示当前页的快捷键
     /// 与选中项摘要 —— 那是**常驻**信息,不该被上一次操作的回执长期占着。
     /// 还没下发完的升级指令条数。TUI 只入队,真正下发在 daemon 那边(隔一拍),
@@ -120,6 +128,7 @@ impl App {
             speed: SpeedTracker::default(),
             modal: None,
             overlay: None,
+            term_h: 0,
             probed_ip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_cmds: 0,
             want_self_upgrade: false,
@@ -327,7 +336,7 @@ impl App {
         match self.page {
             Page::Dashboard => "  [←/→]换栏  [↑↓/jk]选择  [Enter]用量明细",
             Page::Agents => {
-                "  [a]新增  [E]编辑  [Enter]网卡明细  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
+                "  [a]新增  [E]编辑  [Enter]网卡明细  [c]查看配置  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
             }
             Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除",
             Page::Users => {
@@ -383,9 +392,20 @@ impl App {
             }
         }
     }
+
+    /// 二级页面一屏能显示几行。滚动的上界和翻页的步长都按它算。
+    ///
+    /// 还没画过第一帧时(`term_h == 0`)退回 20 行:**宁可少翻也不能多翻** ——
+    /// 少翻一屏只是多按一次,多翻会直接跳过没看过的内容,而人不会察觉。
+    fn overlay_view_h(&self) -> usize {
+        match pages::config_view_h(self.term_h) {
+            0 => 20,
+            h => h,
+        }
+    }
 }
 
-/// 一张只读的用量明细表。
+/// 一个只读的二级页面。
 struct Overlay {
     title: String,
     head: String,
@@ -393,7 +413,34 @@ struct Overlay {
     /// 网卡明细要靠它把「整机烧了多少」和下面「各节点跑了多少」并排摆出来 ——
     /// 这两个数字口径不同,分开看会得出错误结论(§6.4)。
     info: Vec<Line<'static>>,
-    rows: Vec<data::BreakdownRow>,
+    body: OverlayBody,
+}
+
+/// 二级页面的内容。用量明细是表,配置是长文本 —— 后者必须能滚动
+/// (一份三节点的配置有两三百行,一屏放不下)。
+enum OverlayBody {
+    Table(Vec<data::BreakdownRow>),
+    /// `scroll` 是**首行行号**。存行号而不是像素/百分比:
+    /// 终端高度会变,按行号滚动在任何高度下都停在同一行内容上。
+    Text { lines: Vec<String>, scroll: usize },
+}
+
+impl Overlay {
+    fn table(title: String, head: String, rows: Vec<data::BreakdownRow>) -> Self {
+        Self { title, head, info: vec![], body: OverlayBody::Table(rows) }
+    }
+
+    /// 滚动。`view_h` 是当前能显示几行 —— 传进来而不是存起来,
+    /// 因为它随终端尺寸变,存下来就会在改窗口大小之后失准。
+    ///
+    /// 上界是 `len - view_h`:滚到底时最后一行贴着底边。
+    /// 不设上界的话可以一直按下去,直到整屏空白 —— 那时人会以为内容没了。
+    fn scroll_by(&mut self, delta: i64, view_h: usize) {
+        if let OverlayBody::Text { lines, scroll } = &mut self.body {
+            let max = lines.len().saturating_sub(view_h.max(1));
+            *scroll = (*scroll as i64 + delta).clamp(0, max as i64) as usize;
+        }
+    }
 }
 
 /// 进入 TUI。返回时终端一定已经恢复原状(正常退出、出错、panic 三条路都覆盖)。
@@ -502,7 +549,10 @@ async fn event_loop<B: ratatui::backend::Backend>(term: &mut Terminal<B>, mut ap
     let mut ticker = tokio::time::interval(TICK);
 
     loop {
-        term.draw(|f| draw(f, &app))?;
+        // 记下这一帧的高度给按键那一侧算滚动(见 `App::term_h`)。
+        // 取 `draw` 实际画到的区域,而不是另外去问一次终端 —— 改窗口大小时
+        // 这两个值会有一拍不一样,而滚动要跟着**看到的**那一屏走。
+        app.term_h = term.draw(|f| draw(f, &app))?.area.height;
         if app.quit {
             return Ok(());
         }
@@ -591,7 +641,17 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     modal::info_bar(f, chunks[3], &app.header_line());
 
     if let Some(o) = &app.overlay {
-        pages::breakdown(f, f.area(), &o.title, &o.head, &o.info, &o.rows);
+        match &o.body {
+            OverlayBody::Table(rows) => {
+                pages::breakdown(f, f.area(), &o.title, &o.head, &o.info, rows)
+            }
+            // 渲染是只读的:滚动越界由按键那一侧夹住(见 `scroll_by`)。
+            // 这里改状态的话,draw 就得拿 `&mut App`,而它每秒跑一次、
+            // 还要在 panic hook 里用 —— 不值得为一个夹取范围把签名改掉。
+            OverlayBody::Text { lines, scroll } => {
+                pages::config_text(f, f.area(), &o.title, &o.head, lines, *scroll);
+            }
+        }
     }
     if let Some(m) = &app.modal {
         modal::render(f, f.area(), m);
@@ -617,10 +677,35 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             }
         };
     }
-    // 明细表是只读的,任意键关掉。放在页面快捷键**之前** ——
-    // 否则在它开着的时候按 d 会去删掉后面那张表里选中的东西。
-    if app.overlay.is_some() {
-        app.overlay = None;
+    // 二级页面是只读的。放在页面快捷键**之前** —— 否则它开着的时候
+    // 按 d 会去删掉后面那张表里选中的东西。
+    //
+    // 可视行数要在借 `overlay` 之前算完:`overlay_view_h` 读的是 `app`,
+    // 而下面那一句把 `app` 整个可变借走了。
+    let view_h = app.overlay_view_h();
+    if let Some(o) = &mut app.overlay {
+        // 明细表一屏放得下,任意键关掉。
+        // 配置是长文本,**方向键必须留给滚动** —— 否则想往下看一眼就把页面关了,
+        // 而人会以为是崩了。它只认 Esc / q / Enter。
+        let scrollable = matches!(o.body, OverlayBody::Text { .. });
+        if !scrollable {
+            app.overlay = None;
+            return None;
+        }
+        // 翻页留**一行重叠**:新的一屏顶上那行是上一屏的末行。
+        // 整屏跳的话前后两屏之间没有共同的一行,在两百行的 JSON 里
+        // 很容易接不上("刚才那个 inbound 讲完了吗")。
+        let page = (view_h as i64 - 1).max(1);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.overlay = None,
+            KeyCode::Down | KeyCode::Char('j') => o.scroll_by(1, view_h),
+            KeyCode::Up | KeyCode::Char('k') => o.scroll_by(-1, view_h),
+            KeyCode::PageDown | KeyCode::Char(' ') => o.scroll_by(page, view_h),
+            KeyCode::PageUp => o.scroll_by(-page, view_h),
+            KeyCode::Home | KeyCode::Char('g') => o.scroll_by(i64::MIN / 2, view_h),
+            KeyCode::End | KeyCode::Char('G') => o.scroll_by(i64::MAX / 2, view_h),
+            _ => {}
+        }
         return None;
     }
     // 上一次操作的回执只留到下一次按键为止,之后让位给常驻的快捷键提示。
@@ -734,6 +819,15 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                 Some(a) => {
                     let (id, name) = (a.id, a.name.clone());
                     return Some(Action::ShowAgentNics { id, name });
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
+            // 「这台机器上 sing-box 到底跑的是什么」。排查「改了没生效」时,
+            // 这是唯一能把「主控以为的」和「机器上实际的」对上的地方。
+            KeyCode::Char('c') => match app.selected_agent() {
+                Some(a) => {
+                    let (id, name) = (a.id, a.name.clone());
+                    return Some(Action::ShowAgentConfig { id, name });
                 }
                 None => app.fail("没有选中任何被控服务器"),
             },
@@ -1355,14 +1449,13 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         Action::ShowNodeUsers { id, tag, agent } => {
             let rows = data::node_breakdown(&app.pool, *id).await?;
             let n = rows.len();
-            app.overlay = Some(Overlay {
-                title: format!("节点 {tag} 上的用户"),
-                // 各行倍率不同,标记跟在每个用户名后面(见 `node_breakdown`),
-                // 标题只说明这些数字是哪个口径。
-                head: format!("{tag}(在 {agent} 上)· {n} 个用户 · 数字含各自倍率"),
-                info: vec![],
+            // 各行倍率不同,标记跟在每个用户名后面(见 `node_breakdown`),
+            // 标题只说明这些数字是哪个口径。
+            app.overlay = Some(Overlay::table(
+                format!("节点 {tag} 上的用户"),
+                format!("{tag}(在 {agent} 上)· {n} 个用户 · 数字含各自倍率"),
                 rows,
-            });
+            ));
             Ok(String::new())
         }
 
@@ -1378,12 +1471,11 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 .find(|u| u.id == *id)
                 .map(|u| format!(" · 计费 {}", u.mult_tag()))
                 .unwrap_or_default();
-            app.overlay = Some(Overlay {
-                title: format!("{name} 的节点用量"),
-                head: format!("{name} · {n} 个节点{mult}"),
-                info: vec![],
+            app.overlay = Some(Overlay::table(
+                format!("{name} 的节点用量"),
+                format!("{name} · {n} 个节点{mult}"),
                 rows,
-            });
+            ));
             Ok(String::new())
         }
 
@@ -1406,7 +1498,33 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 // 看起来像其中一组坏了(§6.4 / §7.2)。
                 head: format!("{name} · {n} 个节点 · 上=整机网卡,下=节点计费用量"),
                 info,
-                rows,
+                body: OverlayBody::Table(rows),
+            });
+            Ok(String::new())
+        }
+
+        Action::ShowAgentConfig { id, name } => {
+            // 主控**现场组装**,不向 agent 要:下发给它的就是这份字节,
+            // 两边必然一致;而且离线的机器也能看 —— 那恰恰是最需要看的时候。
+            // **原文,不脱敏。** 这一页的用处就是「能不能直接 `sing-box -c` 跑起来」,
+            // 而遮掉私钥的配置跑不起来 —— 那样这一页就只剩个大概样子,
+            // 真要核对 reality 密钥对不对时反而看不到。
+            //
+            // 前提是它只在主控的终端上显示:这些凭据本来就是主控生成、主控保管的
+            // (§9.1 的密钥全部产自这里),库里也是明文。§11.3 管的是**列表和摘要行**
+            // —— 那些是平时一直摆在屏幕上的,而这一页要按 [c] 才打开。
+            let cfg = crate::service::build_agent_config(&app.pool, *id).await?;
+            let text = serde_json::to_string_pretty(&cfg)?;
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            let n = app.nodes.iter().filter(|x| x.agent_id == *id).count();
+            app.overlay = Some(Overlay {
+                title: format!("{name} 的 sing-box 配置"),
+                head: format!(
+                    "{name} · {n} 个节点 · {} 行 · 含凭据原文,注意别外传   [↑↓/PgUp/PgDn]滚动  [Esc]关闭",
+                    lines.len()
+                ),
+                info: vec![],
+                body: OverlayBody::Text { lines, scroll: 0 },
             });
             Ok(String::new())
         }
@@ -1593,7 +1711,7 @@ mod tests {
         let mut a = app();
         a.page = Page::Nodes;
         a.nodes = vec![stub_node(7, "n7")];
-        a.overlay = Some(Overlay { title: "t".into(), head: "h".into(), info: vec![], rows: vec![] });
+        a.overlay = Some(Overlay::table("t".into(), "h".into(), vec![]));
 
         assert!(on_key(&mut a, key('d')).is_none(), "不该产生删除动作");
         assert!(a.modal.is_none(), "也不该弹出确认框");
@@ -2624,5 +2742,145 @@ mod tests {
             Some("www.apple.com"),
             "留空之后应当回落到默认值,而不是留一个下发时会报错的 None"
         );
+    }
+
+    /// **`[c]` 给出的必须是能直接 `sing-box -c` 跑起来的那份原文。**
+    ///
+    /// 三件事一起钉住:
+    ///   1. 结构完整 —— `inbounds` / `outbounds` / `log` 都在;
+    ///   2. 改过出站策略的机器,`dns` 与 `route.default_domain_resolver` 不能少
+    ///      (缺了 server tag,sing-box 起不来);
+    ///   3. **凭据是原文** —— 遮掉私钥的配置跑不起来,那这一页就只剩个大概样子。
+    ///      这一页只在主控的终端上、按 [c] 才打开,而这些密钥本来就产自主控(§9.1)。
+    #[tokio::test]
+    async fn the_config_view_is_a_runnable_original() {
+        use crate::model::node::{NodeParams, Protocol};
+        use crate::model::outbound::OutboundStrategy;
+
+        let path = std::env::temp_dir().join(format!("sbx-cfgview-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let priv_key = params.private_key.clone().expect("reality 该有私钥");
+        let (node_id, _) = crate::db::node_repo::add_node(
+            &pool,
+            agent_id,
+            "in-1",
+            Protocol::VlessReality,
+            8443,
+            &params,
+        )
+        .await
+        .unwrap();
+        let uid = crate::db::node_repo::add_user(&pool, "alice", 0, 0).await.unwrap();
+        crate::db::node_repo::assign_node(&pool, uid, node_id).await.unwrap();
+        // 出站策略设成非 Auto,这样配置里才会出现 dns / route。
+        crate::db::agent_repo::set_outbound_strategy(&pool, agent_id, OutboundStrategy::Ipv4Only)
+            .await
+            .unwrap();
+
+        let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
+        app.refresh().await.unwrap();
+        perform_inner(
+            &mut app,
+            &Action::ShowAgentConfig { id: agent_id, name: "tokyo".into() },
+        )
+        .await
+        .unwrap();
+
+        let text = match &app.overlay.as_ref().expect("该打开配置页").body {
+            OverlayBody::Text { lines, .. } => lines.join("\n"),
+            _ => panic!("配置页该是文本,不是表格"),
+        };
+
+        for must in ["\"inbounds\"", "\"outbounds\"", "\"log\""] {
+            assert!(text.contains(must), "配置缺 {must}:\n{text}");
+        }
+        // 出站策略那一套:server tag 指不到的话 sing-box 起不来。
+        assert!(text.contains("\"dns\""), "改过出站策略就该有 dns:\n{text}");
+        assert!(text.contains("default_domain_resolver"), "缺 route 解析器:\n{text}");
+        assert!(text.contains("ipv4_only"), "策略值没写进去:\n{text}");
+        // 凭据原文 —— 这一条是刻意的,不是漏了脱敏。
+        assert!(text.contains(&priv_key), "reality 私钥该是原文,遮掉就跑不起来了");
+        assert!(!text.contains("***"), "这一页不做脱敏");
+        // 顺带确认它真是能解析回来的 JSON,而不是被截断过的片段。
+        serde_json::from_str::<serde_json::Value>(&text).expect("显示出来的该是合法 JSON 全文");
+    }
+
+    /// **配置页开着的时候,方向键归滚动,不能关页面。**
+    ///
+    /// 明细表是「任意键关掉」—— 一屏放得下,没什么好翻的。配置页照抄那条规则的话:
+    /// 想往下看一眼就把页面关了,而人会以为是崩了,不会想到「原来 ↓ 是关闭键」。
+    #[tokio::test]
+    async fn the_config_page_scrolls_instead_of_closing_on_arrow_keys() {
+        let mut a = app();
+        a.term_h = 24; // 减掉边框/标题/空行,一屏 20 行
+        let lines: Vec<String> = (0..100).map(|i| format!("line {i}")).collect();
+        a.overlay = Some(Overlay {
+            title: "t".into(),
+            head: "h".into(),
+            info: vec![],
+            body: OverlayBody::Text { lines, scroll: 0 },
+        });
+
+        let top = |a: &App| match &a.overlay.as_ref().expect("页面不该被关掉").body {
+            OverlayBody::Text { scroll, .. } => *scroll,
+            _ => panic!("该是文本页"),
+        };
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(top(&a), 1, "↓ 该滚一行,而不是把页面关掉");
+        on_key(&mut a, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(top(&a), 20, "PgDn 该翻一屏(20 行)并留一行重叠");
+
+        // 滚到底:最后一行贴着底边,再按也不该继续走 ——
+        // 越过去就是整屏空白,而那时人会以为内容没了。
+        on_key(&mut a, key('G'));
+        assert_eq!(top(&a), 80, "到底时最后一行该贴着底边");
+        on_key(&mut a, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(top(&a), 80, "已经到底了就别再动");
+        on_key(&mut a, key('g'));
+        assert_eq!(top(&a), 0, "g 回到开头");
+        on_key(&mut a, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(top(&a), 0, "开头之上没有内容,不该滚成负的");
+
+        on_key(&mut a, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.overlay.is_none(), "Esc 该关掉配置页");
+    }
+
+    /// **翻页的步长要跟着终端高度走。**
+    ///
+    /// 写死 20 行的话,在一个 60 行高的终端上按 PgDn 只走三分之一屏 ——
+    /// 更糟的是**滚动上界**也按 20 算,于是滚到底之后底下还压着 30 行看不到,
+    /// 而界面上没有任何迹象说明还有内容。
+    #[tokio::test]
+    async fn the_page_step_follows_the_terminal_height() {
+        let tall = |h: u16| {
+            let mut a = app();
+            a.term_h = h;
+            a.overlay = Some(Overlay {
+                title: "t".into(),
+                head: "h".into(),
+                info: vec![],
+                body: OverlayBody::Text {
+                    lines: (0..100).map(|i| format!("line {i}")).collect(),
+                    scroll: 0,
+                },
+            });
+            on_key(&mut a, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            match &a.overlay.as_ref().unwrap().body {
+                OverlayBody::Text { scroll, .. } => *scroll,
+                _ => unreachable!(),
+            }
+        };
+        // 高终端一屏看得多,滚到底时的首行就更靠前 —— 100 行减去一屏。
+        assert_eq!(tall(24), 80, "24 行高:一屏 20 行");
+        assert_eq!(tall(64), 40, "64 行高:一屏 60 行,滚到底该停在第 40 行");
+
+        // 还没画过第一帧时(测试里构造的 App、或第一次按键早于第一帧)
+        // 退回 20 行:宁可少翻也不能多翻,多翻会跳过没看过的内容。
+        assert_eq!(app().overlay_view_h(), 20, "没有高度信息时该退回保守值");
     }
 }
