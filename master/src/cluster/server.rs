@@ -193,7 +193,12 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
 /// **失败不重试。** 下次握手会再比一次 revision,自然重来(§4.2:
 /// 失败时主控保留旧 revision,不标记为成功)。
 async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, agent_user_rev: i64, master: Revisions) {
-    if agent_config_rev != master.config_revision {
+    if agent_config_rev == master.config_revision {
+        // 版本已经一致,不用发。但要把这个事实记在连接上 ——
+        // 巡检拿 `sent_config_rev` 和库里的值比,留着 `None` 会被当成
+        // 「这条连接还没下发过」,于是白发一次(重建 box 是有代价的)。
+        state.registry.lock().await.mark_config_sent(agent_id, agent_config_rev);
+    } else {
         tracing::info!(
             agent_id,
             agent_rev = agent_config_rev,
@@ -211,7 +216,16 @@ async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, age
                     .call_default(&state.registry, agent_id, method::CONFIG_APPLY, payload)
                     .await
                 {
-                    Ok(_) => tracing::info!(agent_id, rev = master.config_revision, "config.apply 已生效"),
+                    Ok(_) => {
+                        // 记在连接上,否则巡检看不到「已经发过了」,会每 30 秒
+                        // 重发同一个 revision —— 那等于让在线的机器不停重建 box。
+                        state
+                            .registry
+                            .lock()
+                            .await
+                            .mark_config_sent(agent_id, master.config_revision);
+                        tracing::info!(agent_id, rev = master.config_revision, "config.apply 已生效");
+                    }
                     Err(e) => {
                         // agent 回的 error 里带着 box.New 的失败原文(§4.2),值得留痕:
                         // 「配置下发失败」是运维要立刻知道的事。
@@ -244,7 +258,10 @@ async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, age
         }
     }
 
-    if agent_user_rev != master.user_state_revision {
+    if agent_user_rev == master.user_state_revision {
+        // 已经一致,记在连接上,免得巡检把它当成「没下发过」白发一次(理由同上)。
+        state.registry.lock().await.mark_user_sent(agent_id, agent_user_rev);
+    } else {
         tracing::info!(
             agent_id,
             agent_rev = agent_user_rev,
@@ -262,12 +279,19 @@ async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, age
                     .call_default(&state.registry, agent_id, method::USER_STATE, payload)
                     .await
                 {
-                    Ok(_) => tracing::info!(
-                        agent_id,
-                        rev = master.user_state_revision,
-                        count = disabled.len(),
-                        "user.state 已生效"
-                    ),
+                    Ok(_) => {
+                        state
+                            .registry
+                            .lock()
+                            .await
+                            .mark_user_sent(agent_id, master.user_state_revision);
+                        tracing::info!(
+                            agent_id,
+                            rev = master.user_state_revision,
+                            count = disabled.len(),
+                            "user.state 已生效"
+                        );
+                    }
                     Err(e) => tracing::error!(agent_id, error = %e, "user.state 失败"),
                 }
             }

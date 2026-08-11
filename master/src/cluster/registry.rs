@@ -21,6 +21,20 @@ struct AgentConn {
     /// 被驱逐的连接处理协程仍在运行(它要等自己的 socket 读到 EOF),
     /// 若它此时调用 `unregister`,不能把**新**连接踢掉。
     epoch: u64,
+    /// 这条连接上**已经成功下发**的 `config_revision`。
+    ///
+    /// 巡检靠它判断「库里的配置比这台机器新吗」。存在连接上而不是库里,
+    /// 是因为它描述的是**这条连接的状态**:断线重连之后一切从握手的
+    /// catch_up 重新对齐,旧值跟着连接一起消失才是对的。
+    ///
+    /// `None` = 握手后还没在这条连接上下发过。此时以 agent 握手时报的
+    /// revision 为准(由 `mark_config_sent` 在 catch_up 后写入)。
+    sent_config_rev: Option<i64>,
+    /// 同上,但对应 `user_state_revision`(禁用名单)。
+    ///
+    /// 两个 revision **各记各的**:改配置要重建 box,改禁用名单只翻内存标记,
+    /// 合成一个会让「停用一个用户」退化成一次整机重建(§4.1)。
+    sent_user_rev: Option<i64>,
 }
 
 #[derive(Default)]
@@ -51,8 +65,41 @@ impl Registry {
     pub fn register(&mut self, agent_id: i64, tx: ConnTx) -> Registered {
         self.next_epoch += 1;
         let epoch = self.next_epoch;
-        let evicted_previous = self.conns.insert(agent_id, AgentConn { tx, epoch }).is_some();
+        let evicted_previous = self
+            .conns
+            .insert(
+                agent_id,
+                AgentConn { tx, epoch, sent_config_rev: None, sent_user_rev: None },
+            )
+            .is_some();
         Registered { epoch, evicted_previous }
+    }
+
+    /// 记下「这台 agent 上已经生效的 config_revision」。
+    ///
+    /// 只在 `config.apply` **成功**之后调用 —— 失败时不记,让下一轮巡检重试。
+    /// agent 不在表里(刚断开)时静默忽略:那条连接已经没了,记了也没人用。
+    pub fn mark_config_sent(&mut self, agent_id: i64, rev: i64) {
+        if let Some(c) = self.conns.get_mut(&agent_id) {
+            c.sent_config_rev = Some(rev);
+        }
+    }
+
+    /// 已下发的 config_revision。`None` = 这条连接上还没下发过。
+    pub fn sent_config_rev(&self, agent_id: i64) -> Option<i64> {
+        self.conns.get(&agent_id).and_then(|c| c.sent_config_rev)
+    }
+
+    /// 记下「这台 agent 上已经生效的 user_state_revision」。理由同 `mark_config_sent`。
+    pub fn mark_user_sent(&mut self, agent_id: i64, rev: i64) {
+        if let Some(c) = self.conns.get_mut(&agent_id) {
+            c.sent_user_rev = Some(rev);
+        }
+    }
+
+    /// 已下发的 user_state_revision。`None` = 这条连接上还没下发过。
+    pub fn sent_user_rev(&self, agent_id: i64) -> Option<i64> {
+        self.conns.get(&agent_id).and_then(|c| c.sent_user_rev)
     }
 
     /// 注销一条连接。

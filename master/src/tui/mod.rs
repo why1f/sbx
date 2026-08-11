@@ -8,8 +8,9 @@
 //! 网速采样,所以它自己按刷新节奏从 `agent_nic_traffic` 做差(见 `data::SpeedTracker`)。
 //!
 //! 另一个后果是 TUI **只能改库,不能直接推送**:改完之后 revision 会推进,
-//! 在线 agent 由 daemon 在下次握手或下发时同步(§4.1)。所以每个写操作之后
-//! 状态栏都会说明「什么时候生效」,免得人对着「改了但没变」发懵。
+//! 在线 agent 由 daemon 在库变更后 **1s 内**推送给它(v0.4.10);
+//! 离线的在重连握手时补齐。所以每个写操作之后状态栏都会说明「什么时候生效」,
+//! 免得人对着「改了但没变」发懵。
 
 mod clip;
 mod data;
@@ -1272,7 +1273,7 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             // 摆给人看只是一串越来越大的噪音。要紧的是「什么时候生效」。
             let (id, _rev) =
                 node_repo::add_node(&app.pool, d.agent_id, &d.tag, d.protocol, d.port, &params).await?;
-            Ok(format!("已新增节点 #{id} {},在线的机器会重建 box", d.tag))
+            Ok(format!("已新增节点 #{id} {},在线的机器约 1s 后重建 box", d.tag))
         }
 
         Action::EditNode { id, draft } => {
@@ -1297,12 +1298,12 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
 
             let tag = node.tag.clone();
             let (_agent_id, _rev) = node_repo::update_node(&app.pool, *id, draft.port, &params).await?;
-            Ok(format!("已保存节点 {tag},由 daemon 下发生效"))
+            Ok(format!("已保存节点 {tag},已下发生效"))
         }
 
         Action::DeleteNode { id, tag } => {
             let (_agent_id, _rev) = node_repo::delete_node(&app.pool, *id).await?;
-            Ok(format!("已删除节点 {tag},由 daemon 下发生效"))
+            Ok(format!("已删除节点 {tag},已下发生效"))
         }
 
         Action::AddUser { name, quota_gb, multiplier, expire, reset_day } => {
@@ -1444,7 +1445,7 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             // 对着人显示只是一串越来越大的噪音。要紧的是「什么时候生效」——
             // TUI 只改库,下发由 daemon 在下次握手或下发时做(§4.1)。
             crate::db::agent_repo::set_outbound_strategy(&app.pool, *id, *strategy).await?;
-            Ok(format!("{name} 的出站策略改成「{}」,由 daemon 下发生效", strategy.label()))
+            Ok(format!("{name} 的出站策略改成「{}」,已下发生效", strategy.label()))
         }
 
         Action::UpgradeAgents { only, name } => upgrade_agents(app, *only, name).await,
@@ -2562,7 +2563,11 @@ mod tests {
         // 回执要说清「什么时候生效」——TUI 只改库,下发是 daemon 的事。
         // (原来这里断言的是 "config_revision",那只是把内部计数器摆给人看,
         //  已经从回执里去掉了。)
-        assert!(msg.contains("生效"), "{msg}");
+        //
+        // 断言「下发」而不是笼统的「生效」:要盯的是**有没有把下发这件事说出来**。
+        // 早先回执写「由 daemon 下发生效」,而那时根本没有下发这条路 ——
+        // 一句话读起来没毛病却是假的。现在那条路真的有了(v0.4.10)。
+        assert!(msg.contains("下发"), "回执该说明下发:{msg}");
 
         app.refresh().await.unwrap();
         let n = &app.nodes[0];

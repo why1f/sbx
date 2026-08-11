@@ -77,8 +77,21 @@ pub async fn tick(
         sqlx::query("UPDATE agents SET user_state_revision = user_state_revision + 1")
             .execute(pool)
             .await?;
-        push_user_state(pool, registry, rpc).await;
     }
+
+    // 下发**无条件跑**,不看 `sum.changed()`。那个标志只反映本轮配额巡检的结果,
+    // 而 revision 也会被 TUI/CLI 的手动启停推进(node_repo::set_user_enabled) ——
+    // 由 `changed()` 把门时,手动停用一个没超额的用户压根发不出去。
+    // 真正的「要不要发」由 push_* 里的 revision 比较回答。
+    push_user_state(pool, registry, rpc).await;
+
+    // 配置推送。**在 `tick` 里面而不是调用它的循环里** —— 循环没有测试覆盖,
+    // 把接线放在那儿的话,「函数写好了但没接上」这种错没人拦得住,
+    // 而这恰恰就是它当初坏掉的形状(config.apply 只有握手一条路径)。
+    //
+    // 与上面的配额巡检无关:建节点、改出站策略、调整分配都只动 `config_revision`,
+    // `sum.changed()` 是 false 也照样要推。
+    push_config(pool, registry, rpc).await;
 
     Ok(sum)
 }
@@ -295,11 +308,115 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
     Ok((to_disable.len(), to_enable.len()))
 }
 
-/// 向所有在线 agent 下发全量禁用名单。
+/// 把配置推给**库里比它新**的那些在线 agent。
+///
+/// ## 这个函数是补上的一条断链
+///
+/// 早先 `config.apply` 只有一条发送路径:握手时的 `catch_up`。于是主控这边
+/// 建节点、改出站策略、调整分配之后,`config_revision` 在库里加了一,
+/// 而那条**已经连着**的 WebSocket 收不到任何东西 —— 界面上写着
+/// 「在线的机器会重建 box」,实际要等到 agent 重启重连才生效。
+/// 现场表现就是「每次改完都得去被控机 systemctl restart」。
+///
+/// `user.state` 没有这个毛病,因为 `push_user_state` 每轮无条件推;
+/// 配置这一路缺的正是这个对应物。
+///
+/// ## 为什么要记「已下发到哪一版」
+///
+/// 不能每轮无脑下发:`config.apply` 会让 agent **重建整个 box**,
+/// 连接会断一瞬。每 30 秒重建一次,等于把服务打成筛子。
+/// 所以按连接记住已下发的 revision(`Registry::sent_config_rev`),
+/// 只有库里更新时才发。
+///
+/// 记在**连接**上而不是库里:断线重连之后一切从握手的 catch_up 重新对齐,
+/// 这个值跟着连接一起消失才是对的。
+///
+/// 失败不重试也不回滚已记的值 —— 下一轮巡检自然重来,而握手是天然的兜底。
+async fn push_config(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc: &Arc<Rpc>) {
+    let online = registry.lock().await.online_ids();
+    for agent_id in online {
+        let master_rev: i64 =
+            match sqlx::query_scalar("SELECT config_revision FROM agents WHERE id = ?")
+                .bind(agent_id)
+                .fetch_one(pool)
+                .await
+            {
+                Ok(r) => r,
+                // 查不到通常是这台刚被删掉(连接还没断)。跳过就好,
+                // 上报路径上的存在性检查会把那条连接收掉。
+                Err(e) => {
+                    tracing::debug!(agent_id, error = %e, "读取 config_revision 失败,本轮跳过");
+                    continue;
+                }
+            };
+
+        // `None` = 握手的 catch_up 还没跑完(它是并行 spawn 的)。
+        // 这时候不抢着发:catch_up 正要处理这件事,两边都发就是重复下发。
+        let Some(sent) = registry.lock().await.sent_config_rev(agent_id) else {
+            continue;
+        };
+        if sent >= master_rev {
+            continue;
+        }
+
+        let options = match crate::service::build_agent_config(pool, agent_id).await {
+            Ok(o) => o,
+            Err(e) => {
+                // 组装就失败(节点缺必填参数、协议读不懂),根本没发出去。
+                // 记一条审计:界面上要能解释「为什么这台一直没跟上」。
+                tracing::error!(agent_id, error = %e, "组装配置失败,未下发");
+                let now = chrono::Local::now().timestamp();
+                let _ = crate::db::agent_repo::log_event(
+                    pool,
+                    Some(agent_id),
+                    "config_build_failed",
+                    &e.to_string(),
+                    now,
+                )
+                .await;
+                continue;
+            }
+        };
+
+        let payload = serde_json::json!({ "revision": master_rev, "options": options });
+        match rpc.call_default(registry, agent_id, method::CONFIG_APPLY, payload).await {
+            Ok(_) => {
+                registry.lock().await.mark_config_sent(agent_id, master_rev);
+                tracing::info!(agent_id, rev = master_rev, "config.apply 已下发并生效");
+            }
+            Err(e) => {
+                // agent 回的 error 里带着 box.New 的失败原文(§4.2),值得留痕。
+                tracing::error!(agent_id, error = %e, "config.apply 失败(下一轮重试)");
+                let now = chrono::Local::now().timestamp();
+                let _ = crate::db::agent_repo::log_event(
+                    pool,
+                    Some(agent_id),
+                    "config_apply_failed",
+                    &e.to_string(),
+                    now,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// 向**库里比它新**的那些在线 agent 下发禁用名单。
+///
+/// 和 `push_config` 是同一个形状,原因也一样:早先这里由 `tick` 的
+/// `sum.changed()` 把门 —— 而那个标志只反映**配额巡检**的结果。
+/// 管理员在 TUI 里手动停用一个没超额的用户时,`user_state_revision` 加了一,
+/// 但 `changed()` 是 false,于是名单压根不下发,得等那台 agent 重连才生效。
 ///
 /// 离线的不管——它们重连握手时会按 revision 自动补齐(§4.1)。
 /// 这就是为什么这里失败也不需要重试:下次握手是天然的重试点。
 async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc: &Arc<Rpc>) {
+    let online = registry.lock().await.online_ids();
+    if online.is_empty() {
+        return;
+    }
+
+    // 名单是全局的,查一次给所有人用。
     let disabled = match crate::service::disabled_users(pool).await {
         Ok(d) => d,
         Err(e) => {
@@ -308,27 +425,38 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
         }
     };
 
-    let online = registry.lock().await.online_ids();
     for agent_id in online {
-        let rev: i64 = match sqlx::query_scalar("SELECT user_state_revision FROM agents WHERE id = ?")
-            .bind(agent_id)
-            .fetch_one(pool)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(agent_id, error = %e, "读取 revision 失败");
-                continue;
-            }
+        let master_rev: i64 =
+            match sqlx::query_scalar("SELECT user_state_revision FROM agents WHERE id = ?")
+                .bind(agent_id)
+                .fetch_one(pool)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::debug!(agent_id, error = %e, "读取 user_state_revision 失败,本轮跳过");
+                    continue;
+                }
+            };
+
+        // `None` = 握手的 catch_up 还没跑完(并行 spawn 的),它正要处理这件事。
+        let Some(sent) = registry.lock().await.sent_user_rev(agent_id) else {
+            continue;
         };
+        if sent >= master_rev {
+            continue;
+        }
 
         let payload = serde_json::json!({
-            "user_state_revision": rev,
+            "user_state_revision": master_rev,
             "disabled": disabled,
         });
         match rpc.call_default(registry, agent_id, method::USER_STATE, payload).await {
-            Ok(_) => tracing::debug!(agent_id, rev, count = disabled.len(), "user.state 已下发"),
-            Err(e) => tracing::warn!(agent_id, error = %e, "user.state 下发失败(重连时会补齐)"),
+            Ok(_) => {
+                registry.lock().await.mark_user_sent(agent_id, master_rev);
+                tracing::info!(agent_id, rev = master_rev, count = disabled.len(), "user.state 已下发");
+            }
+            Err(e) => tracing::warn!(agent_id, error = %e, "user.state 下发失败(下一轮重试)"),
         }
     }
 }
@@ -392,6 +520,25 @@ async fn drain_commands(
     Ok(done)
 }
 
+/// 库有没有被**别的进程**改过。
+///
+/// `PRAGMA data_version` 的语义正好是这个:它在其他连接提交写事务后变化,
+/// 而**自己**这条连接的写不会让它变。TUI 与 daemon 是两个进程、只共享
+/// 这个库(§8.0),这就是「TUI 刚改了东西」唯一不需要额外信号通道的信号源。
+///
+/// 读失败时返回上一次的值(视作没变)—— 一次读不到不该触发一轮空推送。
+async fn data_version(pool: &SqlitePool, last: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>("PRAGMA data_version").fetch_one(pool).await.unwrap_or(last)
+}
+
+/// 醒来的两种理由。
+enum Wake {
+    /// 到了固定周期(月重置、配额判定这些**跟时间走**的事靠它)。
+    Tick,
+    /// 库被别的进程改了(TUI/CLI 刚写完)。只做下发,不做时间相关的判定。
+    DbChanged,
+}
+
 pub fn spawn(
     state: crate::cluster::ServerState,
     interval_secs: u64,
@@ -401,34 +548,76 @@ pub fn spawn(
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
         // 默认的 Burst 行为会在卡顿后连补几拍,对巡检没意义(它是幂等的,补拍只是浪费)。
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // 盯库变更的快轮询。1 秒是**给人看的延迟**:TUI 里改完配置,
+        // 状态栏说「已下发」,那就该在一次眨眼之内真的发出去,而不是等 30 秒。
+        //
+        // 代价只有一句 `PRAGMA data_version` —— 它读的是内存里的页头计数器,
+        // 不碰磁盘、不加锁,比这个循环里任何一次真正的查询都便宜。
+        let mut watch = tokio::time::interval(std::time::Duration::from_secs(1));
+        watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut seen_version = data_version(&state.pool, 0).await;
+
         loop {
-            ticker.tick().await;
+            let wake = tokio::select! {
+                _ = ticker.tick() => Wake::Tick,
+                _ = watch.tick() => {
+                    let v = data_version(&state.pool, seen_version).await;
+                    if v == seen_version {
+                        continue;
+                    }
+                    seen_version = v;
+                    Wake::DbChanged
+                }
+            };
+
             let now = chrono::Local::now().timestamp();
-            match tick(&state.pool, &state.registry, &state.rpc, now).await {
-                Ok(s) if s.changed() => tracing::info!(
-                    users_reset = s.users_reset,
-                    nics_reset = s.nics_reset,
-                    disabled = s.disabled,
-                    reenabled = s.reenabled,
-                    "配额巡检有变更"
-                ),
-                Ok(_) => tracing::trace!("配额巡检无变更"),
-                // 单轮失败不该终止循环:下一轮 30s 后照常跑。
-                Err(e) => tracing::error!(error = %e, "配额巡检失败"),
+
+            // 时间相关的判定(月重置、到期、配额)只在固定周期做。
+            // 库一变就跑一遍的话,TUI 上每敲一个字都会触发一次全表扫描 ——
+            // 而这些判定本来就没有秒级需求。
+            if let Wake::Tick = wake {
+                match tick(&state.pool, &state.registry, &state.rpc, now).await {
+                    Ok(s) if s.changed() => tracing::info!(
+                        users_reset = s.users_reset,
+                        nics_reset = s.nics_reset,
+                        disabled = s.disabled,
+                        reenabled = s.reenabled,
+                        "配额巡检有变更"
+                    ),
+                    Ok(_) => tracing::trace!("配额巡检无变更"),
+                    // 单轮失败不该终止循环:下一轮 30s 后照常跑。
+                    Err(e) => tracing::error!(error = %e, "配额巡检失败"),
+                }
+                // `tick` 里已经推过一轮,这里不重复。
+            } else {
+                // 库变了:只把该下发的发出去。两个 push 内部都按 revision 比对,
+                // 没变化的 agent 一条消息都不会发,所以这里可以放心每次都调。
+                push_user_state(&state.pool, &state.registry, &state.rpc).await;
+                push_config(&state.pool, &state.registry, &state.rpc).await;
             }
+
             // TUI 排进来的一次性指令(升级)。与配额巡检分开做:
             // 它失败了不该把巡检那一半也带下水。
+            //
+            // 两种唤醒都要取:按 [u] 之后等 30 秒才开始升级,人会以为没按上。
             match drain_commands(&state.pool, &state.registry, &state.rpc, now).await {
                 Ok(n) if n > 0 => tracing::info!(count = n, "已下发排队的指令"),
                 Ok(_) => {}
                 Err(e) => tracing::error!(error = %e, "取排队指令失败"),
             }
 
-            if let Some(tx) = &tg {
-                if let Err(e) = report_usage(&state.pool, tx).await {
-                    tracing::warn!(error = %e, "推送用量给 Telegram 失败");
+            if let Wake::Tick = wake {
+                if let Some(tx) = &tg {
+                    if let Err(e) = report_usage(&state.pool, tx).await {
+                        tracing::warn!(error = %e, "推送用量给 Telegram 失败");
+                    }
                 }
             }
+
+            // 自己刚才那些写(下发成功后没有写库,但 drain_commands 会写 finish)
+            // 不该在下一拍被当成「外部改动」再触发一次。重新取一次基线。
+            seen_version = data_version(&state.pool, seen_version).await;
         }
     });
 }
@@ -889,5 +1078,228 @@ mod tests {
 
         let s = tick(&p, &reg, &rpc, ts(2026, 3, 15)).await.unwrap();
         assert_eq!(s.disabled, 1, "配额判定必须基于跨 agent 求和");
+    }
+
+    /// `PRAGMA data_version` 的语义必须**真的**是「别的连接写了」。
+    ///
+    /// 整个「改完 1 秒内下发」都建在这一条上,而它是我从文档读来的 ——
+    /// 所以实测一遍:自己写不变、别的连接写要变。这两条哪条不成立,
+    /// 唤醒机制要么永不触发,要么每拍都触发(退化成 1 秒一次全量推送)。
+    #[tokio::test]
+    async fn data_version_tracks_other_connections_only() {
+        let path = std::env::temp_dir().join(format!("sbx-dv-{}.db", uuid::Uuid::new_v4()));
+        let p1 = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let p2 = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+
+        // 同一个池上取两次:没人写过,值不该变。
+        let base = data_version(&p1, 0).await;
+        assert_eq!(data_version(&p1, base).await, base, "没人写就不该变");
+
+        // **另一个连接**写 —— 这是 TUI 改库那一幕。
+        crate::db::agent_repo::create(&p2, "from-tui", 0).await.unwrap();
+        let after = data_version(&p1, base).await;
+        assert_ne!(after, base, "别的连接写完之后必须变,否则永远不会被唤醒");
+
+        // 再读一次,没有新的写:要稳定下来,不能每拍都在跳。
+        assert_eq!(data_version(&p1, after).await, after, "没有新写入就该稳住");
+    }
+
+    /// 造一台在线 agent:注册一条假连接,并把「已下发版本」对齐到当前库值,
+    /// 模拟握手的 catch_up 刚跑完的状态。
+    async fn online_agent(
+        p: &SqlitePool,
+        name: &str,
+    ) -> (i64, Arc<Mutex<Registry>>, tokio::sync::mpsc::UnboundedReceiver<sbx_shared::Envelope>)
+    {
+        let (id, _) = crate::db::agent_repo::create(p, name, 0).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut r = Registry::new();
+        r.register(id, tx);
+        // **两个 revision 都要对齐。** 只标其中一个的话,另一条路会被
+        // 「`None` = catch_up 还没跑完」那条规则跳过,测试就测了个寂寞。
+        let (cfg_rev, user_rev): (i64, i64) = sqlx::query_as(
+            "SELECT config_revision, user_state_revision FROM agents WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(p)
+        .await
+        .unwrap();
+        r.mark_config_sent(id, cfg_rev);
+        r.mark_user_sent(id, user_rev);
+        (id, Arc::new(Mutex::new(r)), rx)
+    }
+
+    /// **改了配置就要推给在线的机器,不该等它重启。**
+    ///
+    /// 这是 v0.4.10 修的那个 bug 的回归锚点:`config.apply` 早先只有一条
+    /// 发送路径 —— 握手时的 `catch_up`。于是主控建节点、改出站策略之后,
+    /// `config_revision` 在库里加了一,而已经连着的那条 WebSocket 收不到
+    /// 任何东西。现场表现是「每次改完都得去被控机 systemctl restart」。
+    #[tokio::test]
+    async fn a_config_change_is_pushed_to_an_already_connected_agent() {
+        let p = pool().await;
+        let (id, reg, mut rx) = online_agent(&p, "tokyo").await;
+        let rpc = Arc::new(Rpc::new());
+
+        // 没有变化时不该发 —— config.apply 会让 agent 重建 box,
+        // 每 30 秒白重建一次等于把服务打成筛子。
+        tick(&p, &reg, &rpc, ts(2026, 3, 15)).await.unwrap();
+        assert!(rx.try_recv().is_err(), "没改动就不该下发");
+
+        // 模拟「建了个节点」:推进 config_revision。
+        sqlx::query("UPDATE agents SET config_revision = config_revision + 1 WHERE id = ?")
+            .bind(id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        // push_config 会等 agent 回 resp,这里起个任务扮演 agent。
+        //
+        // **必须带超时。** 直接 `rx.recv().await` 的话,一旦接线断了
+        // (正是这条测试要防的事)它会**永久阻塞**,表现是测试挂死而不是失败 ——
+        // 挂死比失败糟:CI 上看到的是超时,而不是「哪条断言没过」。
+        let rpc2 = rpc.clone();
+        let responder = tokio::spawn(async move {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("5 秒内没等到下发 —— push_config 没接进 tick?")
+                .expect("通道被关了");
+            assert_eq!(env.method, method::CONFIG_APPLY, "该是 config.apply");
+            let rev = env.payload.get("revision").and_then(|v| v.as_i64());
+            assert_eq!(rev, Some(1), "带的该是新版本号");
+            rpc2.resolve(sbx_shared::Envelope::resp_ok(
+                env.id.clone().unwrap(),
+                method::CONFIG_APPLY,
+                serde_json::json!({}),
+            ))
+            .await;
+        });
+
+        // **走 `tick` 而不是直接调 `push_config`** —— 要覆盖的正是「接线在不在」:
+        // 函数写好了却没接进巡检,就是这个 bug 原本的形状。
+        tick(&p, &reg, &rpc, ts(2026, 3, 15)).await.unwrap();
+        responder.await.unwrap();
+
+        // 下发成功后要记账,否则下一轮会重发同一版。
+        assert_eq!(reg.lock().await.sent_config_rev(id), Some(1));
+    }
+
+    /// 下发成功之后**不能再重复发**。
+    ///
+    /// 少了这条约束,巡检每 30 秒就让每台在线机器重建一次 box ——
+    /// 而重建期间连接是断的,等于按巡检周期定时掉线。
+    #[tokio::test]
+    async fn a_pushed_revision_is_not_sent_twice() {
+        let p = pool().await;
+        let (id, reg, mut rx) = online_agent(&p, "tokyo").await;
+        let rpc = Arc::new(Rpc::new());
+
+        sqlx::query("UPDATE agents SET config_revision = 5 WHERE id = ?")
+            .bind(id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let rpc2 = rpc.clone();
+        let responder = tokio::spawn(async move {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("5 秒内没等到下发")
+                .expect("通道被关了");
+            rpc2.resolve(sbx_shared::Envelope::resp_ok(
+                env.id.clone().unwrap(),
+                method::CONFIG_APPLY,
+                serde_json::json!({}),
+            ))
+            .await;
+            // 第二轮不该再来 —— 再收到就是重复下发。
+            rx
+        });
+        push_config(&p, &reg, &rpc).await;
+        let mut rx = responder.await.unwrap();
+
+        push_config(&p, &reg, &rpc).await;
+        assert!(rx.try_recv().is_err(), "同一个 revision 不该发第二次");
+    }
+
+    /// 下发失败时**不记账**,下一轮要重试。
+    ///
+    /// 记了的话这台机器就永远停在旧配置上,而界面上看不出任何异常。
+    #[tokio::test]
+    async fn a_failed_push_is_retried_next_tick() {
+        let p = pool().await;
+        let (id, reg, mut rx) = online_agent(&p, "tokyo").await;
+        let rpc = Arc::new(Rpc::new());
+
+        sqlx::query("UPDATE agents SET config_revision = 3 WHERE id = ?")
+            .bind(id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let rpc2 = rpc.clone();
+        let responder = tokio::spawn(async move {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("5 秒内没等到下发")
+                .expect("通道被关了");
+            rpc2.resolve(sbx_shared::Envelope::resp_err(
+                env.id.clone().unwrap(),
+                method::CONFIG_APPLY,
+                "端口冲突",
+            ))
+            .await;
+        });
+        push_config(&p, &reg, &rpc).await;
+        responder.await.unwrap();
+
+        assert_eq!(reg.lock().await.sent_config_rev(id), Some(0), "失败不该记成已下发");
+    }
+
+    /// **手动停用一个没超额的用户,也要立刻推给在线的机器。**
+    ///
+    /// 这是同一个 bug 的另一半:`push_user_state` 早先由 `sum.changed()` 把门,
+    /// 而那个标志只反映**配额巡检**的结果。管理员按 `[t]` 停用一个用量正常的
+    /// 用户时,`user_state_revision` 加了一但 `changed()` 是 false ——
+    /// 名单压根发不出去,要等那台 agent 重连。
+    #[tokio::test]
+    async fn a_manual_disable_is_pushed_without_a_quota_change() {
+        let p = pool().await;
+        let (id, reg, mut rx) = online_agent(&p, "tokyo").await;
+        let rpc = Arc::new(Rpc::new());
+
+        // 一个用量为 0、不会触发任何配额判定的用户。
+        user_with_usage(&p, "alice", 100 * GB, 0, 0).await;
+        // 手动停用 —— 走的是 TUI/CLI 那条路,只推进 user_state_revision。
+        crate::db::node_repo::set_user_enabled(&p, "alice", false).await.unwrap();
+
+        let rpc2 = rpc.clone();
+        let responder = tokio::spawn(async move {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("5 秒内没等到 user.state —— 被 sum.changed() 挡住了?")
+                .expect("通道被关了");
+            assert_eq!(env.method, method::USER_STATE, "该是 user.state");
+            let names: Vec<&str> = env.payload["disabled"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(names.contains(&"alice"), "名单里该有 alice:{names:?}");
+            rpc2.resolve(sbx_shared::Envelope::resp_ok(
+                env.id.clone().unwrap(),
+                method::USER_STATE,
+                serde_json::json!({}),
+            ))
+            .await;
+        });
+
+        // 这一轮配额巡检什么都不会变(用量是 0),全靠 revision 比较把它发出去。
+        let s = tick(&p, &reg, &rpc, ts(2026, 3, 15)).await.unwrap();
+        assert_eq!(s.disabled, 0, "这条测试的前提:配额巡检本身没有变化");
+        responder.await.unwrap();
+
+        assert!(reg.lock().await.sent_user_rev(id).unwrap() >= 1, "下发后要记账");
     }
 }
