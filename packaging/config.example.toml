@@ -23,6 +23,10 @@ key_path  = "/etc/sbx/tls/key.pem"
 
 # agent 每 heartbeat_secs 发一次 pong 刷新 last_seen;
 # 每 report_interval_secs 上报一次 stats + sysinfo。两个值都由握手下发给 agent。
+#
+# heartbeat_secs 还决定**多久判一条连接掉线**:静默超过它的 3 倍(且不低于 30s)
+# 就当作半开连接断掉并标为离线。断电/拔网线不会有 FIN 到达,不靠这个超时的话
+# 那台机器会一直显示在线。两端用同一个公式,改大了两边一起变松。
 heartbeat_secs       = 10
 report_interval_secs = 30
 

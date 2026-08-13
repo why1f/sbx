@@ -161,7 +161,7 @@ pub fn all(cfg: &Config) -> Vec<Setting> {
             "心跳间隔(秒)",
             cfg.cluster.heartbeat_secs.to_string(),
             Kind::Int,
-            "主控多久 ping 一次 agent。重启 daemon 生效",
+            "agent 多久报一次平安。静默超过 3 倍(至少 30s)判掉线。重启 daemon 生效",
         ),
         s(
             "cluster",

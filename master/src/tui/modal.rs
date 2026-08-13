@@ -666,7 +666,7 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
                     Span::styled(
                         format!("{dot} {state}"),
                         Style::default()
-                            .fg(if *active { theme::ONLINE } else { theme::OFFLINE })
+                            .fg(if *active { theme::ONLINE } else { theme::INACTIVE })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),

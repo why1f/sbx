@@ -348,7 +348,15 @@ impl App {
 
     async fn refresh(&mut self) -> Result<()> {
         let now = chrono::Local::now().timestamp();
-        self.agents = data::load_agents(&self.pool, &mut self.speed, now).await?;
+        // 显示侧的「太久没动静就按离线算」窗口。
+        //
+        // 取 daemon 判半开连接的窗口(`idle_limit`)**再宽一倍还多**:
+        // daemon 活着的时候永远轮不到这条规则 —— 它会先一步把 status 改对。
+        // 只有 daemon 崩了、状态烂在库里没人更新时,这里才把绿灯灭掉。
+        // 两个进程的判据不能反过来,否则会出现「TUI 说离线、daemon 还在下发」。
+        let stale_after =
+            crate::cluster::idle_limit(self.cfg.cluster.heartbeat_secs).as_secs() as i64 * 2 + 30;
+        self.agents = data::load_agents(&self.pool, &mut self.speed, now, stale_after).await?;
         self.nodes = data::load_nodes(&self.pool).await?;
         self.users = data::load_users(&self.pool).await?;
         self.pending_cmds = crate::db::command_repo::pending_count(&self.pool).await.unwrap_or(0);

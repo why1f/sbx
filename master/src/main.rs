@@ -440,6 +440,7 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
         speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
         heartbeat_secs: cfg.cluster.heartbeat_secs,
         report_interval_secs: cfg.cluster.report_interval_secs,
+        idle_limit: cluster::idle_limit(cfg.cluster.heartbeat_secs),
     };
 
     // §9.1 的 Telegram Bot。拿不到租约(另一个进程已经在跑)不是错误,

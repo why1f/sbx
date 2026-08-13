@@ -508,6 +508,7 @@ struct AgentQueryRow {
     load1: Option<f64>,
     uptime_secs: Option<i64>,
     sysinfo_at: Option<i64>,
+    last_seen: Option<i64>,
     boot_id: Option<String>,
     last_rx: i64,
     last_tx: i64,
@@ -517,10 +518,32 @@ struct AgentQueryRow {
     node_count: i64,
 }
 
+/// 库里写着 online,但已经太久没听见动静 —— 一律按 offline 显示。
+///
+/// **这是显示侧的兜底,不是主要防线。** 主要防线在 daemon 里:`recv_loop` 的
+/// 读超时会把半开连接判掉并 `mark_offline`(`cluster::server::idle_limit`)。
+/// 但那条路要求 **daemon 还活着**。daemon 崩了或者被 kill 之后,库里的
+/// `status` 就永远停在最后一刻的值 —— 整屏绿灯,而一台都没连着。
+/// TUI 是另一个进程,照着 `status` 列直读就会跟着一起骗人。
+///
+/// `stale_after` 取得比 daemon 的判定窗口**更宽**(见调用方):这样两者永不打架
+/// —— daemon 还在的时候,它总是先一步把状态改对,这里什么都不会做;
+/// 只有 daemon 失灵、状态烂在库里时,这一条才生效。
+///
+/// `last_seen` 为 NULL = 从来没连上过。那种情况保持库里的值(通常就是 offline),
+/// 不在这里改写:「从没连过」和「连过又断了」是两回事,§7.2 的三态要分得开。
+fn derive_status(status: &str, last_seen: Option<i64>, now: i64, stale_after: i64) -> String {
+    match last_seen {
+        Some(t) if status == "online" && now - t > stale_after => "offline".into(),
+        _ => status.into(),
+    }
+}
+
 pub async fn load_agents(
     pool: &SqlitePool,
     speed: &mut SpeedTracker,
     now: i64,
+    stale_after: i64,
 ) -> Result<Vec<AgentRow>> {
     // LEFT JOIN:从没上报过的 agent 也要出现在列表里(值为 0),
     // 否则「加了但还没连上」的那台会直接看不见,而那正是最需要排查的一台。
@@ -528,6 +551,7 @@ pub async fn load_agents(
         "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.arch, a.outbound_strategy, a.ipv4, a.ipv6,
                 a.nic_quota_bytes, a.nic_reset_day,
                 a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
+                a.last_seen,
                 t.boot_id,
                 COALESCE(t.last_rx, 0)    AS last_rx,
                 COALESCE(t.last_tx, 0)    AS last_tx,
@@ -557,7 +581,7 @@ pub async fn load_agents(
                 id: r.id,
                 name: r.name,
                 token_prefix: r.token_prefix,
-                status: r.status,
+                status: derive_status(&r.status, r.last_seen, now, stale_after),
                 agent_version: r.agent_version,
                 arch: r.arch,
                 outbound: crate::model::outbound::OutboundStrategy::parse(&r.outbound_strategy),
@@ -1124,5 +1148,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].cycle_up, 222, "111 原始 × 2.0 倍率");
         assert_eq!(rows[0].cycle_down, 444, "222 原始 × 2.0 倍率");
+    }
+
+    /// **daemon 崩了之后,那盏绿灯也必须灭掉。**
+    ///
+    /// 主要防线在 daemon 里(`cluster::server` 的读超时)。但它要求 daemon 还活着 ——
+    /// daemon 崩了或被 kill 之后,库里的 `status` 就冻在最后一刻,整屏绿灯而
+    /// 一台都没连着。TUI 是另一个进程,照着 `status` 列直读会跟着一起骗人。
+    #[test]
+    fn a_stale_online_row_is_shown_as_offline() {
+        const NOW: i64 = 1_700_000_000;
+        // 心跳还新鲜 —— 保持 online。
+        assert_eq!(derive_status("online", Some(NOW - 10), NOW, 90), "online");
+        // 正好卡在窗口上不算过期(> 才算,别在边界上抖)。
+        assert_eq!(derive_status("online", Some(NOW - 90), NOW, 90), "online");
+        // 超过窗口 —— 灭灯。
+        assert_eq!(derive_status("online", Some(NOW - 91), NOW, 90), "offline");
+        assert_eq!(derive_status("online", Some(NOW - 86400), NOW, 90), "offline");
+    }
+
+    /// 这条规则**只会把 online 改成 offline**,不会反过来。
+    ///
+    /// 反过来的话,一台刚删掉又重建、last_seen 还是 NULL 的机器会被点亮,
+    /// 而它根本没连上来过。
+    #[test]
+    fn the_staleness_rule_never_lights_a_lamp_up() {
+        const NOW: i64 = 1_700_000_000;
+        assert_eq!(derive_status("offline", Some(NOW), NOW, 90), "offline", "新鲜也不该点亮");
+        assert_eq!(
+            derive_status("offline", None, NOW, 90),
+            "offline",
+            "从没连上过的保持原样"
+        );
+        // last_seen 为 NULL 且写着 online:不改写 —— 「从没连过」与「连过又断了」
+        // 是两回事,这里没有依据去判,交给 daemon(它重启时会统一重置)。
+        assert_eq!(derive_status("online", None, NOW, 90), "online");
+    }
+
+    /// 时钟回拨(NTP 校时、虚拟机快照恢复)不该把在线的机器判掉。
+    #[test]
+    fn a_clock_going_backwards_does_not_kick_anyone_offline() {
+        const NOW: i64 = 1_700_000_000;
+        // last_seen 在“未来”:now - t 是负数,不该大于窗口。
+        assert_eq!(derive_status("online", Some(NOW + 3600), NOW, 90), "online");
     }
 }

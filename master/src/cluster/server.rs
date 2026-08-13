@@ -29,6 +29,7 @@ use futures_util::{SinkExt, StreamExt};
 use sbx_shared::{method, AgentHello, AgentHelloAck, Envelope, Kind};
 use sqlx::SqlitePool;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 
 /// 握手超时:agent 连上后的第一帧必须在这个时间内到达(§4.1)。
@@ -48,6 +49,11 @@ pub struct ServerState {
     pub speed: Arc<Mutex<std::collections::HashMap<i64, SpeedSample>>>,
     pub heartbeat_secs: u64,
     pub report_interval_secs: u64,
+    /// 一条连接最长可以多久不出声。超过就判成半开、断开并 `mark_offline`。
+    ///
+    /// 由 `idle_limit(heartbeat_secs)` 在启动时算好存下来,而不是每次现算:
+    /// 测试要塞一个很小的值(真实值有 30s 下限,照那个跑一条用例要半分钟)。
+    pub idle_limit: Duration,
 }
 
 /// 一次网速采样。`boot_id` 变化的那一次不产生采样(否则会算出爆炸数字,§8.2)。
@@ -375,12 +381,44 @@ async fn handshake(
     Ok(Authenticated { agent_id: agent.id, hello, hello_id })
 }
 
+/// 判定「半开连接」的静默上限:心跳的 3 倍,不低于 30 秒。
+///
+/// **与 agent 侧的 `readLoop` 用同一个公式**(`conn.go`:`idle := 3*heartbeat`,
+/// 下限 30s)。两边取同一个值,才不会出现「一边已经认定断了、另一边还以为连着」
+/// 的一段窗口。3 倍是为了让**一次丢包不断线** —— agent 每 heartbeat_secs 发一条
+/// pong,连丢两条才会触发。
+pub fn idle_limit(heartbeat_secs: u64) -> Duration {
+    Duration::from_secs((heartbeat_secs.saturating_mul(3)).max(30))
+}
+
 async fn recv_loop(
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
     agent_id: i64,
     state: &ServerState,
 ) -> Result<()> {
-    while let Some(msg) = stream.next().await {
+    // **读超时。少了它,机器突然消失时这条连接会永远挂着。**
+    //
+    // TCP 只在对端发了 FIN/RST 时才让读返回。断电、拔网线、网络分区、
+    // NAT/防火墙把连接表项丢掉、虚拟机挂起 —— 这些情况下什么都不会到达,
+    // `stream.next()` 就一直 pending:agent 早已不在,而主控这边
+    // `recv_loop` 不返回 → 清理不跑 → `mark_offline` 不执行 →
+    // **服务管理页上那盏绿灯一直亮着**,直到 daemon 重启或者 OS 的 TCP
+    // keepalive 兜底(Linux 默认 2 小时 11 分)。
+    //
+    // agent 侧一直有这道防线(`conn.go` 的 `idle`),主控侧没有 —— 这次补上,
+    // 两边用同一个公式。dispatch 里 PONG 分支说的「超时判定由外层的心跳巡检做」
+    // 指的就是这里。
+    let idle = state.idle_limit;
+    loop {
+        let msg = match tokio::time::timeout(idle, stream.next()).await {
+            Ok(Some(msg)) => msg,
+            // 对端正常关闭:走正常退出,不是错误。
+            Ok(None) => return Ok(()),
+            Err(_) => anyhow::bail!(
+                "{}s 没收到任何帧(心跳都停了),判定为半开连接",
+                idle.as_secs()
+            ),
+        };
         let Message::Text(text) = msg? else {
             // 二进制/ping/pong 帧忽略。协议是 text frame JSON(§4)。
             continue;
@@ -415,7 +453,6 @@ async fn recv_loop(
         }
         dispatch(env, agent_id, state).await;
     }
-    Ok(())
 }
 
 /// 这个 agent 还在库里吗。
@@ -472,7 +509,9 @@ async fn dispatch(env: Envelope, agent_id: i64, state: &ServerState) {
             tracing::info!(agent_id, level, "agent: {line}");
         }
         method::PONG => {
-            // 心跳记账:只更新 last_seen。超时判定由外层的心跳巡检做。
+            // 心跳记账:只更新 last_seen。**超时判定在 `recv_loop` 的读超时那里**
+            // (`idle_limit`)—— 连着 idle 那么久一条 pong 都没来,那条连接
+            // 就会被判成半开并走正常的清理路径(注销 + mark_offline)。
             let _ = sqlx::query("UPDATE agents SET last_seen = ? WHERE id = ?")
                 .bind(now)
                 .bind(agent_id)
@@ -687,6 +726,79 @@ mod tests {
         assert_eq!(a.last_seen, Some(200));
     }
 
+    /// **静默上限的公式要和 agent 侧一模一样。**
+    ///
+    /// agent 的 `readLoop` 用 `3*heartbeat`、下限 30s。两边取值不同的话,
+    /// 中间会有一段「一边认定断了、另一边还以为连着」的窗口 ——
+    /// 那期间主控会把 config.apply 发给一个已经在重连的 agent。
+    #[test]
+    fn the_idle_limit_matches_the_agent_side_formula() {
+        assert_eq!(idle_limit(10), Duration::from_secs(30), "默认心跳 10s → 下限 30s");
+        assert_eq!(idle_limit(1), Duration::from_secs(30), "3 倍不足 30s 时取下限");
+        assert_eq!(idle_limit(20), Duration::from_secs(60), "超过下限之后按 3 倍走");
+        // heartbeat_secs 是配置项,填 0 也不该让上限变成 0(那会秒断所有连接)。
+        assert_eq!(idle_limit(0), Duration::from_secs(30), "0 也要落到下限");
+    }
+
+    /// **机器突然消失时,那盏绿灯必须自己灭掉。**
+    ///
+    /// 断电、拔网线、网络分区、NAT 丢表项 —— 这些情况��不会有 FIN/RST 到达,
+    /// `stream.next()` 永远 pending。在补上读超时之前,`recv_loop` 不返回 →
+    /// 清理不跑 → `mark_offline` 不执行 → 服务管理页上一直是 online,
+    /// 直到 daemon 重启或者 OS 的 TCP keepalive 兜底(Linux 默认 2 小时 11 分)。
+    ///
+    /// 这里用「连上、握完手、然后一个字都不发」来模拟那台消失的机器 ——
+    /// **不是 drop 连接**:drop 会发 FIN,那正是原来就能处理的那条路径,
+    /// 测不到这个 bug。
+    #[tokio::test]
+    async fn a_silently_vanished_agent_is_marked_offline() {
+        let (url, pool) = spawn_server_with_idle(Duration::from_millis(300)).await;
+        let (id, token) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+
+        let mut ws = connect(&url).await;
+        assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
+        assert!(
+            crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap().is_online(),
+            "握手之后该是 online"
+        );
+
+        // 握着这条连接,什么都不发 —— 机器还在,但已经不说话了。
+        wait_for("静默超时之后该被判成 offline", || async {
+            !crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap().is_online()
+        })
+        .await;
+
+        // 连接还在我们手里(没 drop),证明它是被**读超时**判掉的,
+        // 而不是靠对端关闭那条老路径。
+        drop(ws);
+    }
+
+    /// 反过来:**还在发心跳的 agent 不能被误判**。
+    ///
+    /// 读超时设太紧或者刷新点漏了,表现就是好好的机器每隔一会儿掉一次线;
+    /// 那比「绿灯不灭」更糟 —— 每次重连都会触发一次 catch_up。
+    #[tokio::test]
+    async fn a_heartbeating_agent_is_never_reaped() {
+        let (url, pool) = spawn_server_with_idle(Duration::from_millis(400)).await;
+        let (id, token) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+
+        let mut ws = connect(&url).await;
+        assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
+
+        // 按远快于上限的节奏发 pong,持续到超过上限好几倍。
+        for _ in 0..12 {
+            let env = Envelope::event(method::PONG, serde_json::json!({ "echo_ts": 1 }));
+            ws.send(tungstenite::Message::Text(serde_json::to_string(&env).unwrap()))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap().is_online(),
+                "还在发心跳的 agent 不该被判成离线"
+            );
+        }
+    }
+
     /// 两个 revision 必须能分别读出来(§4.1)。
     #[tokio::test]
     async fn revisions_load_independently() {
@@ -760,6 +872,12 @@ mod tests {
 
     /// 起一个 server,返回 (ws_url, pool)。测试结束时 server 随 runtime 一起销毁。
     async fn spawn_server() -> (String, SqlitePool) {
+        // 真实公式给的是 30s。绝大多数用例在这个窗口里跑完,不受影响;
+        // 专门验半开检测的那条用自己的短值(`spawn_server_with_idle`)。
+        spawn_server_with_idle(idle_limit(10)).await
+    }
+
+    async fn spawn_server_with_idle(idle: Duration) -> (String, SqlitePool) {
         let pool = pool().await;
         let state = ServerState {
             pool: pool.clone(),
@@ -768,6 +886,7 @@ mod tests {
             speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
             heartbeat_secs: 10,
             report_interval_secs: 30,
+            idle_limit: idle,
         };
         // 端口 0 = 让内核分配一个空闲端口,避免测试并发时抢端口。
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

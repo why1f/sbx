@@ -7,9 +7,26 @@ use ratatui::style::Color;
 use ratatui::text::Span;
 
 pub const ONLINE: Color = Color::Rgb(0x3d, 0xdc, 0x84);
-pub const OFFLINE: Color = Color::Rgb(0x9a, 0x9a, 0x9a);
+/// **只给「agent 掉线」用。** 停用的用户、关掉的开关请用 `INACTIVE`。
+///
+/// 掉线是红的,不是灰的:灰读作「这一项没启用」,一眼扫过去会跳过它;
+/// 而一台掉线的机器上跑着的用户此刻全部连不上,那是要立刻处理的事。
+///
+/// 用的是进度条最后那一档同一个红(`STOPS` 的 1.00)—— 这套界面里
+/// 「红 = 出事了」只该有一个色号。
+pub const OFFLINE: Color = Color::Rgb(0xe5, 0x48, 0x4d);
+/// 「关着 / 停用 / 没启用」。这些是**正常状态**,不是故障 ——
+/// 管理员手动停用一个用户、把某个开关设成 false,都不该染成告警色。
+///
+/// 与 `OFFLINE` 分开,是因为原先它们共用一个常量:掉线改红的时候,
+/// 设置页里一个 `false` 会跟着变成刺眼的红,而那什么事都没有。
+pub const INACTIVE: Color = Color::Rgb(0x9a, 0x9a, 0x9a);
 /// 「从没连上过」与「连过又断了」要分开:前者通常是 token 没贴对或防火墙,
 /// 后者是网络或进程问题,排查方向完全不同(model/agent.rs 同样的理由)。
+///
+/// 橙和红在某些终端配色下会靠得比较近,所以这两态**还靠形状分**:
+/// 掉线是实心 `●`,从未连接是空心 `○`(见 `pages::agents`)。
+/// 只靠颜色区分的话,色觉障碍的人这里就少了一个信息维度。
 pub const NEVER: Color = Color::Rgb(0xe5, 0x9a, 0x3a);
 pub const UP: Color = Color::Rgb(0x3d, 0xdc, 0x84);
 pub const DOWN: Color = Color::Rgb(0x5a, 0x9d, 0xf0);

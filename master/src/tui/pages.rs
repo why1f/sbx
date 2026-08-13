@@ -172,7 +172,7 @@ fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], us
         line2.push(Span::styled(format!("自动停用 {auto_off}   "), Style::default().fg(theme::NEVER)));
     }
     if manual_off > 0 {
-        line2.push(Span::styled(format!("手动停用 {manual_off}"), Style::default().fg(theme::OFFLINE)));
+        line2.push(Span::styled(format!("手动停用 {manual_off}"), Style::default().fg(theme::INACTIVE)));
     }
 
     let mut speed_line = vec![Span::raw("  当前网速    ")];
@@ -664,7 +664,7 @@ fn state_color(u: &UserRow) -> Color {
     match (u.enabled, u.auto_disabled) {
         (true, _) => theme::ONLINE,
         (false, true) => theme::NEVER,
-        (false, false) => theme::OFFLINE,
+        (false, false) => theme::INACTIVE,
     }
 }
 
@@ -1240,7 +1240,7 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
             let (mark, color) = match (u.enabled, u.auto_disabled) {
                 (true, _) => ("● 启用", theme::ONLINE),
                 (false, true) => ("◐ 自动停用", theme::NEVER),
-                (false, false) => ("○ 手动停用", theme::OFFLINE),
+                (false, false) => ("○ 手动停用", theme::INACTIVE),
             };
             let cells: Vec<Cell> = cols
                 .iter()
@@ -1368,7 +1368,7 @@ pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], s
         .map(|(i, s)| {
             let value_style = match s.kind {
                 super::settings::Kind::Bool(true) => Style::default().fg(theme::ONLINE),
-                super::settings::Kind::Bool(false) => Style::default().fg(theme::OFFLINE),
+                super::settings::Kind::Bool(false) => Style::default().fg(theme::INACTIVE),
                 super::settings::Kind::Secret => Style::default().fg(theme::NEVER),
                 _ => Style::default().fg(theme::ACCENT),
             };
