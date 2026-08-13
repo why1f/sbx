@@ -18,7 +18,9 @@ mod forms;
 mod modal;
 mod pages;
 mod settings;
-mod theme;
+/// 配色与自绘部件。`cols` / `pad` 那两个按显示列宽算的工具 `doctor` 也在用
+/// —— CJK 宽度逻辑只该有一份。
+pub mod theme;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};

@@ -127,8 +127,13 @@ curl -fsSL .../install.sh | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' S
 ## 已经能跑的东西
 
 ```sh
-cargo test                      # 453 个测试
+cargo test                      # 503 个测试
 cargo build --release           # 产物 target/release/sbx
+
+# 装完起不来?先跑自检 —— 二进制/配置/数据库/systemd/证书/端口逐项过一遍,
+# 每项都写出实际位置,数据库另给文件大小与 schema 版本。
+# 它只读,不会把库建出来、也不会生成缺失的证书。有 ERR 时退出码为 1。
+./target/release/sbx --config c.toml doctor
 
 # 建库 + 加一台被控服务器 + 启动主控
 ./target/release/sbx --config c.toml init-db

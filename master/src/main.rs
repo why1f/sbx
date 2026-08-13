@@ -11,6 +11,7 @@
 mod cluster;
 mod config;
 mod db;
+mod doctor;
 mod install;
 mod model;
 mod secrets;
@@ -26,6 +27,7 @@ mod upgrade;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 
 #[derive(Parser)]
 #[command(name = "sbx", version, about = "sing-box 集群管理(主控)")]
@@ -40,6 +42,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// 自检:二进制、配置、数据库、systemd、证书、端口逐项过一遍,列出各自的位置。
+    ///
+    /// **只读,不改任何东西** —— 它既不会把数据库建出来,也不会生成缺失的证书
+    /// (那两件事分别由 `init-db` 和 daemon 首次启动做)。装完起不来时先跑它。
+    ///
+    /// 有 ERR 时退出码为 1,可以直接进部署脚本;WARN 不算失败。
+    Doctor,
     /// 初始化/迁移数据库并退出。反复运行是安全的(幂等)。
     InitDb,
     /// 启动主控守护进程(WS 服务端)。
@@ -143,12 +152,30 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // **doctor 必须抢在下面两步之前。**
+    //
+    //   * `load_config` 在文件不存在时静默退回全默认配置 —— 而 doctor 要报告的
+    //     正是「配置文件在不在」,拿它的结果就什么都看不出来;
+    //   * `init_pool` 用的是 `mode=rwc`,它会**把库建出来**并跑迁移 ——
+    //     放在它后面的 doctor 永远报不出「数据库缺失」;
+    //   * 库真打不开时 `init_pool` 直接 `?` 出去,doctor 一行都来不及打,
+    //     而那恰恰是最需要它的时刻。
+    if matches!(cli.cmd, Cmd::Doctor) {
+        let checks = doctor::collect(&cli.config).await;
+        print!("{}", doctor::render(&checks, std::io::stdout().is_terminal()));
+        std::process::exit(doctor::exit_code(&checks));
+    }
+
     let cfg = load_config(&cli.config)?;
     let pool = db::init_pool(&cfg.db.path)
         .await
         .with_context(|| format!("打开数据库 {} 失败", cfg.db.path))?;
 
     match cli.cmd {
+        // 上面那个 `matches!` 已经把它处理掉并 `exit` 了,走不到这里。
+        // 留一个显式分支而不是 `_ =>`:以后再加子命令时,漏写分支要能编译失败。
+        Cmd::Doctor => unreachable!("doctor 在打开数据库之前就已经处理并退出了"),
         Cmd::InitDb => {
             println!("数据库已就绪:{}(schema v{})", cfg.db.path, db::schema_version());
         }
