@@ -4,6 +4,56 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.16
+
+### 修
+
+- **节点分配弹窗里,中文 agent 名只显示一半。**
+
+  picker 用 `format!("{:<24}")` 给节点名补空格。Rust 按 Unicode 字符数计算宽度,
+  终端却把每个汉字画成两列:`面包云` 是 3 个字符、6 个显示列。因此
+  `Dmit-面包云` 会把右侧说明整体推出 3 列,再叠加弹窗宽度仍按原始标签估算,
+  最终 `在 面包云 上` 只剩 `在 面`。
+
+  改用现有的 `theme::pad` 按显示列宽补齐,弹窗宽度按实际固定的 24 列标签区计算,
+  note 再按真正剩余空间截断。回归测试使用现场的 `Dmit-面包云` 和
+  `vless-reality · :30652 · 在 面包云 上`,两部分都必须完整出现。
+
+- **IPv6 导出到结构化订阅时,`server` 错误带方括号。**
+
+  旧实现让 `endpoint()` 提前把 IPv6 变成 `[2001:db8::1]`,然后同一个值同时流向
+  分享 URI、Clash YAML 与 VMess JSON。方括号只属于 URI authority 语法:
+  `@[IPv6]:端口` 是正确的；结构化 `server/add/host` 中它会被客户端当作地址内容,
+  形成无法拨号的错误配置。
+
+  现在 endpoint 始终返回裸 host,只在构造分享 URI 时临时补框:
+
+  - URI:`vless://uuid@[2001:db8::1]:443`
+  - Clash/Mihomo:`server: "2001:db8::1"`
+  - VMess JSON:`"add":"2001:db8::1"`
+
+  `public_base` 的 host 提取也统一返回裸地址,并去掉 URL 自身端口,避免拼出
+  `host:8443:30652`。测试遍历全部 URI 协议确认方括号仍在,同时确认 Clash/VMess
+  结构化字段绝不带框。
+
+### 文档
+
+- README 从历史开发状态表改为面向使用者的安装、doctor、TUI、订阅、运行语义、
+  构建与仓库布局；删除重复和过期测试数字,写清 IPv6 在 URI 与结构化配置中的差异。
+- DEPLOY 以主控/agent 的实际安装流程和 `sbx doctor` 为入口重排,补充 IPv6 入站验证、
+  掉线判定、当前 `[u]` agent 升级路径和危险卸载提示；删除 v0.2.0 手工示例及
+  「主控尚不能发起升级」等已过期内容。
+- DESIGN 保留架构理由与正确性约束,删除本机绝对路径、历史实施顺序、旧项目逐文件
+  搬迁表和 session 交接提醒；工作区布局、验证基线、订阅 IPv6 语义改为当前实现。
+- 保留 CHANGELOG 全部历史。引用扫描确认 `e2e/`、`spike/`、`master/testdata/`、
+  `packaging/` 都被 CI、测试或发布使用,因此没有为了“看起来干净”误删必要文件。
+
+### 测试
+
+- master 509 个测试、shared 6 个测试全部通过;
+- Clippy `-D warnings`、Go vet/test、gofmt 全部通过;
+- 新增中文 picker 与 URI/结构化 IPv6 上下文分离回归。
+
 ## v0.4.15
 
 ### 修

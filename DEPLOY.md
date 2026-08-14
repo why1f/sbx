@@ -1,195 +1,224 @@
-# 部署与跨机验证清单
+# 部署与跨机验证
 
-假设:**master 在 A 机,agent 在 B 机**,两台都是 Linux。
-这份清单同时是 `DESIGN.md` §13.2 / §13.3 的**跨机版本** ——
-仓库里已经跑过的那次是单机 loopback(§13.2 就是那么规定的),
-跨机额外能验到的是:真实网络延迟下的 wss、跨公网断线重连、以及 systemd 单元。
+假设主控在 A 机、agent 在 B 机，两台均为 Linux。默认端口：
 
-> 装之前想清楚端口。这类机器上通常已经有 nginx / docker / 别的代理,
-> 撞上去的表现是「agent 起不来」,或者更糟——把别人的服务挤掉。
-> 下面用 `18443`(集群)和 `18081`(订阅)只是示例,**先 `ss -tlnp` 确认没被占**。
+- `18443/tcp`：agent 回连主控，需允许 B → A
+- `18081/tcp`：订阅 HTTP，默认只监听 `127.0.0.1`，不要直接暴露公网
 
----
+安装前先用 `ss -tlnp` 确认端口没有被 nginx、Docker 或其它代理占用。
 
-## A 机(master)
+## 1. 安装主控（A 机）
 
 ```sh
-# 1. 装
 curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
-#    脚本会放好 /usr/local/bin/sbx、/etc/sbx/config.example.toml 与 sbx.service(不启用)。
-#    它**不会覆盖**已有的 /etc/sbx/config.toml。
 cp -n /etc/sbx/config.example.toml /etc/sbx/config.toml
-
-# 2. 改 /etc/sbx/config.toml —— 至少确认这两个端口没被占
-#    [cluster] listen  = "0.0.0.0:18443"   ← agent 要能连到,必须对外
-#    [subscription] listen = "127.0.0.1:18081"  ← 只听本地,前面挂 nginx
-
-# 3. 起来。证书不存在时会自签一张并打印指纹
-systemctl daemon-reload && systemctl enable --now sbx
-journalctl -u sbx -n 20 --no-pager        # 记下 fingerprint
-sbx --config /etc/sbx/config.toml fingerprint   # 或者随时再打印一次
 ```
 
-**防火墙**:只需要放行集群端口。订阅端口默认只听 `127.0.0.1`,不要对外。
+至少检查 `/etc/sbx/config.toml`：
+
+```toml
+[cluster]
+listen = "0.0.0.0:18443"
+
+[subscription]
+listen = "127.0.0.1:18081"
+```
+
+启动：
+
+```sh
+systemctl daemon-reload
+systemctl enable --now sbx
+sbx --config /etc/sbx/config.toml doctor
+sbx --config /etc/sbx/config.toml fingerprint
+journalctl -u sbx -n 30 --no-pager
+```
+
+`doctor` 只读，不会创建数据库、执行迁移或生成证书；有 ERR 时退出码为 1。
+
+只需对外放行集群端口：
 
 ```sh
 ufw allow 18443/tcp comment 'sbx cluster'
-# 云厂商那边的安全组(Oracle VCN / 阿里云 / AWS)也要放行,两层都得开
 ```
 
-> Oracle Cloud 的实例默认还有一层 VCN 安全列表,ufw 放行了不代表外面连得进来。
-> 验证:在 B 机上 `nc -vz <A机IP> 18443`。
+云厂商安全组/VCN 也必须放行。请从 B 机验证，而不是只在 A 机本地测：
 
-## B 机(agent)
+```sh
+nc -vz <A机公网地址> 18443
+```
 
-**推荐:让主控把命令生成好。** 在 A 机上 `sbx --config /etc/sbx/config.toml tui`,
-按 `2` 到服务管理页,按 `a` 新增 —— 弹窗里就是一条填好 token 与证书指纹的完整命令,
-整条复制到 B 机上跑(root):
+## 2. 安装 agent（B 机）
+
+推荐在 A 机打开 TUI，进入“服务管理”页按 `[a]`，复制生成的完整命令到 B 机执行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh \
-  | SBX_SERVER='wss://<A机IP>:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+  | SBX_SERVER='wss://<A机地址>:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
 ```
 
-它会:装 `sbx-agent`(校验 sha256)→ 放好 unit → 写 `/etc/sbx/agent.toml`(0600)
-→ `enable --now sbx-agent`。给了 `SBX_TOKEN` 就一定是在装被控端,
-不用再带 `SBX_TARGET=agent`。
+脚本会：
 
-token 丢了或要换,在 TUI 里按 `r` 轮换,把新命令在 B 机上再跑一遍就行 ——
-旧配置会自动备份成 `agent.toml.bak`。
+1. 下载正确架构的 `sbx-agent` 并校验 SHA-256；
+2. 安装 `/etc/systemd/system/sbx-agent.service`；
+3. 写入 `/etc/sbx/agent.toml`（0600）；
+4. 执行 `systemctl enable --now sbx-agent`。
 
-<details>
-<summary>手工版(想知道它到底做了什么,或者机器连不上 GitHub)</summary>
+查看状态：
 
 ```sh
-# 1. 装。注意选对 arch,以及校验 sha256
-curl -fsSLO https://github.com/why1f/sbx/releases/download/v0.2.0/sbx-agent-v0.2.0-linux-arm64
-curl -fsSLO https://github.com/why1f/sbx/releases/download/v0.2.0/sbx-agent-v0.2.0-linux-arm64.sha256
-sha256sum -c sbx-agent-v0.2.0-linux-arm64.sha256
-install -m755 sbx-agent-v0.2.0-linux-arm64 /usr/local/bin/sbx-agent
-install -d -m750 /etc/sbx && install -m644 sbx-agent.service /etc/systemd/system/
-
-# 2. 在 A 机上生成 token
-#    sbx --config /etc/sbx/config.toml agent-add tokyo    ← token 只显示这一次
-
-cat > /etc/sbx/agent.toml <<'EOF'
-server      = "wss://<A机IP>:18443/ws"
-token       = "<agent-add 打印的那串>"
-fingerprint = "<A 机打印的 sha256:...>"
-state_dir   = "/var/lib/sbx-agent"
-EOF
-chmod 600 /etc/sbx/agent.toml     # 里面有 token
-
-systemctl daemon-reload && systemctl enable --now sbx-agent
+systemctl status sbx-agent --no-pager
+journalctl -u sbx-agent -n 30 --no-pager
 ```
 
-</details>
+期望看到：
 
-```sh
-journalctl -u sbx-agent -f
-```
-
-期望日志:
-
-```
+```text
 没有 last-applied.json,等待主控首次 config.apply
-已连上主控:agent_id=1,上报间隔 30s,心跳 10s
+已连上主控:agent_id=…,上报间隔 30s,心跳 10s
 ```
 
----
+轮换 token：在 TUI 服务管理页按 `[r]`，把新命令在 B 机再执行一次。旧配置会备份成
+`/etc/sbx/agent.toml.bak`。
 
-## 验证清单
+## 3. 验证清单
 
-### 0. 先跑自检
+### 3.1 主控自检
 
 ```sh
-# A 机。二进制/配置/数据目录/数据库/systemd/证书/端口逐项过一遍,
-# 每项写出实际位置,数据库另给文件大小与 schema 版本。
 sbx --config /etc/sbx/config.toml doctor
 ```
 
-它**只读**:不会把数据库建出来(那是 `init-db` 的活),也不会生成缺失的证书
-(那是 daemon 首次启动时做的)—— 所以反复跑是安全的,而且看到的是系统的真实状态。
+重点应为 OK：二进制、配置文件、数据目录、数据库、systemd 单元、集群监听和 TLS 证书。
+订阅或 Telegram 明确关闭时属于正常状态。
 
-有 ERR 时退出码为 1,可以直接写进部署脚本;WARN 不算失败
-(「daemon 还没起来」「订阅没配 public_base」都是正常中间态)。
+### 3.2 握手与配置下发
 
-下面几条是它盖不住的部分:跨机连通性、真实流量、断线重连。
-
-### 1. 握手与下发
+A 机：
 
 ```sh
-# A 机
-sbx --config /etc/sbx/config.toml agent-list      # 应当 online,带 os/arch/版本
+sbx --config /etc/sbx/config.toml agent-list
 sbx --config /etc/sbx/config.toml node-add 1 tokyo-in 443 --protocol vless-reality
-# 日志里应当出现「配置版本不一致,下发 config.apply」→「config.apply 已生效」
-# B 机上 ss -tlnp | grep 443 应当看到 sbx-agent 在听
 ```
 
-### 2. 冷启动(agent 不依赖主控)
+确认：
+
+- agent 状态为 online，带版本、架构和公网地址；
+- A 机日志出现配置下发成功；
+- B 机 `ss -tlnp | grep 443` 能看到节点监听。
+
+### 3.3 IPv6
+
+B 机：
 
 ```sh
-# B 机:先停 A 机的 master,再重启 agent
-systemctl restart sbx-agent
-journalctl -u sbx-agent -n 5
+ip -6 route show default
+curl -6 -sS --max-time 5 https://api.ip.sb/ip; echo
 ```
 
-期望**先**出现 `已按 last-applied.json 启动 box`,**再**是连主控失败并退避重试。
-这条的意义:主控挂了,节点照常服务。
+agent 优先使用内核 RFC 6724 源地址选择，不依赖外部查询速度；外部查询只是兜底。
+如果 TUI 仍没有 IPv6，确认默认路由、云安全组及主机防火墙。
 
-### 3. 跨公网断线重连
+从其它机器验证入站，而不是只验证 B 机能出站：
 
 ```sh
-# A 机:停掉 master,看 B 机退避;再拉起来,看它自己回来
-systemctl stop sbx && sleep 90 && systemctl start sbx
+nc -6 -vz <B机IPv6> <节点端口>
 ```
 
-B 机日志应当能看到退避间隔从 1s 翻倍到 60s 封顶,主控回来后**自动重连**,
-且不需要重新下发配置(revision 一致)。
+订阅格式：
 
-### 4. 流量记账(§13.2 的跨机版)
+- 分享 URI：`@[IPv6]:端口`
+- Clash/Mihomo 与 VMess JSON 的 `server` / `add` / `host`：裸 IPv6，不含方括号
 
-用真客户端连 B 机的节点跑一些流量,然后在 A 机:
+### 3.4 冷启动
+
+停掉 A 机主控，再重启 B 机 agent：
 
 ```sh
-sqlite3 /etc/sbx/sbx.db "SELECT u.name, n.tag, t.cycle_up, t.cycle_down
-  FROM user_traffic t JOIN users u ON u.id=t.user_id JOIN nodes n ON n.id=t.node_id;"
+systemctl stop sbx                    # A 机
+systemctl restart sbx-agent           # B 机
+journalctl -u sbx-agent -n 20 --no-pager
+```
+
+应先出现“已按 last-applied.json 启动 box”，随后才是连接主控失败并退避。主控不可用时，已有节点仍应服务。
+验证后恢复主控：
+
+```sh
+systemctl start sbx
+```
+
+### 3.5 掉线与重连
+
+A 机：
+
+```sh
+systemctl stop sbx
+sleep 40
+systemctl start sbx
+```
+
+B 机应退避重试并自动重连。主控默认在 30 秒静默后把 agent 标为离线；TUI 中掉线灯为红色。
+重连后 revision 一致时不应重复重建 box。
+
+### 3.6 流量记账与进程重启
+
+用真实客户端经过 B 机节点产生流量，然后在 A 机检查：
+
+```sh
+sqlite3 /etc/sbx/sbx.db "SELECT u.name,n.tag,t.cycle_up,t.cycle_down
+  FROM user_traffic t
+  JOIN users u ON u.id=t.user_id
+  JOIN nodes n ON n.id=t.node_id;"
+
 sqlite3 /etc/sbx/sbx.db "SELECT * FROM user_traffic_total;"
 ```
 
-多台 agent 时,`user_traffic_total` 应当等于各节点之和。
+多台 agent 时，`user_traffic_total` 应等于各节点之和。
 
-### 5. 断连恢复(§13.3 的跨机版)
+流量进行中重启 agent：
 
 ```sh
-# B 机:跑流量期间
-kill -9 $(pidof sbx-agent)     # systemd 的 Restart=always 会把它拉回来
+kill -9 $(pidof sbx-agent)
 ```
 
-A 机的 `agent_events` 里应当出现一条 `counter_reset`,
-而 `user_traffic.total_up/down` 应当是「重启前 + 重启后」之和 ——
-**既不重复计,也不丢失**。这是 §5.2 那套 epoch/delta 的核心。
+systemd 的 `Restart=always` 会拉起它。重启前后的累计流量应相加且不重复，`agent_events` 应记录计数器 epoch 变化。
 
-### 6. 自升级(本仓库唯一未实测的功能)
+### 3.7 升级
 
-`agent.upgrade` 的收尾动作是**替换掉自己的二进制然后退出**,
-靠 systemd 的 `Restart=always` 拉起新版本 —— 所以这一条必须在 systemd 下测,
-手动 `nohup` 起的 agent 升级完就没了。
-
-`sbx-agent.service` 里为此专门开了 `ReadWritePaths=/usr/local/bin`
-(其余路径被 `ProtectSystem=strict` 锁着)。不用自升级的话可以删掉那一行,
-那时 `agent.upgrade` 会明确报错而不是静默失败。
-
-目前主控侧还没有发起 `agent.upgrade` 的命令,要测得手工构造一条 WS 消息。
-
----
-
-## 卸载
+主控：
 
 ```sh
-systemctl disable --now sbx-agent   # B 机
-systemctl disable --now sbx         # A 机
-rm -f /usr/local/bin/sbx{,-agent} /etc/systemd/system/sbx{,-agent}.service
+curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+systemctl restart sbx
+```
+
+正在运行的 TUI 需要退出后重新进入，才能加载新二进制。
+
+agent：在 TUI 服务管理页按 `[u]`，可升级当前 agent 或全部在线 agent。agent 下载目标版本、校验
+SHA-256、原子替换自身并退出，由 `sbx-agent.service` 的 `Restart=always` 拉起新版本。
+
+## 4. 关键路径与权限
+
+| 路径 | 内容 | 建议权限 |
+|---|---|---|
+| `/usr/local/bin/sbx` | 主控二进制 | 0755 |
+| `/usr/local/bin/sbx-agent` | agent 二进制 | 0755 |
+| `/etc/sbx/config.toml` | 主控配置 | 0640 |
+| `/etc/sbx/sbx.db` | 主控数据库 | 仅服务用户可读写 |
+| `/etc/sbx/tls/` | 主控证书和私钥 | 目录 0750 |
+| `/etc/sbx/agent.toml` | 主控地址、token、指纹 | 0600 |
+| `/var/lib/sbx-agent/last-applied.json` | agent 最后成功配置 | 仅服务用户可读写 |
+
+## 5. 卸载
+
+以下操作会删除配置、数据库、证书和 agent 状态，先自行备份：
+
+```sh
+systemctl disable --now sbx-agent 2>/dev/null || true
+systemctl disable --now sbx 2>/dev/null || true
+rm -f /usr/local/bin/sbx /usr/local/bin/sbx-agent
+rm -f /etc/systemd/system/sbx.service /etc/systemd/system/sbx-agent.service
 rm -rf /etc/sbx /var/lib/sbx-agent
+systemctl daemon-reload
 ufw delete allow 18443/tcp
 ```

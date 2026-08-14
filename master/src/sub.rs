@@ -111,41 +111,56 @@ pub async fn find_by_sub_token(pool: &SqlitePool, token: &str) -> Result<Option<
 
 // ─────────────────────────── 地址与端口 ───────────────────────────
 
-/// 规范化一个主机地址。IPv6 字面量必须补方括号,否则拼进 URL 非法。
+/// 规范化一个**裸主机地址**。IPv6 在这里不带方括号。
 ///
-/// 长度上限 64 是防御性的:这个值会进 URL、进 HTML 属性,来源是数据库里
-/// 可被管理员编辑的字段。
+/// 方括号是 URI authority 的语法(`@[2001:db8::1]:443`),不是主机地址本身。
+/// endpoint 同时供分享 URI、VMess JSON 与 Clash YAML 使用;若在这一层加框,
+/// 结构化配置会得到 `server: "[2001:db8::1]"`,客户端把方括号当成地址内容,
+/// DNS/拨号随即失败。URI 那一侧由 `authority_host` 临时补框。
 pub fn normalize_host(text: &str) -> Option<String> {
     let t = text.trim();
+    // 管理员可能从 URL 里复制了 `[v6]`,入库/中转也允许这种输入;
+    // 规范化时剥掉**一层**框,结构化输出始终拿裸地址。
+    let t = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(t);
     if t.is_empty() || t.len() > 64 {
-        return None;
-    }
-    Some(if t.contains(':') && !t.starts_with('[') {
-        format!("[{t}]")
+        None
     } else {
-        t.to_string()
-    })
+        Some(t.to_string())
+    }
 }
 
-/// 从 `public_base`(形如 `https://sub.example.com:8443/x`)里取出 host[:port]。
+/// 把裸主机名变成 URI authority 可用的形状。只有这里给 IPv6 加框。
+fn authority_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+/// 从 `public_base`(形如 `https://sub.example.com:8443/x`)里取出**裸 host**。
 fn public_base_host(public_base: &str) -> Option<String> {
     let s = public_base.trim();
     if s.is_empty() {
         return None;
     }
-    let rest = s
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(s);
-    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // 这里**不能**用 normalize_host:public_base 里的 IPv6 已经是带方括号的
-    // URL 形式了,再包一层会变成 [[::1]]。
-    let host = host.trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
+    let rest = s.split_once("://").map(|(_, r)| r).unwrap_or(s);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return None;
     }
+
+    // URL 里的 IPv6 是 `[addr]:port`;只取框内地址。域名/IPv4 的 `:port`
+    // 同样去掉 —— endpoint 的端口由节点/中转决定,不能拼出 `host:8443:30652`。
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split_once(']').map(|(h, _)| h).unwrap_or(inner)
+    } else if authority.matches(':').count() == 1 {
+        authority.split_once(':').map(|(h, _)| h).unwrap_or(authority)
+    } else {
+        // 没框的裸 IPv6(虽不是合法 URL authority)仍尽量接受。
+        authority
+    };
+    normalize_host(host)
 }
 
 /// 订阅里对外暴露的 `(地址, 端口)`。
@@ -243,6 +258,9 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
     let tag = enc(&n.tag);
     let p = &n.params;
     let insec = skip_cert_verify(n.protocol);
+    // `s` 始终是裸主机;只有 URI authority 需要 `[IPv6]`。
+    // VMess JSON 仍直接用 `s`,不能把框写进 `add`/`host` 字段。
+    let authority = authority_host(s);
 
     match n.protocol {
         Protocol::VlessReality => {
@@ -254,7 +272,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
                 "vless://{}@{}:{}?encryption=none&flow=xtls-rprx-vision&security=reality\
                  &sni={}&fp=chrome&pbk={}&sid={}&type=tcp#{}",
                 u.uuid,
-                s,
+                authority,
                 port,
                 enc(&sni),
                 enc(&pbk),
@@ -270,7 +288,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
             Some(format!(
                 "vless://{}@{}:{}?encryption=none&security=none&type=ws&path={}#{}",
                 u.uuid,
-                s,
+                authority,
                 port,
                 enc(&path),
                 tag
@@ -305,7 +323,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
             Some(format!(
                 "ss://{}@{}:{}#{}",
                 STANDARD.encode(format!("{method}:{pw}")),
-                s,
+                authority,
                 port,
                 tag
             ))
@@ -314,7 +332,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
         Protocol::Trojan => Some(format!(
             "trojan://{}@{}:{}?{}#{}",
             enc(&u.password),
-            s,
+            authority,
             port,
             query(&[
                 Some("security=tls".into()),
@@ -330,7 +348,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
         Protocol::Hysteria2 => Some(format!(
             "hysteria2://{}@{}:{}?{}#{}",
             enc(&u.password),
-            s,
+            authority,
             port,
             query(&[sni_param(p), insec.then(|| "insecure=1".into())]),
             tag
@@ -340,7 +358,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
             "tuic://{}:{}@{}:{}?{}#{}",
             u.uuid,
             enc(&u.password),
-            s,
+            authority,
             port,
             query(&[
                 Some("congestion_control=bbr".into()),
@@ -355,7 +373,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
         Protocol::Anytls => Some(format!(
             "anytls://{}@{}:{}?{}#{}",
             enc(&u.password),
-            s,
+            authority,
             port,
             query(&[sni_param(p), insec.then(|| "allowInsecure=1".into())]),
             tag
@@ -471,9 +489,9 @@ pub fn generate_clash_yaml(user: &SubUser, nodes: &[ExportNode], opts: &ExportOp
 
 /// 写一条 Clash proxy。返回 false 表示这个节点导不出(缺密钥材料),调用方跳过它。
 ///
-/// 注意 `server:` 一律走 `yaml_str` —— IPv6 字面量是 `[2001:db8::1]` 这种形状,
-/// 直接写进 YAML 会被解析成**流式序列**(一个列表),而不是字符串。
-/// 那种配置 clash 不会报错,只会把 server 当成一个数组然后连不上。
+/// 注意 `server:` 一律走 `yaml_str`。IPv6 **保持裸地址**但要加 YAML 引号:
+/// `server: "2001:db8::1"`。方括号只属于 URI authority,写成
+/// `server: "[2001:db8::1]"` 会被客户端当作地址内容,形成错误配置。
 fn clash_proxy(out: &mut String, u: &SubUser, n: &ExportNode, s: &str, port: u16) -> bool {
     let p = &n.params;
     let name = yaml_str(&n.tag);
@@ -647,12 +665,14 @@ mod tests {
     // ─────────────── 地址与端口 ───────────────
 
     #[test]
-    fn ipv4_stays_plain_and_ipv6_gets_brackets() {
+    fn normalized_hosts_are_raw_and_uri_authorities_get_brackets() {
         assert_eq!(normalize_host(" 1.2.3.4\n"), Some("1.2.3.4".into()));
-        // 不补方括号的话 `vless://…@2001:db8::1:8443` 里的端口分隔符没法区分,
-        // 客户端解析直接失败。
-        assert_eq!(normalize_host("2001:db8::1"), Some("[2001:db8::1]".into()));
-        assert_eq!(normalize_host("[2001:db8::1]"), Some("[2001:db8::1]".into()));
+        // endpoint / JSON / YAML 必须拿裸地址;输入本来带框也要剥掉。
+        assert_eq!(normalize_host("2001:db8::1"), Some("2001:db8::1".into()));
+        assert_eq!(normalize_host("[2001:db8::1]"), Some("2001:db8::1".into()));
+        // 只有拼 URI authority 时才加框,否则端口分隔符无法区分。
+        assert_eq!(authority_host("2001:db8::1"), "[2001:db8::1]");
+        assert_eq!(authority_host("1.2.3.4"), "1.2.3.4");
         assert_eq!(normalize_host("   "), None);
         assert_eq!(normalize_host(&"x".repeat(65)), None);
     }
@@ -663,12 +683,12 @@ mod tests {
         assert_eq!(endpoint(&n, &opts()), Some(("203.0.113.7".into(), 8443)));
     }
 
-    /// 节点标了 ipv6 偏好就走 agent 的 v6 地址,而且要带方括号。
+    /// 节点标了 IPv6 偏好就选 agent 的裸 IPv6;具体输出格式由导出器决定。
     #[test]
-    fn ipv6_preference_selects_the_v6_address() {
+    fn ipv6_preference_selects_the_raw_v6_address() {
         let mut n = node(Protocol::VlessReality);
         n.params.ipv6 = true;
-        assert_eq!(endpoint(&n, &opts()), Some(("[2001:db8::1]".into(), 8443)));
+        assert_eq!(endpoint(&n, &opts()), Some(("2001:db8::1".into(), 8443)));
     }
 
     /// 偏好的那一路没有地址时回落到另一路,而不是导不出。
@@ -852,6 +872,32 @@ mod tests {
         assert_eq!(v["tls"], "", "sbx 的 ws 系不开后端 TLS(§9.1)");
     }
 
+    /// 同一个 IPv6 在两种输出上下文里形状不同:
+    /// URI authority 必须带框,结构化 JSON 的 server/add 必须不带框。
+    #[test]
+    fn ipv6_brackets_exist_only_in_uri_authorities() {
+        for proto in Protocol::all().iter().copied().filter(|p| *p != Protocol::VmessWs) {
+            let mut n = node(proto);
+            n.params.ipv6 = true;
+            let link = &generate_links(&user(), &[n], &opts())[0].link;
+            assert!(
+                link.contains("@[2001:db8::1]:8443"),
+                "{proto} URI authority 缺 IPv6 方括号:{link}"
+            );
+        }
+
+        let mut vmess = node(Protocol::VmessWs);
+        vmess.params.ipv6 = true;
+        // 没有显式 server_name 时 host 也回落到连接地址,两处都必须是裸地址。
+        vmess.params.server_name = None;
+        let link = &generate_links(&user(), &[vmess], &opts())[0].link;
+        let raw = STANDARD.decode(link.trim_start_matches("vmess://")).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["add"], "2001:db8::1");
+        assert_eq!(v["host"], "2001:db8::1");
+        assert_ne!(v["add"], "[2001:db8::1]", "结构化字段不准带 URI 方括号");
+    }
+
     #[test]
     fn subscription_body_is_base64_of_newline_separated_links() {
         let nodes: Vec<_> = Protocol::all().iter().map(|p| node(*p)).collect();
@@ -969,19 +1015,18 @@ mod tests {
         );
     }
 
-    /// IPv6 地址在 YAML 里必须加引号。
-    ///
-    /// `server: [2001:db8::1]` 是**流式序列**语法 —— clash 会把它解析成一个列表,
-    /// 不报错,只是连不上。这条是从真实输出里发现的回归锚点。
+    /// 结构化配置的 IPv6 server 必须是**不带方括号的裸地址**,并加 YAML 引号。
+    /// 方括号只属于 URI authority;放进 server 字段会被当作地址本身的一部分。
     #[test]
-    fn clash_quotes_ipv6_server_addresses() {
+    fn clash_uses_a_raw_quoted_ipv6_server_address() {
         let mut n = node(Protocol::Hysteria2);
         n.params.ipv6 = true;
         let yaml = generate_clash_yaml(&user(), &[n], &opts());
         assert!(
-            yaml.contains("server: \"[2001:db8::1]\""),
-            "IPv6 地址没加引号,会被当成 YAML 列表:\n{yaml}"
+            yaml.contains("server: \"2001:db8::1\""),
+            "IPv6 server 应是带引号的裸地址:\n{yaml}"
         );
+        assert!(!yaml.contains("server: \"[2001:db8::1]\""), "结构化 server 不准带框:\n{yaml}");
         // IPv4 不需要引号,别过度加。
         let yaml4 = generate_clash_yaml(&user(), &[node(Protocol::Hysteria2)], &opts());
         assert!(yaml4.contains("server: 203.0.113.7"), "{yaml4}");

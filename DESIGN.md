@@ -1,10 +1,8 @@
 # sbx —— 主控(Rust)+ 多被控 agent(Go 内嵌 sing-box)集群管理 TUI
 
-> **本文件是自包含的方案需求文件。** 阅读者可能没有任何前置上下文。
-> 实现之前请**完整读完 §0 与 §1**——那里记录的是已经过验证、且**已经排除掉其它备选方案**的结论。
-> 如果你在实现过程中产生了「不如直接用 Clash API 拿流量」「不如用 V2Ray API 拿流量」
-> 「不如让 agent 用 Rust 调官方 sing-box 二进制」「不如 fork 一份 sing-box 打补丁」这类想法,
-> 说明你跳过了 §0;这四条路都已经被读源码验证并排除,理由写在 §0.1 / §0.2 / §0.3。
+> 本文件记录**当前仍生效的架构约束与正确性理由**,不是实施待办。
+> §0 与 §1 保存了已经通过源码阅读、真实 sing-box 与跨机测试验证的选型结论。
+> 修改流量采集、配置权威、许可证边界或 TLS 模型前,先读对应理由。
 
 ---
 
@@ -12,27 +10,16 @@
 
 ### 0.0 项目定位
 
-已有一个**单服务器**的 sing-box 管理工具:`D:\Project\vibecoding\singbox-manager`(Rust,16225 行,二进制名 `sb`,版本 0.7.0)。
-它管理**本机一个** sing-box 进程:CLI + TUI + systemd 运维闭环,用户/节点/流量/订阅/Telegram 通知。
+sbx 解决的是**一台主控管理多台 agent**的问题:
 
-**sbx 是一个新项目**,目录为 `D:\Project\vibecoding\sbx\`(与 `singbox-manager` 平级)。
-**不改动 `singbox-manager` 的任何文件**——旧项目只作为**代码来源**被复用(§9 给出逐文件的复用映射)。
+1. 主控与 agent 通过 WebSocket 通信；
+2. 一个用户可分配来自不同 agent 的多个节点,用量跨 agent 求和；
+3. 主控 TUI 管理 agent、节点、用户、订阅、通知与升级；
+4. agent 上报 `/proc/net/dev` 网卡累计与 per-user/inbound 流量；
+5. 主控 Rust、agent Go 并把 sing-box 作为库静态内嵌。
 
-sbx 要解决的是旧项目做不到的事:
-
-1. 一台**主控**统一管理 N 台**被控**(agent)服务器。
-2. 主控 ↔ agent 通过 **WebSocket** 通信。
-3. **一个用户可以被分配多个代理节点,这些节点可以来自不同的 agent 服务器**;
-   该用户的流量统计 = **它名下所有节点流量之和(跨 agent 求和)**。
-4. 主控 TUI 要有**「服务管理」栏**:新增 agent、生成/轮换连接 token。
-5. 被控服务器列表用**两行式**布局(见 §8,对齐 `D:\Project\vibecoding\1.png`):
-   IPv4 / IPv6 两行,上行 ↑ / 下行 ↓ 两行,「已用 / 总配额」+ 渐变进度条 + 流量重置日期。
-6. 被控服务器的**整机流量**统计走 agent 的 **`/proc/net/dev` 物理网卡 RX+TX 累计**,
-   与 VPS 服务商面板的网卡计费口径一致(不是代理流量,是网卡流量,两者是不同的两套数字)。
-
-技术选型的结论(已定):**主控 Rust,agent Go 且把 sing-box 作为库静态内嵌,编译成单个二进制。**
-理由不是「Go 写 agent 更顺手」,而是 §0.2 的读源码结果——**per-user 累计流量只能靠进程内挂 tracker 拿到,
-而挂 tracker 需要 `adapter.Router` 对象,那是 Rust 进程碰不到的东西**。完整推论见 §0.3。
+主控/agent 的语言边界不是偏好:per-user 累计依赖进程内 `adapter.Router` tracker,
+Rust 主控无法访问 Go 对象。完整推论见 §0.2 / §0.3。
 
 ### 0.1 sing-box 的四个**外部** API 面(已逐一核实)
 
@@ -112,7 +99,8 @@ func (s *Box) Router() adapter.Router { return s.router }
 
 **结论一:agent 用 Go 写,把 sing-box 作为 Go 库静态内嵌。** 于是:
 
-- 不需要 `with_v2ray_api` 构建标记,**也不需要任何构建标记**
+- 不需要 `with_v2ray_api` 构建标记,但发行 agent 时必须带 `with_quic,with_utls`:
+  reality 依赖 uTLS,Hysteria2/TUIC 依赖 QUIC。
 - 不需要 gRPC(统计对象就在同一块内存里,不起任何监听)
 - 不需要自编译内核 CI、内核分发仓库、TUI 里的内核安装/升级按钮
 - 不需要旧项目 `core/singbox.rs`(810 行)的**外部进程管理**(启停、配置文件落盘给别的进程读、`sing-box check` 子进程)
@@ -134,7 +122,7 @@ sbx 的主控 `Cargo.toml` 相对旧项目**删掉** `tonic`、`prost`、`[build
 | **动态改用户**(§7.5) | 得先给内核补进一套管理 RPC 才能驱动 | 一次 Go 方法调用 |
 
 **结论三:不 fork sing-box、不打补丁。** sing-box 版本就是 `go.mod` 里的一行。
-七个协议的运行时改用户能力确实被挡在未导出字段后面(§7.5 有完整核实结果),
+八种协议的运行时改用户能力确实被挡在未导出字段后面(§7.5 有完整核实结果),
 但绕开它的代价比 fork 小得多。触发重新考虑的条件写在 §7.5 末尾。
 
 ---
@@ -162,7 +150,7 @@ agent 本地**只保留一份 `last-applied.json` 快照**,用途**仅限**:主�
 - 主控内置 rustls **自签证书**;agent **首次连接时固定证书指纹**(TOFU pinning)。
   `token` 与 `fingerprint` 一起写进 agent 配置文件。
 - **证书由主控自己生成,不需要用户准备。** daemon 启动时若 `cert_path` / `key_path`(§11.2)不存在,
-  就用 `rcgen` 生成一张长有效期(10 年)自签证书写进去,权限 `0600`;已存在则直接加载。
+  就用 `rcgen` 生成一张长有效期自签证书写进去,权限 `0600`;已存在则直接加载。
   SAN 取 `cluster.listen` 的地址加 `localhost`——**但 agent 侧只校验指纹、不校验 SAN/CN**,
   所以主控改域名或 IP 都不需要重签(TOFU 的本意就是把信任锚定在密钥而非名字上)。
 - 主控启动后计算证书 DER 的 **SHA-256** 作为指纹(`sha256:<hex>`),
@@ -191,53 +179,19 @@ agent 本地**只保留一份 `last-applied.json` 快照**,用途**仅限**:主�
 
 ## 3. 工作区布局
 
-```
-sbx/
-├─ Cargo.toml                 # workspace = ["master", "shared"]
-├─ LICENSE-MIT                # 覆盖 master/ 与 shared/
-├─ DESIGN.md                  # 本文件
-├─ README.md                  # 顶部必须标注双许可与 §1.1 的边界理由
-├─ .github/workflows/
-│  ├─ ci.yml                  # cargo test + go test(两侧都跑)
-│  └─ release.yml             # master(Rust,musl)+ agent(Go)一起出产物,§11.1
-├─ shared/                    # 协议定义:envelope + 所有 payload struct(serde)
-│  └─ src/{lib.rs, proto.rs, version.rs}
-├─ master/                    # bin = "sbx"
-│  └─ src/
-│     ├─ main.rs              # CLI(clap) + daemon + tui 三入口
-│     ├─ model/               # ← 复用旧 user.rs / node.rs,新增 agent.rs
-│     ├─ db/                  # ← 复用旧迁移模式(PRAGMA user_version + include_str!)
-│     │  └─ migrations/001_init.sql ...
-│     ├─ cluster/
-│     │  ├─ server.rs         # axum WS 端点 + token 校验 + 握手
-│     │  ├─ registry.rs       # AgentId -> AgentConn(mpsc sender、状态、心跳)
-│     │  ├─ rpc.rs            # 请求/响应关联(id -> oneshot)、超时、重发策略
-│     │  └─ ingest.rs         # stats.report / sysinfo.report 落库(含 epoch 处理)
-│     ├─ service/             # user / node / traffic / sub(← 复用 813 行 8 协议链接生成)
-│     │                       # / stats_html(← 复用) / tg(← 复用)
-│     └─ tui/
-│        ├─ runner.rs, forms.rs, app.rs
-│        └─ pages/{dashboard, agents, nodes, users, traffic}.rs
-│                             # agents.rs = 「服务管理」栏:两行式列表 + token 管理
-└─ agent/                     # 独立 Go module,GPLv3,单二进制 "sbx-agent"
-   ├─ go.mod                  # sing-box 版本就是这里的一行 require;升级 = go get -u
-   ├─ LICENSE                 # GPLv3
-   ├─ cmd/sbx-agent/main.go   # 读配置 → 冷启动 box → 起 ws 客户端
-   ├─ config/                 # TOML 配置:server / token / fingerprint / state_dir
-   ├─ master/                 # WS 客户端:重连(指数退避 1→60s)、心跳、envelope 编解码
-   │                          # (§3 早期草案里叫 wsclient/,实现时按「对端是谁」命名)
-   ├─ boxctl/                 # option.Options 构建 → box.New → Start/Close;热重载(§7.4)
-   ├─ tracker/                # ConnectionTracker 实现:per-user 计数 + disabled 集合(§7.1/§7.5)
-   ├─ state/                  # last-applied.json 的原子读写(§4.1)
-   └─ sysinfo/                # /proc/net/dev、/proc/stat、/proc/meminfo、boot_id、公网 IP 自探
-```
+| 路径 | 当前职责 |
+|---|---|
+| `master/` | Rust 主控:CLI、daemon、TUI、SQLite、订阅、Telegram、升级、doctor |
+| `agent/` | Go agent:WebSocket 客户端、内嵌 sing-box、tracker、sysinfo、自升级 |
+| `shared/` | Rust 协议信封与 payload 类型 |
+| `packaging/` | 安装脚本、示例配置、systemd unit 与离线测试 |
+| `master/testdata/` | 八协议与出站策略 golden,由真 sing-box 校验 |
+| `spike/` | tracker 的真实 sing-box 流量/拒绝行为回归 |
+| `e2e/` | 跨 agent 求和与断线恢复驱动 |
+| `.github/workflows/` | Rust/Go/安装/端到端 CI 与双架构发布 |
 
-二进制命名:主控 **`sbx`**,agent **`sbx-agent`**。
-
-**`agent/` 里没有 `patches/` 目录,也没有内核构建脚本**——sing-box 是普通的 Go 依赖(§0.3 结论三)。
-如果将来出现了 `patches/`,说明 §7.5 的触发条件被满足了,那时才需要它。
-
----
+二进制名:主控 `sbx`,agent `sbx-agent`。`agent/` 不允许出现 `replace`、`patches/`
+或内核构建脚本；sing-box 版本只由 `agent/go.mod` 的普通依赖决定。
 
 ## 4. WS 协议
 
@@ -686,7 +640,8 @@ tracker 已经在数据路径上且拿得到 `md.User`,所以禁用只需在 `Ro
 `disabled` 集合作为 `last-applied.json` 的一个独立字段,`user.state` 只改这个字段并落盘,
 **不动 `options`、不重建 box**。§1.2「主控是唯一真源」不受影响。
 
-**什么时候重新考虑打补丁:** 给七个协议各加一个导出的 `UpdateUsers`,约 5 行 × 7 个文件,确实很小。
+**什么时候重新考虑打补丁:** 若上游运行时用户更新能力仍不可用、且重建 box 的代价变得不可接受,
+再评估为相关协议补导出接口。当前条件不成立,所以继续保持普通依赖、零补丁。
 但它把 CI 从一条 `go build` 变成 clone 上游 + apply patch + `go mod edit -replace` + 每日 cron 追补丁腐烂(§11)。
 **触发条件:当「加用户导致同 agent 其他用户掉线」成为实际投诉时。**
 届时 WS 协议、主控、数据库一行不用改,只是 `config.apply` 多一条「仅用户变更」的快路径。
@@ -903,7 +858,7 @@ SHA-256 单次即可,且 `token_prefix` 让定位是 O(1)。
 一次提交整体替换(`node_repo::set_user_nodes`)。之前那版要人先去另一页把 `node_id` 记下来,
 一次只能加一个,取消分配还得走另一条路。
 
-### 8.2 两行式列表(对齐 `D:\Project\vibecoding\1.png`)
+### 8.2 两行式列表
 
 用 ratatui `Table` + `Row::new(cells).height(2)`,每个 cell 用
 `Cell::from(Text::from(vec![Line, Line]))`,列宽用 `Constraint::Length`。
@@ -961,74 +916,35 @@ SHA-256 单次即可,且 `token_prefix` 让定位是 O(1)。
 
 ---
 
-## 9. 复用映射(旧项目 → sbx)
+## 9. 从旧实现保留下来的契约
 
-旧项目路径全部相对 `D:\Project\vibecoding\singbox-manager\`。
+### 9.1 必须保留
 
-### 9.1 直接搬迁到 master(改动小)
+- 八协议链接与配置生成语义；golden 在 `master/testdata/`,由 `agent/boxctl` 喂给真 sing-box。
+- SQLite 线性迁移:`include_str!` + `PRAGMA user_version`,每版一事务。
+- 用户配额/到期/倍率、Telegram 阈值去重、订阅和只读统计页。
+- Reality、自签 TLS、Shadowsocks 服务端密钥只生成一次并持久化。
+- TUI 的显示宽度必须使用 `theme::{cols,pad,truncate}`,不能用 Rust 字符宽度。
 
-| 旧文件 | 行数 | 去向与改动 |
-|---|---|---|
-| `src/service/sub_service.rs` | 813 | → `master/src/service/sub_service.rs`。**8 协议链接生成全部保留**(vless-reality / vless-ws / vmess-ws / trojan / shadowsocks / hysteria2 / tuic / anytls)。唯一改动见 §10 |
-| `src/service/stats_html.rs` | 321 | → 原样 |
-| `src/service/tg_service.rs` | 2439 | → 原样(通知源改成读 `user_traffic_total` 视图) |
-| `src/service/sub_server.rs` | 333 | → 原样(这是 §2 里「订阅是例外」的那个 HTTP 监听) |
-| `src/db/mod.rs` | 167 | → 迁移框架照搬(`MIGRATIONS: &[&str]` of `include_str!`,每版一事务,`is_duplicate_column` 容错,池化前用独立连接跑完) |
-| `src/model/user.rs` | 116 | → `used_total_bytes` / `quota_bytes` / `quota_used_percent` / `is_expired` / `is_over_quota` / `format_bytes` 全部保留;`can_use_node(tag)` 改为查 `user_nodes` |
-| `src/model/node.rs` | 89 | → `Protocol` 枚举(9 变体含 Unknown)、`InboundNode`、`RelaySetting`、`EditNodeRequest`(None = 保持原样)全部保留;新增 `agent_id` 字段 |
-| `src/service/node_service.rs` | 278 | → 拆:`normalize_server_ip` + `detect()` + `default_user_name_for_inbound()` 留在 master;`get_server_ips()` 那套探测**搬到 agent(Go)** |
-| `src/model/config.rs` | 192 | → 分节 TOML + `#[serde(default)]` 的模式照搬,内容重写(见 §11) |
-| `src/tui/**` | ~4200 | → 布局与交互模式照搬;`pages/` 新增 `agents.rs`,`nodes.rs` 加 agent 归属列 |
-| `src/service/traffic_service.rs` | 221 | → `SyncState { alerted, runtime_sync_dirty }` 与 `alert_bucket(pct, alert_pct)` 的**去重语义**保留;数据来源从 gRPC 改为 `cluster/ingest.rs` |
-| `src/main.rs` | 1315 | → `traffic_supervisor()` 的 1→60s 退避、`SyncState` **在循环外**创建(使告警去重能跨重连存活)、`shutdown_flush()` on SIGTERM —— 三条语义全部保留,搬到 WS 连接管理上 |
-| `src/core/sysinfo.rs` | 136 | → **语义**移植到 `agent/sysinfo/`(Go)。Rust 版本不再需要 |
+### 9.2 明确移除且不得重新引入
 
-### 9.2 明确不搬(§0.3 已论证其消失)
+- V2Ray gRPC API、protobuf 与 `with_v2ray_api`；统计来自进程内 tracker。
+- 外部 sing-box 进程管理、内核安装/升级页与内核分发仓库。
+- fork / patch sing-box；CI 拒绝 `agent/go.mod` 的 `replace` 和 `agent/patches/`。
+- agent 管理 HTTP/gRPC 端口；agent 只主动连接主控 WebSocket。
 
-| 旧文件 | 行数 | 消失原因 |
-|---|---|---|
-| `src/core/grpc.rs` | 68 | 统计在 agent 进程内直接读内存(§7.1),无 gRPC |
-| `src/core/singbox.rs` | 810 | sing-box 内嵌进 agent,无外部进程管理 |
-| `src/core/config.rs` | 1333 | 配置由主控生成 `option.Options` 下发,不再有本机 `/etc/sing-box/config.json` 编辑逻辑 |
-| `src/tui/pages/kernel.rs` | 136 | 无内核安装/升级概念 |
-| `src/cli/kernel.rs` | 29 | 同上 |
-| `build.rs` + `proto/` | — | 无 protobuf |
-| `proto/v2ray_stats.proto` | — | 同上;不走 V2Ray API(§0.2) |
-| `.github/workflows/build-singbox.yml` | 199 | **不移植。** 不 fork sing-box,不自编译内核(§0.3 结论三);sing-box 版本就是 `agent/go.mod` 里的一行 |
-| `KernelConfig` / `kernel.update_repo`(在 `model/config.rs` 内) | — | 无内核分发仓库,无第二个版本号要追 |
-
-其中最后两条是**新增的删除项**,与旧项目「内核自编译 + 分发仓库」那条路线整体作废对应:
-`sync_v2ray_api_users`(在 `core/config.rs` 内,约 33 行)也随之消失——
-自己的 tracker 无条件对所有用户建账,不需要预先声明名单(§0.2 第 3 点)。
-
-对应地,master 的 `Cargo.toml` 相对旧项目删除:`tonic`、`prost`、整个 `[build-dependencies]` 段。
-新增:`tokio-tungstenite`(或 axum 自带 ws)、`rustls` 相关、`rcgen`(自签证书,§1.3)、`rand`、`sha2`。
-**不要引 `argon2`**——理由见 §8.1。
-
-### 9.3 旧项目留下的可复用事实
-
-- 旧项目二进制名 `sb`,版本 0.7.0,edition 2021,16225 行
-- 旧迁移文件序列:`001_init` / `002_allowed_nodes` / `003_sub_token` / `004_traffic_multiplier` / `005_telegram` / `006_auto_disabled` / `007_tg_bot_lease`
-- 旧默认路径:sing-box 配置 `/etc/sing-box/config.json`、二进制 `/etc/sing-box/bin/sing-box`、
-  gRPC `127.0.0.1:18080`、DB `/etc/sing-box/manager/manager.db`、订阅监听 `127.0.0.1:18081`、
-  nginx 片段 `/etc/nginx/conf.d/sb-manager.conf`
-- 旧默认值:`stats.sync_interval_secs = 30`、`quota_alert_percent = 80`、
-  Telegram `timezone = "Asia/Shanghai"`、`poll_interval_secs = 2`、`request_timeout_secs = 10`、
-  通知阈值 80/90/100、推送时刻 `["09:00", "21:30"]`
-- 旧项目有 65 个测试,**主要覆盖纯函数与 DB 语义,协议生成的回归面偏薄**——§12 要补的正是这个缺口
-
----
+因此 master 不依赖 `tonic`/`prost`,agent 只允许 `with_quic,with_utls` 两个 build tag。
 
 ## 10. 订阅导出
 
-复用旧 `sub_service.rs`(8 协议)。**唯一的改动**:
+节点地址来自 `agents.ipv4 / agents.ipv6`,保留中转覆盖与
+`use_public_base_as_server` 优先级链。
 
-节点地址来源从「本机公网 IP 探测」改为**读 `agents.ipv4` / `agents.ipv6`**。
+IPv6 必须按输出上下文处理:
+- URI authority 加方括号:`@[2001:db8::1]:443`；
+- Clash/Mihomo YAML 与 VMess JSON 的 `server/add/host` 使用不带框的裸地址。
 
-保留的东西:
-- 中转覆盖(`RelaySetting`)
-- `use_public_base_as_server` 的优先级链(旧 `resolve_export_server()` 的 4 步优先级)
-- `normalize_server_ip` 对 IPv6 字面量补方括号的处理(URL 场景必须补,否则订阅链接非法)
+方括号属于 URI 语法,不能在 endpoint 层提前写进地址。
 
 一个用户的订阅 = 它在 `user_nodes` 里的**全部节点,跨 agent 拼在一起**。
 
@@ -1163,81 +1079,24 @@ insecure    = false          # true 时允许 ws:// 明文
 
 ---
 
-## 12. 实施顺序
+## 12. 真实 sing-box 验证基线
 
-### 12.0 先做这个 spike(在写任何 sbx 代码之前)
+`spike/` 已在 sing-box v1.14.0-beta.3 上验证并进入 CI:
 
-> ✅ **已完成。** 代码在 `spike/`,在 sing-box **v1.14.0-beta.3** 上跑通,
-> 三条全部得到肯定结论,下面记录的是**实测结果**而不是待办。
-> 它是自断言的回归测试(全部通过才 exit 0),已进 CI:`cd spike && go run .`。
-> **改了 `agent/tracker` 就要同步改它**,否则验的不是同一份东西。
+1. per-user / inbound tag 流量真实到账,read=上行、write=下行；
+2. 禁用用户的新连接在毫秒级被拒,错误文本不泄露 quota/expire/ban 状态；
+3. inbound tag 来自 `md.Inbound`,不是协议名 `InboundType`；
+4. `include.Context()` 与 `AppendTracker` 的安装时序不可改变。
 
-一个**独立的 Go 程序**,不属于 sbx 工作区,只验三件事。
-
-```go
-ctx := include.Context(context.Background())
-b, _ := box.New(box.Options{Context: ctx, Options: 一个最小 vless inbound + direct outbound})
-b.Router().AppendTracker(tracker)
-b.Start()
-```
-
-1. **统计确实到账。** ✅ 用真客户端跑一条 vless 流量(上行 128 KiB、下行 2 MiB,
-   16:1 的不对称是刻意的——方向搞反必然失败而不是勉强通过),两个方向都记到了,
-   误差在 32 KiB 的握手开销以内。用户名与配置一致。
-   方向也定了:`NewInt64CounterConn(conn, read, write)` 的 **read 是上行、write 是下行**,
-   与上游 `service/ssmapi/traffic.go:116` 的用法一致。
-2. **`rejected(conn)` 的客户端观感。** ✅ 把用户加进 `disabled` 后再连,
-   **3ms 内**收到一次普通的连接中断。对错误文本做了泄漏扫描
-   (`disabl` / `quota` / `expire` / `ban` / `suspend` 五个词根),没有命中。
-   代价是拒绝发生在选定 outbound 之后,会浪费一次上游拨号——可接受。
-3. **`InboundContext` 上 inbound tag 的字段名与内容。** ✅ 字段名就是 `md.Inbound`,
-   填的是**配置里的 tag 字符串**(实测 `"vless-in"`)。
-   另有 `md.InboundType == "vless"`,那是协议名,不是 tag,不要用它记账。
-
-**第 2 条曾是本方案唯一没有实测过的环节**(§7.5)。实测通过,
-所以「禁用也走 box 重建」那条退路**不启用**;它仍然有效,留作 §7.5 触发条件成立时的备选。
-
-顺带在 spike 里确认了 `include.Context()` 注册的 inbound 覆盖面。
-**但 spike 只跑了 vless(无 TLS),没有覆盖到 build tag 这一项** ——
-真正的答案由 §9.1 的跨语言 golden 测试给出(`agent/boxctl` 把主控生成的八份配置
-喂给真 sing-box):
-
-> ⚠️ **agent 必须带 `-tags with_quic,with_utls` 构建。**
-> `with_utls` 是 reality 的依赖(缺了报 `uTLS, which is required by reality is not
-> included in this build`),`with_quic` 是 hysteria2 / tuic 的依赖。
-> 少了 tag 的失败时机很糟:配置已经下发,agent 在 `box.New` 才报错,
-> 主控保留旧 revision 并反复重试,表现成「加了节点但一直不生效」。
-> 所以 `agent/boxctl/buildtags.go` 里放了一个编译期哨兵 —— 漏 tag 直接编不出来。
->
-> **这两个就是允许的全部 tag。** 出现 `with_v2ray_api` 说明 §0.2 被误读了:
-> 流量统计走 ConnectionTracker,与 v2ray API 无关(§7.1)。
-
-`agent/boxctl` 的两个测试与 spike 分工不同,两边都要有:
-spike 验的是**流量记到没记到**(需要真实代理链路),`boxctl` 验的是**实例切换与回滚**
-(§7.4 的顺序:同端口热重载、Start 失败后回滚到旧配置,只需要端口),
-以及上面那份**跨语言配置契约**。
-
-### 12.1 主线
-
-1. `shared/` 协议 struct + `master/db` 迁移 + `model/`(搬旧代码)
-2. `master/cluster`:WS server、token 握手、registry、心跳、rpc 关联
-3. `agent/`:wsclient + sysinfo + 一个**只回假配置的 boxctl stub** → 先打通端到端链路
-4. `agent/boxctl` 真接入(`option.Options` + `box.New` + §7.4 的热重载顺序)+ `agent/tracker`(§7.1,spike 代码搬过来)
-5. `master/service`:traffic ingest(epoch/delta)、配额与到期自动化(走 `user.state`)、user ↔ node 分配
-6. `master/tui`:先 agents 页(两行式列表 + token 管理),再 users / nodes / dashboard
-7. `sub_service` / `tg_service` / `stats_html` 搬迁
-8. 打包:`release.yml` 出 master(musl × 2 arch)+ agent(Go × 2 arch),见 §11.1
-
-第 3 步的 stub 是刻意的:**在碰 sing-box 内嵌这个最大不确定性之前,先让 WS 链路可观测**。
-(§12.0 的 spike 已经把这个不确定性提前消化掉了,但 stub 仍然值得——它让 WS 链路的调试不受 box 干扰。)
-
----
+`agent/boxctl` 另行验证同端口热重载、失败回滚与八协议跨语言 golden。
+Reality 需要 `with_utls`,Hysteria2/TUIC 需要 `with_quic`;编译期哨兵阻止漏 tag。
+修改 `agent/tracker` 时必须同步修改并运行 `spike/`。
 
 ## 13. 验证方式
 
-### 13.1 单元测试(必须新增)
+### 13.1 单元测试契约
 
-旧项目 65 个测试**没有覆盖**下面这两块,而它们正是 sbx 的核心正确性所在:
+以下两块是 sbx 的核心正确性,必须持续保留:
 
 - **epoch / delta 增量算法**:喂三类输入 —— 正常递增、epoch 变更、`new < last` 回绕。
 - **跨 agent 求和视图**:造 2 个 agent × 3 个节点的数据,验证 `user_traffic_total` 的结果
@@ -1271,24 +1130,23 @@ spike 验的是**流量记到没记到**(需要真实代理链路),`boxctl` 验�
 顺带验到:agent 冷启动时先按 `last-applied.json` 把 box 拉起来再连主控(§4.1),
 订阅链接里的地址是 agent 自探到的公网 IP 而不是 `127.0.0.1`(§7.3)。
 
-### 13.4 两行式列表
+### 13.4 TUI 宽度与 Unicode
 
-窄终端(80 列)与宽终端各截一次图,与 `D:\Project\vibecoding\1.png` 对比。
-重点看:**IPv6 截断**、**渐变条在 quota 为 NULL / 50% / 100% 三态下的表现**。
+窄/宽终端均由 TestBackend 回归。重点覆盖:
+
+- 完整 39 字符 IPv6、IPv4/IPv6 中转与端口；
+- 中文 label/note 按终端显示列宽对齐；
+- quota NULL / 50% / 100% 的进度条；
+- 列宽总和不得越过边框,确实放不下时必须显示 `…` 或砍掉整列。
 
 ---
 
-## 14. 给下一个 session 的提醒
+## 14. 维护约束速查
 
-- `1.png` 在 `D:\Project\vibecoding\1.png`(工作区根目录,**不在** `singbox-manager` 里面)。
-- 旧项目 `D:\Project\vibecoding\singbox-manager` **只读**,不要改它。
-- §1 的三条决策(双许可 / 配置权威 / TOFU)是**默认选择,可推翻**,但推翻前请读它们各自的理由段。
-- §0 的四个 API 面结论是**已验证的**,不要重新论证,也不要基于「Clash API 应该能拿到流量」
-  或「用官方二进制更省事」重新设计 agent。
-- **本文档里原先只剩三处未经实测的地方,全部集中在 §12.0 的 spike**:
-  ① 统计是否到账、② `rejected(conn)` 的客户端观感、③ `InboundContext` 上 inbound tag 的字段名。
-  **三条已在 sing-box v1.14.0-beta.3 上实测通过**,结论写在 §12.0 / §7.1 / §7.5。
-  除此之外的技术论断都已读源码核实。**改 `agent/tracker` 时同步改 `spike/`。**
-- 记账口径是 **`(用户, inbound tag)` 二元组**,不是用户名。§7.1 / §4.3 / §6.1 三处必须一致。
-- **`config_revision` 与 `user_state_revision` 是两个独立的计数器**,握手时分别比对(§4.1)。
-  把它们合并会造成两种 bug 之一:离线期间的禁用永久失效,或高频路径退化成全量 box 重建。
+- §1 的双许可 / 配置权威 / TOFU 是默认架构,调整前必须更新理由与部署流程。
+- 记账键是 `(用户, inbound tag)`,不是用户名。
+- `config_revision` 与 `user_state_revision` 独立:前者重建 box,后者只更新内存名单。
+- 改 `agent/tracker` 同步改 `spike/`;改主控配置生成同步改 golden。
+- URI 与结构化订阅的 IPv6 形状不同,不能共享带框后的 host。
+- TUI 中文宽度使用 `theme::cols/pad/truncate`,不得用 `format!("{:<n}")` 对齐。
+- 发布前 tag、Cargo 版本、CHANGELOG 标题必须一致,并等待 CI 全绿。

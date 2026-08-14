@@ -840,7 +840,10 @@ fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
     let widest = p
         .items
         .iter()
-        .map(|i| theme::cols(&i.label).min(24) + theme::cols(&i.note) + 10)
+        // 标签渲染**固定占 24 个显示列**(见下面的 `theme::pad`),
+        // 不能用原始 label 的宽度估算 —— `Dmit-面包云` 原始只有 14 列,
+        // 但实际会占满 24 列,少算的 10 列正好把 note 的尾巴截掉。
+        .map(|i| 24 + theme::cols(&i.note) + 10)
         .max()
         .unwrap_or(0);
     let w = (widest as u16)
@@ -876,14 +879,20 @@ fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
                 Style::default().fg(if it.checked { theme::ONLINE } else { theme::DIM }),
             ),
             Span::styled(
-                format!("{:<24}", theme::truncate(&it.label, 24)),
+                // Rust 的 `format!("{:<24}")` 按字符数补,不是按终端显示列补。
+                // `面包云` 是 3 个 Rust 字符但占 6 列,会把右侧 note 推出去
+                // 3 列 —— 正是「在 面」只剩半截的来源。`theme::pad` 按显示列宽补。
+                theme::pad(&it.label, 24),
                 if sel {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 },
             ),
-            Span::styled(it.note.clone(), Style::default().fg(theme::DIM)),
+            Span::styled(
+                theme::truncate(&it.note, (w as usize).saturating_sub(2 + 3 + 4 + 24)),
+                Style::default().fg(theme::DIM),
+            ),
         ]));
     }
     lines.push(Line::from(""));
@@ -1000,6 +1009,30 @@ mod render_preview {
             .collect::<Vec<_>>()
             .join("
 ")
+    }
+
+    /// 中文标签要按**显示列宽**补齐,不能按 Rust 字符数补。
+    ///
+    /// 现场的 `Dmit-面包云` 含 3 个中文字符:Rust 看是 3 字符,终端看是 6 列。
+    /// 用 `format!("{:<24}")` 会多补 3 格,把右侧说明推出弹窗,
+    /// 最终「在 面包云 上」只剩「在 面」。
+    #[test]
+    fn picker_keeps_the_full_agent_name_after_a_cjk_label() {
+        let m = Modal::Picker(Picker::new(
+            "分配节点",
+            "用户 admin(勾上的就是这个用户能用的节点)",
+            vec![PickItem {
+                id: 1,
+                label: "Dmit-面包云".into(),
+                note: "vless-reality · :30652 · 在 面包云 上".into(),
+                checked: true,
+            }],
+            Box::new(|_| Action::Refresh),
+        ));
+        let out = draw(145, 12, &m);
+        let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("Dmit-面包云"), "节点名该完整显示:\n{out}");
+        assert!(flat.contains("在面包云上"), "所属 agent 名该完整显示:\n{out}");
     }
 
     /// `cargo test render_preview::token -- --nocapture` 看一眼长什么样。
