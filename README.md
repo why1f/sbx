@@ -127,7 +127,7 @@ curl -fsSL .../install.sh | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' S
 ## 已经能跑的东西
 
 ```sh
-cargo test                      # 506 个测试
+cargo test                      # 507 个测试
 cargo build --release           # 产物 target/release/sbx
 
 # 装完起不来?先跑自检 —— 二进制/配置/数据库/systemd/证书/端口逐项过一遍,

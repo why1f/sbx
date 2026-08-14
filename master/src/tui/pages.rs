@@ -724,12 +724,12 @@ const PCT_LABEL_COLS: u16 = 6;
 /// 窄屏回退时,「每月 22 日重置」跟在百分比后面要占的地方(中文按两列算)。
 const RESET_LABEL_COLS: u16 = 15;
 
-/// 完整 IPv6 的最大显示宽度:8 组 4 位十六进制 + 7 个冒号 = 39。
+/// 完整 IPv6 的最大**列宽**:39 个内容字符 + 1 格列内留白 = 40。
 ///
-/// **IP 那一列必须按它算,不能按 IPv4 的 15 算** —— 两个地址是上下两行
-/// 共用同一列的。早先给 22,于是 `2605:52c0:2:3525:505…` 被从**尾巴**截掉,
-/// 而尾部恰恰是主机位:同一个 /64 下的两台机器,截完长得一模一样。
-const IPV6_COLS: u16 = 39;
+/// 渲染处会用 `c.ip - 1` 给相邻列留一格。这里若写 39,实际只能显示 38 个
+/// 地址字符 —— 于是一个八组全是四位的 IPv6 会从尾部少两个字符(最后一格
+/// 被省略号占掉)。这正是 `...:febb:5a…` 的来源。
+const IPV6_COLS: u16 = 40;
 
 fn columns(total_width: u16) -> Cols {
     // 减掉左右边框(2),以及 ratatui 在各列之间插的间隔(五列 = 四个;
@@ -1037,34 +1037,54 @@ fn ncol_width(c: NCol) -> u16 {
     }
 }
 
-/// 中转落点撑到头要多少列:`→ ` 两列 + `[完整IPv6]` 41 列 + `:65535` 6 列。
-/// 域名落点通常 20~30 列,也在这个数以内。
-const RELAY_MAX: u16 = 49;
-/// SNI / path 撑到头要多少列。域名一般 ≤30,path 可以更长,但再宽就该去
-/// 「操作」那一行看完整值了 —— 这一列是用来扫的,不是用来读全文的。
-const PARAM_MAX: u16 = 40;
+/// 中转落点撑到头要多少**列宽**:`→ ` 两列 + `[完整IPv6]` 41 列 +
+/// `:65535` 6 列 + 1 格列内留白 = 50。
+const RELAY_MAX: u16 = 50;
+/// SNI / path 的最大列宽(含一格列内留白)。
+const PARAM_MAX: u16 = 41;
 
-/// 各列的实际宽度:常规宽度 + **把右边剩下的余量补给最容易被截的两列**。
+/// 当前数据真正需要的中转列宽。
 ///
-/// 表格末尾挂着一个 `Constraint::Min(0)` 的空列,余量原本全被它吃掉 ——
-/// 于是宽屏上「中转」被截成 `→ 64.186.234.7:4…`(落点端口看不见,而那正是
-/// 这一列的用处),右边却空着三十几列。和 v0.4.11 修 IP 列是同一个形状。
-///
-/// 先补中转再补 SNI:中转被截掉的是**端口号**,而 SNI 被截掉的是域名尾部,
-/// 前者更致命 —— 一个看不见端口的落点等于没显示。
-fn ncol_widths(cols: &[NCol], total: u16) -> Vec<u16> {
-    let mut w: Vec<u16> = cols.iter().map(|c| ncol_width(*c)).collect();
+/// - 全是 `—`:标题 4 列 + 留白 = 5,导出就紧跟过来;
+/// - IPv4/域名:只给实际文本所需的宽度;
+/// - IPv6:最多撑到 `RELAY_MAX`,这时才保留原先那段大空间。
+fn relay_need(rows: &[NodeRow]) -> u16 {
+    rows.iter()
+        .filter_map(relay_label)
+        .map(|s| (theme::cols(&format!("→ {s}")) + 1) as u16)
+        .max()
+        .unwrap_or(5)
+        .clamp(5, RELAY_MAX)
+}
+
+fn param_need(rows: &[NodeRow]) -> u16 {
+    rows.iter()
+        .map(|n| (theme::cols(&node_param(n)) + 1) as u16)
+        .max()
+        .unwrap_or(11)
+        .clamp(ncol_width(NCol::Param), PARAM_MAX)
+}
+
+/// 各列的实际宽度。中转列先按内容**收窄**,再只在确实需要时吃余量。
+fn ncol_widths(cols: &[NCol], total: u16, relay_want: u16, param_want: u16) -> Vec<u16> {
+    let mut w: Vec<u16> = cols
+        .iter()
+        .map(|c| match c {
+            // 先允许缩到内容宽度。没有中转时从 18 收到 5,导出列自然贴过来。
+            NCol::Relay => ncol_width(*c).min(relay_want),
+            _ => ncol_width(*c),
+        })
+        .collect();
     let sum: u16 = w.iter().sum();
-    // 与 `pick` 的可用宽度算法逐字一致:列间隔 = 列数(含末尾空列),边框 2。
-    // 两处不一致的话,补出来的宽度会把总宽撑过边框,ratatui 会静默压缩各列(§13.4)。
     let mut spare = total.saturating_sub(sum + cols.len() as u16 + 2);
 
-    for (target, cap) in [(NCol::Relay, RELAY_MAX), (NCol::Param, PARAM_MAX)] {
+    // 有 IPv4 时通常只补到 20~22;有 IPv6 时才继续扩到当前终端能给的宽度。
+    for (target, want) in [(NCol::Relay, relay_want), (NCol::Param, param_want)] {
         if spare == 0 {
             break;
         }
         if let Some(i) = cols.iter().position(|c| *c == target) {
-            let add = spare.min(cap.saturating_sub(w[i]));
+            let add = spare.min(want.saturating_sub(w[i]));
             w[i] += add;
             spare -= add;
         }
@@ -1108,9 +1128,9 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
     let c = [area];
 
     let cols = pick(c[0].width, &NCOL_ALL, ncol_width, &NCOL_DROP);
-    // 实际宽度可能比常规宽度宽(余量补给了中转 / SNI)。**截断必须按它来** ——
-    // 按常规宽度截的话,列撑宽了而内容还是短的,等于白撑。
-    let widths = ncol_widths(&cols, c[0].width);
+    let relay_want = relay_need(rows);
+    let param_want = param_need(rows);
+    let widths = ncol_widths(&cols, c[0].width, relay_want, param_want);
     let cell_w = |col: NCol| {
         cols.iter().position(|c| *c == col).map_or(0, |i| widths[i]).saturating_sub(1) as usize
     };
@@ -1180,10 +1200,15 @@ pub fn relay_label(n: &NodeRow) -> Option<String> {
     if !n.params.relay.is_enabled() {
         return None;
     }
-    Some(match n.params.relay.port {
-        Some(p) => format!("{}:{}", n.params.relay.host, p),
-        None => format!("{}:{}", n.params.relay.host, n.listen_port),
-    })
+    let host = &n.params.relay.host;
+    // IPv6 与端口拼在一起必须加方括号,否则
+    // `2600:...:5ad5:40000` 根本分不出哪一段是地址、哪一段是端口。
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.clone(),
+    };
+    let port = n.params.relay.port.map(i64::from).unwrap_or(n.listen_port);
+    Some(format!("{host}:{port}"))
 }
 
 // ─────────────────────────── users ───────────────────────────
@@ -1809,13 +1834,44 @@ mod tests {
         }
     }
 
+    /// 「中转」到「导出」的距离要跟内容走,不能一律为最长 IPv6 预留。
+    #[test]
+    fn relay_column_width_follows_the_actual_address_family() {
+        let cols = NCOL_ALL.to_vec();
+        let relay_i = cols.iter().position(|c| *c == NCol::Relay).unwrap();
+
+        let none = vec![node()];
+        let none_w = super::ncol_widths(&cols, 200, super::relay_need(&none), PARAM_MAX)[relay_i];
+        assert_eq!(none_w, 5, "没有中转时只留得下标题和破折号即可");
+
+        let mut v4 = node();
+        v4.params.relay = crate::model::node::RelaySetting {
+            host: "64.186.234.7".into(),
+            port: Some(40000),
+        };
+        let v4 = vec![v4];
+        let v4_w = super::ncol_widths(&cols, 200, super::relay_need(&v4), PARAM_MAX)[relay_i];
+
+        let mut v6 = node();
+        v6.params.relay = crate::model::node::RelaySetting {
+            host: "2600:1700:3a90:c620:be24:11ff:febb:5ad5".into(),
+            port: Some(40000),
+        };
+        let v6 = vec![v6];
+        let v6_w = super::ncol_widths(&cols, 200, super::relay_need(&v6), PARAM_MAX)[relay_i];
+
+        assert!(none_w < v4_w && v4_w < v6_w, "该随内容增长:none={none_w},v4={v4_w},v6={v6_w}");
+        assert_eq!(super::relay_label(&v6[0]).as_deref(), Some("[2600:1700:3a90:c620:be24:11ff:febb:5ad5]:40000"),
+            "IPv6 与端口拼接必须加方括号");
+    }
+
     /// 补宽度**不能把总宽撑过边框**。撑过去 ratatui 会静默压缩各列,
     /// 那正是 §13.4 要防的那种「看起来正常、其实每列都少了一格」。
     #[test]
     fn widening_a_column_never_overflows_the_table() {
         for w in [60u16, 90, 120, 140, 160, 200, 300] {
             let cols = super::pick(w, &NCOL_ALL, super::ncol_width, &NCOL_DROP);
-            let widths = super::ncol_widths(&cols, w);
+            let widths = super::ncol_widths(&cols, w, RELAY_MAX, PARAM_MAX);
             let total: u16 = widths.iter().sum::<u16>() + cols.len() as u16 + 2;
             assert!(total <= w, "{w} 列:补完宽度后总宽 {total} 超了");
         }
@@ -1865,9 +1921,13 @@ mod tests {
     }
 
     /// 理论最长的 IPv6 在足够宽的终端上也要完整显示。
+    /// 这条用的是现场触发 bug 的地址:八组全是四位,**正好 39 个字符**。
+    /// 早先列宽虽写 39,渲染却会减一格做留白,实际只给地址 38 格,
+    /// 因而显示成 `...:febb:5a…`,最后两个字符永远看不到。
     #[test]
     fn the_longest_possible_ipv6_fits_on_a_wide_terminal() {
-        const MAX: &str = "2605:52c0:2:3525:aaaa:bbbb:cccc:dddd";
+        const MAX: &str = "2600:1700:3a90:c620:be24:11ff:febb:5ad5";
+        assert_eq!(MAX.len(), 39, "这条回归必须真的是理论最长形式");
         let mut a = agent(None, None);
         a.ipv6 = Some(MAX.into());
         let out = draw_to_string(170, 12, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
