@@ -2,6 +2,7 @@ package sysinfo
 
 import (
 	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -160,5 +161,73 @@ func TestFailedProbeIsNegativelyCached(t *testing.T) {
 	}
 	if fetched.IsZero() {
 		t.Error("失败也要记时间戳,否则下次调用又会重试一轮")
+	}
+}
+
+// isGloballyRoutable 挡掉的每一类都有具体后果:这些地址写进 agents.ipv4/ipv6
+// 就成了订阅链接里的死地址,而主控那边 COALESCE 会用它冲掉管理员手填的正确值。
+func TestOnlyGloballyRoutableAddressesAreReported(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+		why  string
+	}{
+		// 这台机器实际的两个地址,都该算数。
+		{"2600:1700:3a90:c620:be24:11ff:febb:5ad5", true, "SLAAC 出来的全球 v6"},
+		{"2a06:9801:1e::1c1", true, "另一段的全球 v6"},
+		{"76.9.111.80", true, "公网 v4"},
+
+		{"fe80::be24:11ff:febb:5ad5", false, "链路本地只在同网段有意义"},
+		{"fc00::1", false, "ULA 是 v6 的内网段"},
+		{"fd12:3456::1", false, "ULA 的另一半(fd00::/8)"},
+		{"::1", false, "回环"},
+		{"::", false, "未指定"},
+		{"ff02::1", false, "组播"},
+
+		{"10.0.0.5", false, "RFC1918"},
+		{"172.16.0.1", false, "RFC1918 下界"},
+		{"172.31.255.254", false, "RFC1918 上界"},
+		{"172.32.0.1", true, "172.32 已经出了 RFC1918"},
+		{"192.168.1.1", false, "RFC1918"},
+		{"100.64.0.1", false, "CGNAT:看着像公网,外面连不进来"},
+		{"100.127.255.255", false, "CGNAT 上界"},
+		{"100.128.0.1", true, "100.128 已经出了 CGNAT"},
+		{"127.0.0.1", false, "回环"},
+		{"169.254.1.1", false, "v4 链路本地"},
+	}
+	for _, c := range cases {
+		ip := net.ParseIP(c.ip)
+		if ip == nil {
+			t.Fatalf("测试用例里的地址解析不了: %s", c.ip)
+		}
+		if got := isGloballyRoutable(ip); got != c.want {
+			t.Errorf("isGloballyRoutable(%s) = %v, 想要 %v —— %s", c.ip, got, c.want, c.why)
+		}
+	}
+}
+
+// 本机源地址那条路**不发包也不依赖外部服务**,所以它必须是瞬时的。
+//
+// 这正是它存在的理由:原先只有 HTTP 探测一条路,超时 3 秒,碰上响应慢的
+// endpoint 就两个连着超时 —— 一台明明有全球 IPv6 的机器界面上一直是空的。
+func TestLocalSourceIPDoesNotBlock(t *testing.T) {
+	start := time.Now()
+	for _, network := range []string{"udp4", "udp6"} {
+		got := localSourceIP(network)
+		// 返回什么取决于跑测试的这台机器有没有对应的默认路由,两种都合法;
+		// 但**只要返回了就必须是全球可达地址**。
+		if got != nil {
+			ip := net.ParseIP(*got)
+			if ip == nil {
+				t.Fatalf("%s 返回了解析不了的地址: %q", network, *got)
+			}
+			if !isGloballyRoutable(ip) {
+				t.Errorf("%s 返回了不该报的地址 %s", network, *got)
+			}
+		}
+	}
+	// 两路加起来远不该到一秒 —— 它只做路由查找,不发包。
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("本机源地址查询耗时 %v,它不该阻塞", d)
 	}
 }

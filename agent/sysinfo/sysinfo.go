@@ -83,12 +83,17 @@ type Collector struct {
 
 func NewCollector() *Collector {
 	return &Collector{
-		v4Endpoints: []string{"https://api4.ipify.org", "https://ifconfig.me/ip"},
-		v6Endpoints: []string{"https://api6.ipify.org", "https://ifconfig.me/ip"},
+		// 顺序就是优先级,第一个成功的即采用。ip.sb 排前面是实测的结果:
+		// 同一台机器上 ipify 要等好几秒(v6 到那家的路由绕),ip.sb 立刻就回。
+		// **两个就够了** —— 这一步在拨号之前跑,每多一个 endpoint 就多 3 秒
+		// 最坏延迟,而 v6 现在还有本机源地址那条瞬时路兜着。
+		v4Endpoints: []string{"https://api.ip.sb/ip", "https://api4.ipify.org"},
+		v6Endpoints: []string{"https://api.ip.sb/ip", "https://api6.ipify.org"},
 	}
 }
 
-// SetEndpoints 覆盖自探地址。传 nil 表示**不探测那一路**,直接报 nil。
+// SetEndpoints 覆盖自探地址。传 nil 表示**不探测那一路**,直接报 nil ——
+// 连本机源地址那条路也一并关掉(单测靠这个完全不碰网络栈)。
 func (c *Collector) SetEndpoints(v4, v6 []string) {
 	c.ipMu.Lock()
 	defer c.ipMu.Unlock()
@@ -373,10 +378,27 @@ func (c *Collector) PublicIPs(ctx context.Context) (*string, *string) {
 	go func() {
 		defer wg.Done()
 		v4 = probe(ctx, "tcp4", v4eps)
+		// v4 只在 HTTP 探测**全部失败**时才看本机源地址,而且必须是公网地址。
+		// NAT 后面选出来的是 10.x,那个值写进订阅是死地址 —— 所以顺序不能反。
+		if v4 == nil && len(v4eps) > 0 {
+			v4 = localSourceIP("udp4")
+		}
 	}()
 	go func() {
 		defer wg.Done()
-		v6 = probe(ctx, "tcp6", v6eps)
+		// **v6 先问内核。** 没有 NAT,内核为出网选的源地址就是这台机器的公网身份,
+		// 而且这一步是瞬时的、不依赖任何外部服务。
+		//
+		// 原先只有 HTTP 探测那一条路,超时 3 秒:碰上 api6.ipify.org 响应慢的
+		// 机器(线路绕、v6 到那家的路由差),两个 endpoint 连着超时,
+		// 于是一台**明明有全球 IPv6、也能出网**的机器在界面上一直是空的。
+		if len(v6eps) > 0 {
+			v6 = localSourceIP("udp6")
+		}
+		// 内核给不出全球地址时(没有 v6 默认路由、或者只有 ULA)再去问外面。
+		if v6 == nil {
+			v6 = probe(ctx, "tcp6", v6eps)
+		}
 	}()
 	wg.Wait()
 
@@ -433,4 +455,66 @@ func probe(ctx context.Context, network string, endpoints []string) *string {
 		return &s
 	}
 	return nil
+}
+
+// localSourceIP 问内核:「要去外网的话,你会用哪个源地址?」
+//
+// **不发任何数据包。** `net.Dial` 对 UDP 只做路由查找 + 源地址选择
+// (RFC 6724),然后就有了 LocalAddr。所以它是**瞬时**的,没有超时可言,
+// 也不依赖任何外部服务可达。
+//
+// **IPv6 用它是准确的,因为 v6 没有 NAT** —— 内核选出来的源地址就是这台机器
+// 在公网上的身份。IPv4 则不然:NAT 后面选出来的是 10.x/192.168.x,
+// 那个值写进订阅链接是死地址,所以 v4 只把它当**最后兜底**,而且必须先过
+// `isGloballyRoutable`。
+//
+// 目标地址随便挑一个公网地址即可(这里用 Google DNS),它不会被联系到。
+func localSourceIP(network string) *string {
+	target := "[2001:4860:4860::8888]:53"
+	if network == "udp4" {
+		target = "8.8.8.8:53"
+	}
+	conn, err := net.Dial(network, target)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP == nil {
+		return nil
+	}
+	if !isGloballyRoutable(addr.IP) {
+		return nil
+	}
+	s := addr.IP.String()
+	return &s
+}
+
+// isGloballyRoutable 判断这个地址能不能被公网上的别人连到。
+//
+// 挡掉的每一类都有具体后果:私有地址 / CGNAT 写进订阅是死地址;
+// 链路本地(fe80::)只在同一网段有意义;ULA(fc00::/7)是 v6 的「内网段」;
+// 回环和未指定地址更不用说。**这些值宁可不报** —— 主控那边
+// `COALESCE(?, ipv4)` 会保留库里已有的(可能是管理员手填的正确地址),
+// 而报一个错的会把它冲掉。
+func isGloballyRoutable(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		// RFC 1918 私有段 + RFC 6598 CGNAT(100.64.0.0/10)。
+		// CGNAT 尤其要挡:运营商 NAT 后面的机器拿到的就是这一段,
+		// 看起来像公网地址,实际上外面连不进来。
+		if v4[0] == 10 ||
+			(v4[0] == 172 && v4[1]&0xf0 == 16) ||
+			(v4[0] == 192 && v4[1] == 168) ||
+			(v4[0] == 100 && v4[1]&0xc0 == 64) {
+			return false
+		}
+		return true
+	}
+	// ULA:fc00::/7。
+	return ip[0]&0xfe != 0xfc
 }

@@ -1037,6 +1037,41 @@ fn ncol_width(c: NCol) -> u16 {
     }
 }
 
+/// 中转落点撑到头要多少列:`→ ` 两列 + `[完整IPv6]` 41 列 + `:65535` 6 列。
+/// 域名落点通常 20~30 列,也在这个数以内。
+const RELAY_MAX: u16 = 49;
+/// SNI / path 撑到头要多少列。域名一般 ≤30,path 可以更长,但再宽就该去
+/// 「操作」那一行看完整值了 —— 这一列是用来扫的,不是用来读全文的。
+const PARAM_MAX: u16 = 40;
+
+/// 各列的实际宽度:常规宽度 + **把右边剩下的余量补给最容易被截的两列**。
+///
+/// 表格末尾挂着一个 `Constraint::Min(0)` 的空列,余量原本全被它吃掉 ——
+/// 于是宽屏上「中转」被截成 `→ 64.186.234.7:4…`(落点端口看不见,而那正是
+/// 这一列的用处),右边却空着三十几列。和 v0.4.11 修 IP 列是同一个形状。
+///
+/// 先补中转再补 SNI:中转被截掉的是**端口号**,而 SNI 被截掉的是域名尾部,
+/// 前者更致命 —— 一个看不见端口的落点等于没显示。
+fn ncol_widths(cols: &[NCol], total: u16) -> Vec<u16> {
+    let mut w: Vec<u16> = cols.iter().map(|c| ncol_width(*c)).collect();
+    let sum: u16 = w.iter().sum();
+    // 与 `pick` 的可用宽度算法逐字一致:列间隔 = 列数(含末尾空列),边框 2。
+    // 两处不一致的话,补出来的宽度会把总宽撑过边框,ratatui 会静默压缩各列(§13.4)。
+    let mut spare = total.saturating_sub(sum + cols.len() as u16 + 2);
+
+    for (target, cap) in [(NCol::Relay, RELAY_MAX), (NCol::Param, PARAM_MAX)] {
+        if spare == 0 {
+            break;
+        }
+        if let Some(i) = cols.iter().position(|c| *c == target) {
+            let add = spare.min(cap.saturating_sub(w[i]));
+            w[i] += add;
+            spare -= add;
+        }
+    }
+    w
+}
+
 fn ncol_title(c: NCol) -> &'static str {
     match c {
         NCol::Id => "#",
@@ -1073,6 +1108,12 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
     let c = [area];
 
     let cols = pick(c[0].width, &NCOL_ALL, ncol_width, &NCOL_DROP);
+    // 实际宽度可能比常规宽度宽(余量补给了中转 / SNI)。**截断必须按它来** ——
+    // 按常规宽度截的话,列撑宽了而内容还是短的,等于白撑。
+    let widths = ncol_widths(&cols, c[0].width);
+    let cell_w = |col: NCol| {
+        cols.iter().position(|c| *c == col).map_or(0, |i| widths[i]).saturating_sub(1) as usize
+    };
     let table_rows: Vec<Row> = rows
         .iter()
         .enumerate()
@@ -1086,10 +1127,12 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
                     NCol::Proto => Cell::from(n.protocol.clone()),
                     NCol::Port => Cell::from(n.listen_port.to_string()),
                     NCol::Users => Cell::from(n.user_count.to_string()),
-                    NCol::Param => Cell::from(theme::truncate(&node_param(n), 21)),
+                    NCol::Param => Cell::from(theme::truncate(&node_param(n), cell_w(NCol::Param))),
                     NCol::Relay => match relay_label(n) {
-                        Some(l) => Cell::from(theme::truncate(&format!("→ {l}"), 17))
-                            .style(Style::default().fg(theme::DOWN)),
+                        Some(l) => {
+                            Cell::from(theme::truncate(&format!("→ {l}"), cell_w(NCol::Relay)))
+                                .style(Style::default().fg(theme::DOWN))
+                        }
                         None => Cell::from("—").style(Style::default().fg(theme::DIM)),
                     },
                     NCol::Export => {
@@ -1106,9 +1149,9 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
         })
         .collect();
 
-    let constraints: Vec<Constraint> = cols
+    let constraints: Vec<Constraint> = widths
         .iter()
-        .map(|c| Constraint::Length(ncol_width(*c)))
+        .map(|w| Constraint::Length(*w))
         .chain(std::iter::once(Constraint::Min(0)))
         .collect();
     let titles: Vec<&str> = cols.iter().map(|c| ncol_title(*c)).chain(std::iter::once("")).collect();
@@ -1742,6 +1785,60 @@ mod tests {
         a.down_per_sec = None;
         let out = render_agents(&[a]);
         assert!(out.contains("↑ --") && out.contains("↓ --"), "{out}");
+    }
+
+    /// **宽屏上「中转」落点要完整显示 —— 尤其是端口。**
+    ///
+    /// 这一列原本写死 18 列,而 `→ 64.186.234.7:40000` 要 20 列,于是被截成
+    /// `→ 64.186.234.7:4…` —— 截掉的恰恰是**端口号**,而中转落点的用处
+    /// 就是「打到哪个地址的哪个端口」。少了端口这一列基本等于没显示。
+    /// 而那时表格右边还空着三十几列(余量全被末尾那个 `Min(0)` 空列吃掉了)。
+    #[test]
+    fn a_relay_target_keeps_its_port_on_a_wide_terminal() {
+        let mut n = node();
+        n.params.relay = crate::model::node::RelaySetting {
+            host: "64.186.234.7".into(),
+            port: Some(40000),
+        };
+        for w in [140, 160, 200] {
+            let out = draw_to_string(w, 10, |f| nodes(f, f.area(), &[n.clone()], 0));
+            assert!(
+                out.contains("64.186.234.7:40000"),
+                "{w} 列上中转落点该完整显示(含端口):\n{out}"
+            );
+        }
+    }
+
+    /// 补宽度**不能把总宽撑过边框**。撑过去 ratatui 会静默压缩各列,
+    /// 那正是 §13.4 要防的那种「看起来正常、其实每列都少了一格」。
+    #[test]
+    fn widening_a_column_never_overflows_the_table() {
+        for w in [60u16, 90, 120, 140, 160, 200, 300] {
+            let cols = super::pick(w, &NCOL_ALL, super::ncol_width, &NCOL_DROP);
+            let widths = super::ncol_widths(&cols, w);
+            let total: u16 = widths.iter().sum::<u16>() + cols.len() as u16 + 2;
+            assert!(total <= w, "{w} 列:补完宽度后总宽 {total} 超了");
+        }
+    }
+
+    /// 宽度不够时仍然截断,而且**看得出来被截了**(§13.4 防的是静默截断)。
+    ///
+    /// 120 列是刻意挑的:九列的常规宽度加间隔边框正好 119,所以这个宽度上
+    /// 中转列**还在**、但只多出一列余量。再窄一点它会被整列砍掉
+    /// (`NCOL_DROP` 里它排第二),那就没有截断可看了。
+    #[test]
+    fn a_relay_target_is_visibly_truncated_when_narrow() {
+        let mut n = node();
+        n.params.relay = crate::model::node::RelaySetting {
+            host: "a-very-long-relay-hostname.example.com".into(),
+            port: Some(40000),
+        };
+        let out = draw_to_string(120, 10, |f| nodes(f, f.area(), &[n.clone()], 0));
+        // 断内容而不是断表头:`draw_to_string` 是逐格取字符的,宽字符第二格
+        // 是空白 —— 表头「中转」提取出来是「中 转」。那是取字方式的产物,
+        // 不是渲染问题,拿它做断言只会得到一条误导人的失败。
+        assert!(out.contains("a-very-long"), "这个宽度上中转列该还在:\n{out}");
+        assert!(out.contains('…'), "放不下时要带省略号:\n{out}");
     }
 
     /// **宽屏上 IPv6 要完整显示,一个字符都不能少。**
