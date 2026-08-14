@@ -4,6 +4,38 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.17
+
+### 修
+
+- **Shadowsocks AEAD-2022 订阅链接出现两层 Base64。**
+
+  外层订阅 Base64 是正常的:订阅响应是多条分享链接组成的文本,整体编码后由客户端解码。
+  但 `ss://` 内部原先又把 `method:password` 整段做了一次 Base64,形成：
+
+  ```text
+  ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206...
+  ```
+
+  当前默认加密方式是 `2022-blake3-aes-128-gcm`。按照 SIP002,AEAD-2022 的 userinfo
+  必须保持明文结构,不能再套 Base64。现在改为 `method:password` 原文结构,
+  method 与 password 分别按 URI 规则 percent-encode；password 内部的
+  「服务端密钥:用户密钥」分隔符也会编码为 `%3A`。
+
+  正确形状:
+
+  ```text
+  ss://2022-blake3-aes-128-gcm:服务端密钥%3A用户密钥@[IPv6]:30652#节点名
+  ```
+
+  外层订阅 Base64 保持不变,分享 URI 的 IPv6 方括号也保持不变。
+
+### 测试
+
+- Shadowsocks 2022 链接回归改为验证明文 percent-encoded userinfo;
+- 继续确认服务端密钥与用户密钥两部分都存在;
+- 确认 `ss://` userinfo 不再以 Base64 内容开头。
+
 ## v0.4.16
 
 ### 修

@@ -318,11 +318,21 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
             let method = param(p, |x| x.ss_method.as_ref())
                 .unwrap_or_else(|| crate::secrets::SS_DEFAULT_METHOD.to_string());
             let psk = param(p, |x| x.ss_password.as_ref())?;
-            // 2022 系列:服务端密钥和用户密钥用冒号拼起来一起给客户端。
+            // AEAD-2022 的 SIP002 userinfo **不得再做 Base64**。
+            //
+            // 外层订阅本身仍是 Base64(一组分享链接的传输格式),那一层是正常的;
+            // 但 `ss://` 里面的 2022 userinfo 必须是明文 `method:password`,
+            // 两部分各自 percent-encode。password 里「服务端密钥:用户密钥」的冒号
+            // 会变成 `%3A`,避免被误读成 method/password 的分隔符。
+            //
+            // 旧写法把整段再用 STANDARD Base64 编一次,形成“两层解码”,而且含
+            // `+` `/` `=` 这些非 URL-safe 字符。部分客户端宽容接受,但它不符合
+            // AEAD-2022 的 SIP002 规则。
             let pw = format!("{}:{}", psk, crate::secrets::ss_user_password(&u.uuid));
             Some(format!(
-                "ss://{}@{}:{}#{}",
-                STANDARD.encode(format!("{method}:{pw}")),
+                "ss://{}:{}@{}:{}#{}",
+                enc(&method),
+                enc(&pw),
                 authority,
                 port,
                 tag
@@ -843,21 +853,23 @@ mod tests {
         assert!(!link.ends_with("东京 #1"), "tag 没编码: {link}");
     }
 
-    /// shadowsocks 2022:服务端密钥和用户密钥要一起交给客户端(冒号拼接),
-    /// 少了任何一半都连不上。
+    /// Shadowsocks 2022 的 SIP002 userinfo 是明文 percent-encoded,
+    /// **不是**再套一层 Base64。外层订阅 Base64 与这一层是两个不同的东西。
     #[test]
-    fn shadowsocks_link_carries_both_keys() {
+    fn shadowsocks_2022_link_uses_plain_percent_encoded_userinfo() {
         let n = node(Protocol::Shadowsocks);
         let link = &generate_links(&user(), std::slice::from_ref(&n), &opts())[0].link;
-        let b64 = link.trim_start_matches("ss://").split('@').next().unwrap();
-        let decoded = String::from_utf8(STANDARD.decode(b64).unwrap()).unwrap();
+        let userinfo = link.trim_start_matches("ss://").split('@').next().unwrap();
+        let (method, encoded_pw) = userinfo.split_once(':').expect("userinfo 该有 method:password");
+        let decoded_pw = urlencoding::decode(encoded_pw).unwrap();
         let psk = n.params.ss_password.clone().unwrap();
-        assert!(decoded.starts_with(crate::secrets::SS_DEFAULT_METHOD), "{decoded}");
-        assert!(decoded.contains(&psk), "缺服务端密钥: {decoded}");
+        assert_eq!(method, crate::secrets::SS_DEFAULT_METHOD);
+        assert!(decoded_pw.starts_with(&psk), "缺服务端密钥: {decoded_pw}");
         assert!(
-            decoded.contains(&crate::secrets::ss_user_password(&user().uuid)),
-            "缺用户密钥: {decoded}"
+            decoded_pw.contains(&crate::secrets::ss_user_password(&user().uuid)),
+            "缺用户密钥: {decoded_pw}"
         );
+        assert!(!userinfo.starts_with("MjAyMi"), "2022 userinfo 不该再套 Base64:{link}");
     }
 
     #[test]
