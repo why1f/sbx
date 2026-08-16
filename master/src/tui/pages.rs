@@ -727,12 +727,15 @@ const PCT_LABEL_COLS: u16 = 6;
 /// 窄屏回退时,「每月 22 日重置」跟在百分比后面要占的地方(中文按两列算)。
 const RESET_LABEL_COLS: u16 = 15;
 
-/// 完整 IPv6 的最大**列宽**:39 个内容字符 + 1 格列内留白 = 40。
+/// 完整 IPv6 的最大列宽:八组四位 + 七个冒号 = 39,**不再额外留白**。
 ///
-/// 渲染处会用 `c.ip - 1` 给相邻列留一格。这里若写 39,实际只能显示 38 个
-/// 地址字符 —— 于是一个八组全是四位的 IPv6 会从尾部少两个字符(最后一格
-/// 被省略号占掉)。这正是 `...:febb:5a…` 的来源。
-const IPV6_COLS: u16 = 40;
+/// v0.4.15 这里是 40(39 + 1 格列内留白),因为渲染处会 `c.ip - 1`。
+/// 但那一格是白花的:ratatui 的 `Table` 本来就在相邻两列之间插 `column_spacing`
+/// (默认 1),留白之后地址和网速列之间是**两格**,而别的列都是一格。
+/// 代价是整张表多占一列 —— 146 列的终端上正好卡在「七列全在 + 完整 IPv6」的
+/// 门槛下面一格,最长的那个地址又从尾巴少掉两个字符(`…febb:5a…`)。
+/// 现在按 39 算、渲染处也不再减一,分隔交给 `column_spacing`。
+const IPV6_COLS: u16 = 39;
 
 fn columns(total_width: u16) -> Cols {
     // 减掉左右边框(2),以及**基础形态**下 ratatui 在各列之间插的间隔:
@@ -846,7 +849,8 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
             ]));
 
             // IPv6 在列表里**不加方括号** —— 那只是 URL 场景的要求(§8.2)。
-            let ip_w = c.ip.saturating_sub(1) as usize;
+            // 列宽直接用满:列与列之间的分隔由 `column_spacing` 负责(见 IPV6_COLS)。
+            let ip_w = c.ip as usize;
             let ip_cell = Cell::from(Text::from(vec![
                 Line::from(theme::truncate(a.ipv4.as_deref().unwrap_or("—"), ip_w)),
                 Line::from(Span::styled(
@@ -1365,6 +1369,11 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
                         let label = forms::reset_day_label(u.reset_day);
                         // 今天正好是重置日 → 标出来。用量突然归零时,
                         // 第一反应是「统计坏了」,而这一格能立刻解释清楚。
+                        //
+                        // **光有颜色不够。** 有人报过「16 号那天这个字是黄的、
+                        // 别的日子是白的,是不是坏了」—— 颜色说不出它在标什么。
+                        // 这一列只有 6 格,塞不下「今天」两个字,所以那句话在
+                        // 「操作」面板的摘要行里(`mod.rs::ops_lines`),两处配套。
                         if u.reset_day == Some(today as i64) {
                             Cell::from(Span::styled(label, Style::default().fg(theme::ACCENT)))
                         } else {
@@ -1959,6 +1968,38 @@ mod tests {
         a.ipv6 = Some(MAX.into());
         let out = draw_to_string(170, 12, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
         assert!(out.contains(MAX), "170 列该放得下最长的 IPv6:\n{out}");
+    }
+
+    /// **146 列:七列全在,最长的 IPv6 也要一个字符不少。**
+    ///
+    /// 这是现场那台终端的宽度。列内那一格留白让整张表多占一列,正好卡在
+    /// 门槛下面 —— 地址被截成 `…febb:5a…`,而右边看起来还空着。
+    /// 留白是白花的:ratatui 本来就在相邻两列之间插了一格 `column_spacing`。
+    #[test]
+    fn the_longest_ipv6_survives_at_the_exact_threshold_width() {
+        const MAX: &str = "2600:1700:3a90:c620:be24:11ff:febb:5ad5";
+        let mut a = agent(None, None);
+        a.ipv6 = Some(MAX.into());
+        a.ipv4 = Some("76.9.111.80".into());
+
+        let c = super::columns(146);
+        assert!(c.host > 0 && c.outbound > 0 && c.reset > 0, "146 列该画得下全部七列");
+
+        let out = draw_to_string(146, 8, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
+        assert!(out.contains(MAX), "146 列该完整显示最长的 IPv6:\n{out}");
+        // 顺带确认没把别的列挤掉 —— 挤掉了「完整显示」就没有意义。
+        assert!(has_cjk(&out, "主机") && has_cjk(&out, "出站"), "别的列不该被牺牲:\n{out}");
+    }
+
+    /// 145 列真的放不下,那就该**看得出来被截了**,而不是悄悄少两位。
+    #[test]
+    fn one_column_short_still_truncates_visibly() {
+        const MAX: &str = "2600:1700:3a90:c620:be24:11ff:febb:5ad5";
+        let mut a = agent(None, None);
+        a.ipv6 = Some(MAX.into());
+        let out = draw_to_string(145, 8, |f| agents(f, f.area(), &[a.clone()], 0, NOW));
+        assert!(!out.contains(MAX), "145 列本来就放不下:\n{out}");
+        assert!(out.contains('…'), "放不下要带省略号:\n{out}");
     }
 
     /// 窄屏放不下时仍然截断,而且**看得出来被截了**(带 `…`)。

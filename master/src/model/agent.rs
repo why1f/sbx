@@ -40,14 +40,20 @@ impl AgentStatus {
     }
 }
 
+/// 网卡记账口径:本周期算多少,由这一项决定(§6.4)。
+///
+/// **方向站在被控机的角度看**,与 `/proc/net/dev` 一致:
+///   * 出站 = Transmit = TX = 机器**发出**去的字节。代理场景里这就是
+///     「服务器 → 客户端」那一段,也就是客户端那边看到的下载。
+///   * 入站 = Receive = RX = 机器**收进来**的字节。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum NicAccountingMode {
     /// RX + TX；保持升级前的默认口径。
     #[default]
     Sum,
-    /// 仅计算机器发出的 TX。
+    /// 仅计算机器发出的 TX(服务器 → 客户端)。
     Outbound,
-    /// 仅计算机器收到的 RX。
+    /// 仅计算机器收到的 RX(客户端 → 服务器)。
     Inbound,
     /// 在完整周期累计 RX/TX 中取较大值。
     Max,
@@ -69,16 +75,16 @@ impl NicAccountingMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Sum => "进出合计",
-            Self::Outbound => "仅出站(TX)",
-            Self::Inbound => "仅入站(RX)",
-            Self::Max => "进出取大",
+            Self::Sum => "入出总计",
+            Self::Outbound => "仅出站(机器发出)",
+            Self::Inbound => "仅入站(机器收到)",
+            Self::Max => "入出取大",
         }
     }
 
     pub fn short(self) -> &'static str {
         match self {
-            Self::Sum => "合计",
+            Self::Sum => "总计",
             Self::Outbound => "出站",
             Self::Inbound => "入站",
             Self::Max => "取大",

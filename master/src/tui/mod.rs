@@ -311,6 +311,20 @@ impl App {
                         u.traffic_multiplier,
                         sub
                     );
+                    // 「重置」那一格在**今天正好是重置日**时会变色(pages.rs)。
+                    // 光靠颜色说不清是怎么回事 —— 用户报过一次「16 号那天字是黄的,
+                    // 别的日子是白的,这是不是坏了」。所以这里补一句人话:
+                    // 它标的是「这个号今天会清零」,而不是某种告警。
+                    let today = forms::today_day(chrono::Local::now().timestamp()) as i64;
+                    if u.reset_day == Some(today) {
+                        return vec![
+                            first,
+                            format!(
+                                "  今天({today} 日)正好是 {} 的流量重置日 —— 表里那一格因此高亮,用量清零是正常的",
+                                u.name
+                            ),
+                        ];
+                    }
                     // 绑了网卡就必须说 —— 客户端里显示的流量和表里那个数不是一回事。
                     if !u.nic_agent_ids.is_empty() {
                         return vec![
@@ -1282,8 +1296,9 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
         .head(format!("#{} {}(IP 由 agent 自探上报,改了会被下一次上报覆盖)", a.id, a.name))
         .with_note(Box::new(|_| {
             vec![
-                "网卡配额按所选口径读取机器原始 RX/TX,不是用户计费用量。".into(),
-                "出站 = TX,入站 = RX;切换只重算当前周期,不会清零原始流量。".into(),
+                "网卡配额按所选口径读取机器原始进出字节,不是用户计费用量。".into(),
+                "出站 = 机器发出(服务器→客户端,即客户端那边的下载),入站 = 机器收到。".into(),
+                "两个方向一直分开记,换口径只重算当前周期的显示,不清零原始流量。".into(),
                 "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
             ]
         })),
@@ -2039,6 +2054,29 @@ mod tests {
         assert!(a.status_is_error);
     }
 
+    /// 今天正好是某个用户的重置日时,摘要行要**用人话说清楚**。
+    ///
+    /// 表里那一格只会变个色,而颜色说不出它在标什么 —— 现场的反馈是
+    /// 「16 号那天这个字是黄的、别的日子是白的,是不是坏了」。
+    /// 那一列只有 6 格,塞不下「今天」两个字,所以话得放在摘要行。
+    #[tokio::test]
+    async fn the_ops_line_explains_todays_reset_highlight() {
+        let today = forms::today_day(chrono::Local::now().timestamp()) as i64;
+
+        let mut a = app();
+        a.page = Page::Users;
+        a.users = vec![data::UserRow { reset_day: Some(today), ..stub_user(true) }];
+        let ops = a.ops_lines().join("\n");
+        assert!(ops.contains("重置日"), "该说清那个高亮是什么:\n{ops}");
+        assert!(ops.contains("清零"), "要说明用量归零是正常的:\n{ops}");
+
+        // 不是今天就别啰嗦 —— 那一格也不会高亮。
+        let other = if today == 1 { 2 } else { 1 };
+        a.users = vec![data::UserRow { reset_day: Some(other), ..stub_user(true) }];
+        let ops = a.ops_lines().join("\n");
+        assert!(!ops.contains("清零"), "不是重置日就不该出现这句:\n{ops}");
+    }
+
     /// 摘要行要显示**当前**策略 —— 这是按下 `[o]` 之后唯一能确认改对了的地方
     /// (列表里没有这一列)。
     #[tokio::test]
@@ -2085,7 +2123,7 @@ mod tests {
         }
     }
 
-    /// 新增框默认「进出合计」——升级到这一版的行为不该变。
+    /// 新增框默认「入出总计」——升级到这一版的行为不该变。
     /// ←/→ 循环一圈能取到全部四个口径。
     #[tokio::test]
     async fn the_add_agent_form_defaults_to_sum_and_cycles_through_every_mode() {
