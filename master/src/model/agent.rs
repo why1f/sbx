@@ -76,8 +76,8 @@ impl NicAccountingMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Sum => "入出总计",
-            Self::Outbound => "仅出站(机器发出)",
-            Self::Inbound => "仅入站(机器收到)",
+            Self::Outbound => "仅出站(TX)",
+            Self::Inbound => "仅入站(RX)",
             Self::Max => "入出取大",
         }
     }
