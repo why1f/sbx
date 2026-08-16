@@ -328,7 +328,7 @@ mod tests {
         let texts = [
             "Tag:同一台机器内唯一;也是 (用户, tag) 记账口径的一半(§7.1),建好之后不能改。",
             "reality:密钥对与 short_id 建节点时自动生成;server_name 同时是握手目标",
-            "curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | SBX_SERVER='wss://203.0.113.8:18443/ws' bash",
+            "(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | SBX_SERVER='wss://203.0.113.8:18443/ws' sh",
             "短",
             "",
         ];

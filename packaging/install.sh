@@ -2,14 +2,16 @@
 # sbx 一键安装 / 升级脚本。
 #
 #   # 装主控(不带参数就是这个)
-#   curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+#   (curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+#     || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | sh
 #
 #   # 装被控 agent
-#   curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash -s -- agent
+#   (curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+#     || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | sh -s -- agent
 #
 #   # 装被控 agent 并**直接接入某台主控**(主控 TUI 的「新增被控服务器」会吐出整条命令)
 #   curl -fsSL .../install.sh | SBX_SERVER='wss://1.2.3.4:18443/ws' \
-#       SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+#       SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' sh
 #
 # 选目标的优先级:
 #   1. 命令行参数 / SBX_TARGET
@@ -22,7 +24,7 @@
 #
 # 用 POSIX sh 写(`| sh` 和 `| bash` 都能跑):被控机上可能只有 dash/busybox。
 #
-# ── 关于 `curl | bash` ──
+# ── 关于 `download | sh` ──
 # 整个脚本包在函数里,最后一行才 `main "$@"`。这样连接中断导致下载不完整时,
 # shell 读到的是一堆没被调用的函数定义,不会执行到一半就动你的系统。
 
@@ -30,10 +32,13 @@ set -eu
 
 REPO="why1f/sbx"
 BIN_DIR="${SBX_BIN_DIR:-/usr/local/bin}"
-# 配置目录。改它就得自己改 unit 里的 ExecStart —— sbx-agent.service 写死了
+# 配置目录。改它就得自己改 service 里的启动参数 —— systemd/OpenRC 文件都写死了
 # /etc/sbx/agent.toml。留这个口子主要是为了能在真机之外测这个脚本。
 CONF_DIR="${SBX_CONF_DIR:-/etc/sbx}"
+# systemd 与 OpenRC 的服务文件分别落在这两处。环境变量只用于离线测试/非标准布局。
 UNIT_DIR="${SBX_UNIT_DIR:-/etc/systemd/system}"
+INIT_DIR="${SBX_INIT_DIR:-/etc/init.d}"
+INIT_SYSTEM="none"
 API="https://api.github.com/repos/$REPO/releases/latest"
 DL="https://github.com/$REPO/releases/download"
 RAW="https://raw.githubusercontent.com/$REPO/main/packaging/install.sh"
@@ -56,12 +61,17 @@ info() { printf '  %s\n' "$*"; }
 invocation() {
     case "$0" in
         *install.sh) printf '%s' "$0" ;;
-        *) printf 'curl -fsSL %s | bash -s --' "$RAW" ;;
+        *) printf '(curl -fsSL %s 2>/dev/null || wget -qO- %s) | sh -s --' "$RAW" "$RAW" ;;
     esac
 }
 
 need() {
-    command -v "$1" >/dev/null 2>&1 || die "缺少 $1,请先安装(apt install $2 / yum install $2)"
+    command -v "$1" >/dev/null 2>&1 || die "缺少 $1,请先安装(apt/yum: $2; Alpine: apk add $2)"
+}
+
+need_downloader() {
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 ||
+        die "缺少下载工具,请先安装 curl 或 wget(Alpine: apk add curl)"
 }
 
 usage() {
@@ -74,7 +84,7 @@ usage() {
 选项:
   --version <X.Y.Z>   装指定版本(默认最新)
   --force             即使已是该版本也重新装一遍
-  --no-restart        替换二进制后不重启 systemd 单元
+  --no-restart        替换二进制后不重启 systemd/OpenRC 服务
   --bin-dir <目录>    安装目录(默认 /usr/local/bin,也可用 SBX_BIN_DIR)
   -h, --help          这段
 
@@ -144,9 +154,30 @@ detect_arch() {
     [ "$(uname -s)" = "Linux" ] || die "只支持 Linux(当前 $(uname -s))"
 }
 
+# 不按发行版名字猜 init。Alpine 容器也有 /etc/alpine-release,但 PID 1 通常不是
+# OpenRC;硬看发行版会装出一个永远没人拉起的 service。命令真实存在才采用。
+detect_init_system() {
+    if command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 &&
+         command -v rc-update >/dev/null 2>&1 &&
+         command -v openrc-run >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="none"
+    fi
+    info "init 系统:$INIT_SYSTEM"
+}
+
+# 服务文件属于源码,不重复占 GitHub Release 资产。按**目标版本 tag**取,
+# 不能固定 main:用 --version 装旧二进制时必须配同版本的 unit/config。
+source_asset_url() {
+    printf 'https://raw.githubusercontent.com/%s/v%s/packaging/%s' "$REPO" "$1" "$2"
+}
+
 latest_version() {
     # 只要 tag_name。不引 jq —— 被控机上通常没有。
-    v=$(curl -fsSL "$API" 2>/dev/null | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
+    v=$(http_body "$API" 2>/dev/null | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
     [ -n "$v" ] || die "取不到最新版本号。GitHub API 可能被限流(未认证 60 次/小时)或网络不通;
        可以用 --version 显式指定,例如 --version 0.1.0"
     printf '%s' "$v"
@@ -187,18 +218,32 @@ should_install() {
 #
 # 临时文件必须和目标**同目录**:跨文件系统的 mv 不是原子的,会退化成 copy,
 # 中途断电就留下一个截断的可执行文件。
-# 下载一个文件,失败重试几次。
-#
-# `curl --retry` 默认**只重试传输层错误和 5xx,不管 404**。而刚发布的 release
-# 在 CDN 上有几秒的传播窗口,那期间同一个地址会间歇性返 404 ——
-# 表现是「刚发的版本装不上」,而过一分钟又好了。
-# `--retry-all-errors` 能覆盖这种,但它要 curl 7.71+;被控机上可能是更老的版本,
-# 传了会直接报「不认识的参数」。所以退回最朴素的办法:自己睡一下再试。
+# 从网络取文件。curl 优先,Alpine/BusyBox 没有 curl 时走 wget。
 download() {
     _u="$1"; _o="$2"
     _n=0
     while :; do
-        curl -fsSL --retry 3 -o "$_o" "$_u" && return 0
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 3 -o "$_o" "$_u" && return 0
+        else
+            wget -q -O "$_o" "$_u" && return 0
+        fi
+        _n=$((_n + 1))
+        [ "$_n" -ge 3 ] && return 1
+        sleep 3
+    done
+}
+
+# 取 API/文本响应到 stdout。不能用 `$(download ...)` —— download 的语义是写文件。
+http_body() {
+    _u="$1"
+    _n=0
+    while :; do
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --retry 3 "$_u" && return 0
+        else
+            wget -q -O - "$_u" && return 0
+        fi
         _n=$((_n + 1))
         [ "$_n" -ge 3 ] && return 1
         sleep 3
@@ -232,14 +277,55 @@ fetch_verify_install() {
     rm -f "$_sum"
 }
 
-# 单元在跑才重启。没跑的话装完不该顺手把它拉起来 ——
-# 那等于替用户决定「这台机器现在开始提供服务」。
+manual_restart_command() {
+    case "$INIT_SYSTEM" in
+        systemd) printf 'systemctl restart %s' "$1" ;;
+        openrc)  printf 'rc-service %s restart' "$1" ;;
+        *)       printf '%s/%s %s' "$BIN_DIR" "$1" "$AGENT_CONF" ;;
+    esac
+}
+
+service_is_active() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet "$1" 2>/dev/null ;;
+        openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
+        *)       return 1 ;;
+    esac
+}
+
+service_restart() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl restart "$1" ;;
+        openrc)  rc-service "$1" restart ;;
+        *)       return 1 ;;
+    esac
+}
+
+# 主控只支持 systemd,不能跟着 agent 的 OpenRC 分流走。保持原有语义:
+# systemd 单元在跑才重启,没有 systemctl 或未运行都只替换文件。
+restart_master_if_running() {
+    if [ "$NO_RESTART" -ne 0 ]; then
+        info "跳过重启(sbx),需要时手动执行:systemctl restart sbx"
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || return 0
+    if systemctl is-active --quiet sbx 2>/dev/null; then
+        systemctl restart sbx && info "已重启 sbx(systemd)"
+    else
+        info "sbx 未在运行,只替换了二进制"
+    fi
+}
+
+# agent 单元在跑才重启。没跑的话装完不该顺手把它拉起来 ——
+# 那等于替用户决定「这台机器现在开始提供服务」。systemd/OpenRC 语义一致。
 restart_if_running() {
     _unit="$1"
-    [ "$NO_RESTART" -eq 0 ] || { info "跳过重启($_unit),记得手动 systemctl restart $_unit"; return 0; }
-    command -v systemctl >/dev/null 2>&1 || return 0
-    if systemctl is-active --quiet "$_unit" 2>/dev/null; then
-        systemctl restart "$_unit" && info "已重启 $_unit"
+    if [ "$NO_RESTART" -ne 0 ]; then
+        info "跳过重启($_unit),需要时手动执行:$(manual_restart_command "$_unit")"
+        return 0
+    fi
+    if service_is_active "$_unit"; then
+        service_restart "$_unit" && info "已重启 $_unit($INIT_SYSTEM)"
     else
         info "$_unit 未在运行,只替换了二进制"
     fi
@@ -321,8 +407,8 @@ install_master() {
     _tmpd=$(mktemp -d)
     # mktemp -d 的目录也要保证清掉,否则反复升级会在 /tmp 里堆一堆。
     trap 'rm -rf "$_tmpd"' EXIT INT TERM
-    curl -fsSL --retry 3 -o "$_tmpd/$_name" "$DL/v$_new/$_name" || die "下载失败: $_name"
-    curl -fsSL --retry 3 -o "$_tmpd/$_name.sha256" "$DL/v$_new/$_name.sha256" \
+    download "$DL/v$_new/$_name" "$_tmpd/$_name" || die "下载失败: $_name"
+    download "$DL/v$_new/$_name.sha256" "$_tmpd/$_name.sha256" \
         || die "取不到 .sha256,拒绝安装未校验的产物"
     _want=$(awk '{print $1}' "$_tmpd/$_name.sha256")
     _got=$(sha256sum "$_tmpd/$_name" | awk '{print $1}')
@@ -345,7 +431,41 @@ install_master() {
         info "已放置 sbx.service(未启用;systemctl enable --now sbx 启动)"
     fi
     rm -rf "$_tmpd"; trap - EXIT INT TERM
-    restart_if_running sbx
+    restart_master_if_running
+}
+
+install_agent_assets() {
+    _asset_ver="$1"
+    [ -d "$CONF_DIR" ] || install -d -m750 "$CONF_DIR"
+    case "$INIT_SYSTEM" in
+        systemd)
+            [ -d "$UNIT_DIR" ] || install -d -m755 "$UNIT_DIR"
+            if [ ! -f "$UNIT_DIR/sbx-agent.service" ]; then
+                if fetch_asset "$(source_asset_url "$_asset_ver" sbx-agent.service)" \
+                    "$UNIT_DIR/sbx-agent.service" "sbx-agent.service"; then
+                    systemctl daemon-reload || true
+                    info "已放置 sbx-agent.service"
+                fi
+            fi
+            ;;
+        openrc)
+            [ -d "$INIT_DIR" ] || install -d -m755 "$INIT_DIR"
+            if [ ! -f "$INIT_DIR/sbx-agent" ]; then
+                if fetch_asset "$(source_asset_url "$_asset_ver" sbx-agent.openrc)" \
+                    "$INIT_DIR/sbx-agent" "sbx-agent.openrc"; then
+                    chmod 755 "$INIT_DIR/sbx-agent"
+                    info "已放置 OpenRC service:$INIT_DIR/sbx-agent"
+                fi
+            fi
+            ;;
+        none)
+            info "没有 systemd/OpenRC supervisor,agent 可手动运行但崩溃/自升级后不会自动拉起"
+            ;;
+    esac
+    if [ ! -f "$CONF_DIR/agent.example.toml" ]; then
+        fetch_asset "$(source_asset_url "$_asset_ver" agent.example.toml)" \
+            "$CONF_DIR/agent.example.toml" "agent.example.toml" || true
+    fi
 }
 
 install_agent() {
@@ -358,16 +478,7 @@ install_agent() {
         fetch_verify_install "$DL/v$_new/$_f" "$DL/v$_new/$_f.sha256" "$BIN_DIR/sbx-agent"
     fi
 
-    [ -d "$CONF_DIR" ] || install -d -m750 "$CONF_DIR"
-    if [ ! -f "$UNIT_DIR/sbx-agent.service" ]; then
-        if fetch_asset "$DL/v$_new/sbx-agent.service" "$UNIT_DIR/sbx-agent.service" "sbx-agent.service"; then
-            command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
-            info "已放置 sbx-agent.service"
-        fi
-    fi
-    if [ ! -f "$CONF_DIR/agent.example.toml" ]; then
-        fetch_asset "$DL/v$_new/agent.example.toml" "$CONF_DIR/agent.example.toml" "agent.example.toml" || true
-    fi
+    install_agent_assets "$_new"
 
     write_agent_config
     start_agent
@@ -382,37 +493,59 @@ install_agent() {
 #     替一台没在服务的机器决定「你现在开始提供服务」不是安装脚本该干的事。
 start_agent() {
     if [ "$NO_RESTART" -ne 0 ]; then
-        info "跳过启动/重启(--no-restart),记得手动 systemctl restart sbx-agent"
+        info "跳过启动/重启(--no-restart),需要时手动执行:$(manual_restart_command sbx-agent)"
         return 0
     fi
     if [ -z "${SBX_TOKEN:-}" ]; then
         restart_if_running sbx-agent
         return 0
     fi
-    command -v systemctl >/dev/null 2>&1 || {
-        info "没有 systemd。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
-        return 0
-    }
-    [ -f "$UNIT_DIR/sbx-agent.service" ] || {
-        info "没有 sbx-agent.service,不启动。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
-        return 0
-    }
-    if systemctl enable --now sbx-agent 2>/dev/null; then
-        # 已经在跑的进程读的是旧配置(比如旧 token),必须重启才会用新的。
-        systemctl restart sbx-agent || true
-        info "sbx-agent 已启用并启动。看日志:journalctl -u sbx-agent -f"
-    else
-        info "systemctl enable --now sbx-agent 失败,自己看一眼:systemctl status sbx-agent"
-    fi
+
+    case "$INIT_SYSTEM" in
+        systemd)
+            [ -f "$UNIT_DIR/sbx-agent.service" ] || {
+                info "没有 sbx-agent.service,不启动。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
+                return 0
+            }
+            if systemctl enable --now sbx-agent 2>/dev/null; then
+                # 已经在跑的进程读的是旧配置(比如旧 token),必须重启才会用新的。
+                systemctl restart sbx-agent || true
+                info "sbx-agent 已启用并启动。看日志:journalctl -u sbx-agent -f"
+            else
+                info "systemctl enable --now sbx-agent 失败,自己看一眼:systemctl status sbx-agent"
+            fi
+            ;;
+        openrc)
+            [ -x "$INIT_DIR/sbx-agent" ] || {
+                info "没有 OpenRC service,不启动。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
+                return 0
+            }
+            if ! rc-update add sbx-agent default >/dev/null 2>&1; then
+                info "rc-update add sbx-agent default 失败"
+                return 0
+            fi
+            if rc-service sbx-agent status >/dev/null 2>&1; then
+                rc-service sbx-agent restart
+            else
+                rc-service sbx-agent start
+            fi
+            info "sbx-agent 已加入 default runlevel 并启动。看日志:tail -f /var/log/sbx-agent.log"
+            ;;
+        none)
+            info "没有 systemd/OpenRC,手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
+            info "没有 supervisor 时 agent 自升级退出后不会自动拉起"
+            ;;
+    esac
 }
 
 main() {
     init_targets_from_env
     parse_args "$@"
-    need curl curl
+    need_downloader
     need sha256sum coreutils
     need tar tar
     detect_arch
+    detect_init_system
 
     [ -w "$BIN_DIR" ] || [ "$(id -u)" = "0" ] || die "$BIN_DIR 不可写,请用 root 运行(或 --bin-dir 指定别处)"
     [ -d "$BIN_DIR" ] || install -d -m755 "$BIN_DIR"

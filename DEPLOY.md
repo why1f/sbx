@@ -10,7 +10,8 @@
 ## 1. 安装主控（A 机）
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+  || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | sh
 cp -n /etc/sbx/config.example.toml /etc/sbx/config.toml
 ```
 
@@ -48,27 +49,38 @@ ufw allow 18443/tcp comment 'sbx cluster'
 nc -vz <A机公网地址> 18443
 ```
 
-## 2. 安装 agent（B 机）
+## 2. 安装 agent（B 机，支持 Alpine/OpenRC）
 
 推荐在 A 机打开 TUI，进入“服务管理”页按 `[a]`，复制生成的完整命令到 B 机执行：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh \
-  | SBX_SERVER='wss://<A机地址>:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+  || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) \
+  | SBX_SERVER='wss://<A机地址>:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' sh
 ```
 
 脚本会：
 
 1. 下载正确架构的 `sbx-agent` 并校验 SHA-256；
-2. 安装 `/etc/systemd/system/sbx-agent.service`；
+2. 按命令真实存在情况选择 supervisor：systemd 安装 `/etc/systemd/system/sbx-agent.service`，
+   OpenRC 安装 `/etc/init.d/sbx-agent`；
 3. 写入 `/etc/sbx/agent.toml`（0600）；
-4. 执行 `systemctl enable --now sbx-agent`。
+4. systemd 执行 `systemctl enable --now sbx-agent`，OpenRC 执行
+   `rc-update add sbx-agent default` 后启动。
 
-查看状态：
+`agent.example.toml` 和两种 service 文件按目标版本从源码 tag 获取；`--version 0.x.y`
+不会误配 `main` 分支的新 service。主控仍只使用 systemd。
+
+查看状态（按 B 机 init 选择一组）：
 
 ```sh
+# systemd
 systemctl status sbx-agent --no-pager
 journalctl -u sbx-agent -n 30 --no-pager
+
+# OpenRC
+rc-service sbx-agent status
+tail -n 30 /var/log/sbx-agent.log
 ```
 
 期望看到：
@@ -80,6 +92,17 @@ journalctl -u sbx-agent -n 30 --no-pager
 
 轮换 token：在 TUI 服务管理页按 `[r]`，把新命令在 B 机再执行一次。旧配置会备份成
 `/etc/sbx/agent.toml.bak`。
+
+容器里如果既没有可用的 systemd 命令，也没有 `rc-service` / `rc-update` / `openrc-run`，
+脚本仍安装二进制与配置，但必须由容器入口或现有进程管理器运行：
+
+```sh
+exec /usr/local/bin/sbx-agent /etc/sbx/agent.toml
+```
+
+没有 supervisor 时，普通崩溃和自升级后的主动退出都不会自动恢复。`--no-restart` 在
+systemd/OpenRC 下也只安装文件、不启动；脚本会打印对应的手工重启命令。不带 token 的升级
+只重启原本正在运行的 agent，不会擅自启动停用状态的服务。
 
 ## 3. 验证清单
 
@@ -136,8 +159,10 @@ nc -6 -vz <B机IPv6> <节点端口>
 
 ```sh
 systemctl stop sbx                    # A 机
-systemctl restart sbx-agent           # B 机
+systemctl restart sbx-agent           # B 机 systemd
+# 或：rc-service sbx-agent restart    # B 机 OpenRC
 journalctl -u sbx-agent -n 20 --no-pager
+# OpenRC 日志：tail -n 20 /var/log/sbx-agent.log
 ```
 
 应先出现“已按 last-applied.json 启动 box”，随后才是连接主控失败并退避。主控不可用时，已有节点仍应服务。
@@ -181,21 +206,24 @@ sqlite3 /etc/sbx/sbx.db "SELECT * FROM user_traffic_total;"
 kill -9 $(pidof sbx-agent)
 ```
 
-systemd 的 `Restart=always` 会拉起它。重启前后的累计流量应相加且不重复，`agent_events` 应记录计数器 epoch 变化。
+systemd 的 `Restart=always` 或 OpenRC `supervise-daemon` 会拉起它。重启前后的累计流量应相加且不重复，
+`agent_events` 应记录计数器 epoch 变化。
 
 ### 3.7 升级
 
 主控：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+  || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | sh
 systemctl restart sbx
 ```
 
 正在运行的 TUI 需要退出后重新进入，才能加载新二进制。
 
 agent：在 TUI 服务管理页按 `[u]`，可升级当前 agent 或全部在线 agent。agent 下载目标版本、校验
-SHA-256、原子替换自身并退出，由 `sbx-agent.service` 的 `Restart=always` 拉起新版本。
+SHA-256、原子替换自身并退出，由 systemd `Restart=always` 或 OpenRC `supervise-daemon` 拉起新版本。
+若手动运行或容器没有 supervisor，自升级退出后不会自动恢复。
 
 ## 4. 关键路径与权限
 
@@ -215,10 +243,12 @@ SHA-256、原子替换自身并退出，由 `sbx-agent.service` 的 `Restart=alw
 
 ```sh
 systemctl disable --now sbx-agent 2>/dev/null || true
+rc-update del sbx-agent default 2>/dev/null || true
+rc-service sbx-agent stop 2>/dev/null || true
 systemctl disable --now sbx 2>/dev/null || true
 rm -f /usr/local/bin/sbx /usr/local/bin/sbx-agent
-rm -f /etc/systemd/system/sbx.service /etc/systemd/system/sbx-agent.service
+rm -f /etc/systemd/system/sbx.service /etc/systemd/system/sbx-agent.service /etc/init.d/sbx-agent
 rm -rf /etc/sbx /var/lib/sbx-agent
-systemctl daemon-reload
+systemctl daemon-reload 2>/dev/null || true
 ufw delete allow 18443/tcp
 ```

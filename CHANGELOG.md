@@ -4,6 +4,31 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.18
+
+### 新增
+
+- **被控 agent 支持 Alpine/OpenRC 自动安装与自愈。**
+
+  `packaging/install.sh` 按可用命令检测 systemd 或 OpenRC，不根据发行版名称猜测。
+  OpenRC 安装 `/etc/init.d/sbx-agent`，由 `supervise-daemon` 在普通崩溃和
+  `agent.upgrade` 替换二进制后退出时以 3 秒延迟、无限重试拉起。没有 supervisor 的
+  容器仍安装二进制与配置，并明确提示用 `exec /usr/local/bin/sbx-agent /etc/sbx/agent.toml`
+  手动运行，但不承诺自愈。
+
+- **服务文件改为按版本从源码 tag 获取。**
+
+  `agent.example.toml`、`sbx-agent.service` 与 `sbx-agent.openrc` 不再重复上传到
+  GitHub Release；安装指定版本时从对应 `v${VERSION}` tag 读取，避免二进制与未来
+  `main` 的启动参数错配。Release 资产收敛为主控双架构 tar.gz/校验和与 agent 双架构
+  裸二进制/校验和共八项。
+
+### 文档与测试
+
+- README、DEPLOY、DESIGN 补充 OpenRC、无 init 容器、`--no-restart` 与 supervisor 约束。
+- 安装脚本离线测试覆盖 systemd/OpenRC/none 分流、服务调用、权限和源码 tag 地址，
+  并继续在 dash 与 bash 下运行。
+
 ## v0.4.17
 
 ### 修

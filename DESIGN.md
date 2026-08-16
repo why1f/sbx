@@ -154,7 +154,7 @@ agent 本地**只保留一份 `last-applied.json` 快照**,用途**仅限**:主�
   SAN 取 `cluster.listen` 的地址加 `localhost`——**但 agent 侧只校验指纹、不校验 SAN/CN**,
   所以主控改域名或 IP 都不需要重签(TOFU 的本意就是把信任锚定在密钥而非名字上)。
 - 主控启动后计算证书 DER 的 **SHA-256** 作为指纹(`sha256:<hex>`),
-  §8.1 新增 agent 的弹窗里直接把它填进一键安装命令的 `--fingerprint`。
+  §8.1 新增 agent 的弹窗里直接把它填进一键安装命令的 `SBX_FINGERPRINT`。
   `sbx fingerprint` 子命令也打印它,便于手工排查。
 - 同时支持 `ws://` 明文模式,**仅当** agent 配置里显式写 `insecure = true`(留给「nginx 已做 TLS 终止」的部署)。
 - **不做 CA 体系**、不做证书轮换流程、不做双向 mTLS。规模不匹配。
@@ -173,7 +173,8 @@ agent 本地**只保留一份 `last-applied.json` 快照**,用途**仅限**:主�
 - **不做「花哨但收益低」的 TUI 鼠标交互。** 键盘优先。
 - **不做 agent 侧的业务判断。** agent 不做删档、不做月重置、不做配额判定,只上报原始累计值(§5.3)。
 
-定位:可发行 / 可自用小规模 / CLI + TUI + systemd 运维闭环为核心。
+定位:可发行 / 可自用小规模 / CLI + TUI + supervisor 运维闭环为核心。
+主控仍只支持 systemd；agent 支持 systemd 与 OpenRC。
 
 ---
 
@@ -184,7 +185,7 @@ agent 本地**只保留一份 `last-applied.json` 快照**,用途**仅限**:主�
 | `master/` | Rust 主控:CLI、daemon、TUI、SQLite、订阅、Telegram、升级、doctor |
 | `agent/` | Go agent:WebSocket 客户端、内嵌 sing-box、tracker、sysinfo、自升级 |
 | `shared/` | Rust 协议信封与 payload 类型 |
-| `packaging/` | 安装脚本、示例配置、systemd unit 与离线测试 |
+| `packaging/` | 安装脚本、示例配置、systemd/OpenRC service 与离线测试 |
 | `master/testdata/` | 八协议与出站策略 golden,由真 sing-box 校验 |
 | `spike/` | tracker 的真实 sing-box 流量/拒绝行为回归 |
 | `e2e/` | 跨 agent 求和与断线恢复驱动 |
@@ -764,13 +765,14 @@ agent 的 tracker 从进程启动才开始数,`new` 就是这段时间真实发�
   base64url 编码,**只在弹窗里显示这一次**;库里只存 `token_hash` 与 `token_prefix`(前 8 位)。
   弹窗给出的不是一份要人手抄的 `agent.toml`,而是**一条可以整条复制去跑的命令**:
 
-      curl -fsSL .../install.sh | SBX_SERVER='wss://…/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+      (curl -fsSL .../install.sh 2>/dev/null || wget -qO- .../install.sh) | SBX_SERVER='wss://…/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' sh
 
-  走环境变量而不是 `--server` 这类参数,是因为管道形式下传参要写 `bash -s -- …`,
+  走环境变量而不是 `--server` 这类参数,是因为管道形式下传参要写 `sh -s -- …`,
   而这条命令已经够长了;`SBX_TOKEN` 非空本身就足以让脚本判定「这是在装被控」,
   于是连 `SBX_TARGET=agent` 都不用带(`packaging/install.sh`)。
-  脚本收到这三个值会写好 `/etc/sbx/agent.toml`(**0600**,里面是明文 token)并
-  `enable --now sbx-agent`。
+  脚本收到这三个值会写好 `/etc/sbx/agent.toml`(**0600**,里面是明文 token),然后按当前机器
+  的 supervisor 接入:systemd `enable --now`,OpenRC 加入 `default` runlevel 并启动。
+  没有 supervisor 时只安装并打印手动命令,不会把一次性后台进程伪装成可靠服务。
   **主控地址不问人**(`install::resolve_host`),按这个次序定:
 
   1. `cluster.public_host` —— 人明确指定过就不再猜。
@@ -1030,6 +1032,10 @@ reality 依赖 uTLS、hysteria2 / tuic 依赖 QUIC(§9.1 的跨语言 golden 测
 - **发布前校验元数据**:tag、`Cargo.toml` version、`CHANGELOG.md` 里的 `## v<x>` 标题三者一致,不一致就 fail
 - **每个产物配一个独立的 `.sha256`**,`agent.upgrade`(§4.2)按 `<asset>.sha256` 下载校验
 
+Release 共八项:主控双架构 tar.gz 与各自校验和、agent 双架构裸二进制与各自校验和。
+`agent.example.toml`、systemd/OpenRC service 不重复上传；安装脚本从目标版本源码 tag 获取。
+主控 `config.example.toml` 与 `sbx.service` 仍留在已校验的 tar.gz 内。
+
 ### 11.2 主控配置文件
 
 沿用旧项目的分节 TOML + `#[serde(default)]` 模式(旧 `model/config.rs` 是范本)。分节:
@@ -1076,6 +1082,20 @@ insecure    = false          # true 时允许 ws:// 明文
 
 **凭据处理:** `token`、TLS 私钥、`telegram.bot_token` 属于凭据,
 日志与 TUI 中一律不回显完整值(token 只显示 `token_prefix` 8 位)。
+
+### 11.4 agent 进程监督约束
+
+agent 不要求 systemd 专属 API；它只要求部署环境有一个能在进程退出后重新启动它的
+supervisor。Linux 安装脚本按命令是否真实存在分流:
+
+- systemd 使用 `sbx-agent.service` 的 `Restart=always`；
+- OpenRC 使用 `/etc/init.d/sbx-agent` 的 `supervise-daemon`、3 秒延迟和无限重试；
+- 没有任一 supervisor 的容器仍可手动 `exec /usr/local/bin/sbx-agent /etc/sbx/agent.toml`,
+  但崩溃或 `agent.upgrade` 主动退出后不会自动恢复。
+
+主控运行管理不随 agent 分流改变,仍由 systemd unit 负责。服务文件和 agent 示例配置是
+tracked 源码资产,安装脚本从与二进制相同的 `v${VERSION}` tag 获取,避免旧版本二进制
+误配未来 `main` 的启动参数。
 
 ---
 

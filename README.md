@@ -32,7 +32,8 @@
 ### 主控
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash
+(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+  || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | sh
 cp -n /etc/sbx/config.example.toml /etc/sbx/config.toml
 systemctl enable --now sbx
 sbx --config /etc/sbx/config.toml doctor
@@ -47,24 +48,33 @@ sbx --config /etc/sbx/config.toml doctor
 不会覆盖已有的 `/etc/sbx/config.toml`。重跑安装命令就是升级；新主控二进制需要重启 daemon，
 正在运行的 TUI 需要退出后重新进入。
 
-### 被控机
+### 被控机（Alpine/OpenRC 也适用）
 
 推荐从主控 TUI 生成完整命令：进入“服务管理”页，按 `[a]` 新增 agent，复制弹窗中的命令到被控机执行。
 命令会包含主控地址、一次性 token 和 TLS 指纹，例如：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh \
-  | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' bash
+(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+  || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) \
+  | SBX_SERVER='wss://主控:18443/ws' SBX_TOKEN='…' SBX_FINGERPRINT='sha256:…' sh
 ```
 
-它会安装 `sbx-agent`、写入 `/etc/sbx/agent.toml`（0600）并执行
-`systemctl enable --now sbx-agent`。轮换 token 后，把 TUI 新生成的命令再运行一次即可；旧配置会备份为
+它会安装 `sbx-agent`、写入 `/etc/sbx/agent.toml`（0600）并加入当前机器的 supervisor：
+有 systemd 时执行 `systemctl enable --now sbx-agent`，有 OpenRC 时安装 `/etc/init.d/sbx-agent`、加入 `default` runlevel 并启动。
+服务文件和 `agent.example.toml` 按目标版本从源码 tag 下载，不占 GitHub Release 静态资产。
+没有 supervisor 时只安装文件，不会伪造一个无法自愈的后台服务；手动启动命令为
+`/usr/local/bin/sbx-agent /etc/sbx/agent.toml`，崩溃或自升级退出后不会自动拉起。
+轮换 token 后，把 TUI 新生成的命令再运行一次即可；旧配置会备份为
 `agent.toml.bak`。
+
+只安装/升级而不启动服务时加 `--no-restart`；之后按提示手动执行对应的
+`systemctl restart` 或 `rc-service restart`。不带 token 的二进制升级只会重启原本已经运行的 agent。
 
 单独安装 agent 也可以：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh | bash -s -- agent
+(curl -fsSL https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh 2>/dev/null \
+  || wget -qO- https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh) | sh -s -- agent
 ```
 
 ## 快速使用
@@ -134,6 +144,7 @@ IPv6 输出规则：
 - 用户流量按 `(用户, inbound tag)` 记账，不能只按用户名。
 - `config_revision` 与 `user_state_revision` 独立：前者重建 box，后者只更新内存禁用名单。
 - Reality、自签 TLS、Shadowsocks 等密钥在创建节点时生成一次并持久化，后续下发不得重新生成。
+- agent 必须由能在进程退出后重新拉起它的 supervisor 管理；systemd 的 `Restart=always` 与 OpenRC 的 `supervise-daemon` 都满足。自升级会原子替换二进制后主动退出，没有 supervisor 就会永久离线。
 - agent 不开放管理端口；管理面只有 agent 主动连接主控的 WebSocket。
 
 ## 构建与测试
@@ -164,6 +175,7 @@ CI 还检查：
 
 发布由 `v*` tag 触发。tag、`master/Cargo.toml` 的版本和 `CHANGELOG.md` 标题必须一致。
 主控发布为 musl 静态 `.tar.gz`；agent 发布为裸二进制和独立 `.sha256`。
+`agent.example.toml`、systemd/OpenRC service 由安装脚本从对应源码 tag 获取，不重复上传到 Release。
 
 ## 仓库布局
 
@@ -172,7 +184,7 @@ CI 还检查：
 | `master/` | Rust 主控、CLI、TUI、数据库、订阅和通知 |
 | `agent/` | Go agent，内嵌 sing-box |
 | `shared/` | Rust 协议类型 |
-| `packaging/` | 安装脚本、配置示例、systemd unit |
+| `packaging/` | 安装脚本、配置示例、systemd/OpenRC service |
 | `master/testdata/` | 八协议及出站策略 golden 配置，测试必需 |
 | `spike/` | 真实 sing-box tracker 回归，CI 必需 |
 | `e2e/` | 跨 agent 记账与断连恢复驱动，CI 编译检查 |

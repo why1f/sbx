@@ -147,11 +147,11 @@ jobs:
               -tags with_quic,with_utls \
               -ldflags "-s -w -buildid= -X main.Version=${VERSION}" \
               -o "../dist/${BIN}" ./cmd/sbx-agent
-            # 逐个算,不要 for f in sbx-agent-* —— 那会把下面拷进来的
-            # sbx-agent.service 和刚生成的 .sha256 也算进去。
+            # 逐个算,不要用通配符 —— 下一轮已经有上一轮生成的 .sha256。
             ( cd dist && sha256sum "$BIN" > "${BIN}.sha256" )
           done
-          cp packaging/agent.example.toml packaging/sbx-agent.service agent/LICENSE dist/
+          # agent.example.toml 与两种 init service 都是源码文件。安装脚本按目标
+          # version tag 从 raw.githubusercontent.com 获取,不重复占 release 资产。
 
       - uses: actions/upload-artifact@v4
         with:
@@ -180,8 +180,8 @@ jobs:
       #   *.tar.gz         只吃两个主控包(不吃 .tar.gz.sha256,glob 锚在结尾)
       #   *.tar.gz.sha256  只吃这两个包的校验和
       #   sbx-agent-v*     只吃 agent 裸二进制和它的 .sha256
-      #                    (sbx-agent.service 是点不是横杠,不会被误伤)
-      # 一共十个资产,和 v0.3.1 对得上。
+      # 一共八个资产。agent.example.toml / systemd / OpenRC 文件从对应源码 tag 获取,
+      # 不重复上传到 Release;主控示例配置和 unit 仍在两个 tar.gz 内。
       #
       # fail_on_unmatched_files:glob 收窄了,以后谁改了打包步骤的文件名,
       # 这里就该红,而不是默默发一个少几个资产的 release(默认只 warn)。
@@ -191,7 +191,5 @@ jobs:
             dist/*.tar.gz
             dist/*.tar.gz.sha256
             dist/sbx-agent-v*
-            dist/agent.example.toml
-            dist/sbx-agent.service
           fail_on_unmatched_files: true
           generate_release_notes: true

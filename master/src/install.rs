@@ -4,9 +4,13 @@
 //! 和 CLI 的 `sbx agent-add`。后者尤其要紧 —— 终端不支持 OSC 52 复制时,
 //! CLI 打在普通回滚缓冲里的那一份是唯一能用鼠标选中复制的。
 //!
-//! 命令走**环境变量**而不是 `--server` 这类参数:管道形式下传参要写
-//! `bash -s -- …`,而这条命令已经够长了;`SBX_TOKEN` 非空本身就足以让
-//! `packaging/install.sh` 判定「这是在装被控」,于是连 `SBX_TARGET=agent` 都不用带。
+//! 命令走**环境变量**而不是参数:管道形式下传参要写 `sh -s -- …`,而这条命令
+//! 已经够长了;`SBX_TOKEN` 非空本身就足以让 `packaging/install.sh` 判定
+//! 「这是在装被控」,于是连 `SBX_TARGET=agent` 都不用带。
+//!
+//! 下载器用 curl → wget 回退:Alpine/BusyBox 基础系统常有 wget、没有 bash/curl,
+//! 而安装脚本本身是 POSIX sh。只生成 `curl | bash` 会在脚本开始前就失败,谈不上
+//! 后面的 OpenRC 自动安装。
 
 use crate::config::Config;
 
@@ -150,7 +154,9 @@ pub fn command(cfg: &Config, host: &str, token: Option<&str>) -> String {
         "SBX_INSECURE=1 ".into()
     };
 
-    format!("curl -fsSL {INSTALL_URL} | SBX_SERVER='{server}' SBX_TOKEN='{token}' {auth}bash")
+    format!(
+        "(curl -fsSL {INSTALL_URL} 2>/dev/null || wget -qO- {INSTALL_URL}) | SBX_SERVER='{server}' SBX_TOKEN='{token}' {auth}sh"
+    )
 }
 
 /// 弹窗/终端里跟着命令一起给的几句话。
@@ -316,12 +322,13 @@ mod tests {
         cfg.cluster.tls = false;
         let cmd = command(&cfg, "203.0.113.8", Some("tok"));
         assert!(!cmd.contains('\n'), "{cmd}");
-        assert!(cmd.starts_with("curl -fsSL "), "{cmd}");
-        // 环境变量赋值必须落在 `| ` 之后、`bash` 之前 —— `curl … | VAR=x bash`
-        // 是一条合法的 POSIX 简单命令,而 `VAR=x curl … | bash` 会把变量给了 curl。
-        let (_, after_pipe) = cmd.split_once("| ").expect("要有管道");
+        assert!(cmd.starts_with("(curl -fsSL "), "{cmd}");
+        assert!(cmd.contains("|| wget -qO-"), "Alpine 上要能回退到 BusyBox wget:{cmd}");
+        // 环境变量赋值必须落在 `| ` 之后、`sh` 之前 —— `download | VAR=x sh`
+        // 是合法的 POSIX 简单命令,而 `VAR=x download | sh` 会把变量给下载器。
+        let (_, after_pipe) = cmd.rsplit_once("| ").expect("要有管道");
         assert!(after_pipe.starts_with("SBX_SERVER="), "{cmd}");
-        assert!(after_pipe.ends_with(" bash"), "{cmd}");
+        assert!(after_pipe.ends_with(" sh"), "Alpine 默认没有 bash:{cmd}");
         // 值都用单引号包起来:token 是随机串,理论上可以出现 shell 元字符。
         assert!(cmd.contains("SBX_TOKEN='tok'"), "{cmd}");
     }

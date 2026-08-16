@@ -1633,7 +1633,7 @@ mod tests {
         cfg.cluster.tls = false;
         let m = install_modal(&cfg, "203.0.113.8", "t", Some("tok"), Vec::new());
         let Modal::Info { body, copy, .. } = &m else { panic!("应当是信息框") };
-        assert!(body[0].starts_with("curl -fsSL "), "第一行就该是命令: {:?}", body[0]);
+        assert!(body[0].starts_with("(curl -fsSL "), "第一行就该是命令: {:?}", body[0]);
         assert_eq!(copy.as_deref(), Some(body[0].as_str()), "按 y 复制的就该是那一行");
         assert!(body.iter().any(|l| l.contains("只显示这一次")), "带 token 时要有警告");
     }

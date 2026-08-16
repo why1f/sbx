@@ -121,7 +121,7 @@ jobs:
         timeout-minutes: 5
 
   install-script:
-    # `packaging/install.sh` 是一条 `curl | bash`,过去唯一的验证方式是在真机上跑一遍
+    # `packaging/install.sh` 是一条 `download | sh`,过去唯一的验证方式是在真机上跑一遍
     # —— v0.1.2 那个「带参数一律报错」的回归正是这样溜出去的。
     # 这一关把能离线测的部分(参数解析、目标选择、agent.toml 生成、权限)钉住。
     name: install.sh

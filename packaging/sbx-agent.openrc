@@ -1,0 +1,35 @@
+#!/sbin/openrc-run
+# sbx-agent OpenRC service.
+#
+# `supervise-daemon` is deliberate: agent.upgrade replaces the running binary and
+# exits so it can be re-execed. OpenRC must bring it back just like systemd's
+# `Restart=always` does on the other supported Linux distributions.
+
+name="sbx-agent"
+description="sbx agent (embedded sing-box, managed by sbx master)"
+
+command="/usr/local/bin/sbx-agent"
+command_args="/etc/sbx/agent.toml"
+command_user="root:root"
+
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+
+output_log="/var/log/sbx-agent.log"
+error_log="/var/log/sbx-agent.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    if [ ! -r /etc/sbx/agent.toml ]; then
+        eerror "缺少 /etc/sbx/agent.toml;请先运行主控生成的一键接入命令"
+        return 1
+    fi
+    checkpath --file --mode 0600 /etc/sbx/agent.toml
+    checkpath --directory --mode 0750 /var/lib/sbx-agent
+    checkpath --file --mode 0640 /var/log/sbx-agent.log
+}
