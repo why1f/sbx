@@ -83,10 +83,10 @@ pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// 改 agent 的人工设置:名称、网卡月配额、网卡重置日。
+/// 改 agent 的人工设置:名称、网卡月配额、网卡重置日和网卡记账口径。
 ///
-/// **不推进任何 revision**:这三项都不进下发给 agent 的配置 —— 网卡配额是主控侧
-/// 用来算「这台机器烧了多少」的口径(§6.4),agent 自己根本不需要知道。
+/// **不推进任何 revision**:这些项都不进下发给 agent 的配置 —— 网卡配额和口径是主控侧
+/// 用来算「这台机器烧了多少」的规则,agent 自己根本不需要知道。
 /// 为它推进 `config_revision` 等于「改一次配额 = 那台机器重建一次 box」。
 ///
 /// `ipv4` / `ipv6` **不在这里改**:它们每次 `sysinfo.report` 都会被 agent 自探的值
@@ -132,13 +132,16 @@ pub async fn update_settings(
     name: &str,
     nic_quota_bytes: Option<i64>,
     nic_reset_day: Option<i64>,
+    nic_accounting_mode: crate::model::agent::NicAccountingMode,
 ) -> Result<()> {
     let n = sqlx::query(
-        "UPDATE agents SET name = ?, nic_quota_bytes = ?, nic_reset_day = ? WHERE id = ?",
+        "UPDATE agents SET name = ?, nic_quota_bytes = ?, nic_reset_day = ?,
+                           nic_accounting_mode = ? WHERE id = ?",
     )
     .bind(name)
     .bind(nic_quota_bytes)
     .bind(nic_reset_day)
+    .bind(nic_accounting_mode.key())
     .bind(id)
     .execute(pool)
     .await
@@ -305,12 +308,32 @@ mod tests {
     async fn update_settings_persists_without_touching_revisions() {
         let p = pool().await;
         let (id, _) = create(&p, "tokyo-1", 0).await.unwrap();
+        sqlx::query(
+            "INSERT INTO agent_nic_traffic
+               (agent_id, boot_id, last_rx, last_tx, cycle_rx, cycle_tx,
+                cycle_start, last_reset_ym, updated_at)
+             VALUES (?, 'boot', 1000, 2000, 300, 200, 10, '2026-08', 20)",
+        )
+        .bind(id)
+        .execute(&p)
+        .await
+        .unwrap();
 
-        update_settings(&p, id, "tokyo-1a", Some(500 * 1_073_741_824), Some(22)).await.unwrap();
+        update_settings(
+            &p,
+            id,
+            "tokyo-1a",
+            Some(500 * 1_073_741_824),
+            Some(22),
+            crate::model::agent::NicAccountingMode::Sum,
+        )
+        .await
+        .unwrap();
         let a = get(&p, id).await.unwrap().unwrap();
         assert_eq!(a.name, "tokyo-1a");
         assert_eq!(a.nic_quota_bytes, Some(500 * 1_073_741_824));
         assert_eq!(a.nic_reset_day, Some(22));
+        assert_eq!(a.nic_accounting_mode, "sum");
 
         let revs: (i64, i64) =
             sqlx::query_as("SELECT config_revision, user_state_revision FROM agents WHERE id = ?")
@@ -321,10 +344,30 @@ mod tests {
         assert_eq!(revs, (0, 0), "改设置不该让 agent 重建 box");
 
         // 都能清回「不限 / 不重置」。
-        update_settings(&p, id, "tokyo-1a", None, None).await.unwrap();
+        update_settings(
+            &p,
+            id,
+            "tokyo-1a",
+            None,
+            None,
+            crate::model::agent::NicAccountingMode::Max,
+        )
+        .await
+        .unwrap();
         let a = get(&p, id).await.unwrap().unwrap();
         assert_eq!(a.nic_quota_bytes, None);
         assert_eq!(a.nic_reset_day, None);
+        assert_eq!(a.nic_accounting_mode, "max");
+        let raw: (String, i64, i64, i64, i64, i64, String, i64) = sqlx::query_as(
+            "SELECT boot_id, last_rx, last_tx, cycle_rx, cycle_tx, cycle_start,
+                    last_reset_ym, updated_at
+               FROM agent_nic_traffic WHERE agent_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(raw, ("boot".into(), 1000, 2000, 300, 200, 10, "2026-08".into(), 20));
     }
 
     /// 名字撞了要给一句认得出的话,不是 sqlx 的原始错误。
@@ -333,13 +376,31 @@ mod tests {
         let p = pool().await;
         let (id, _) = create(&p, "a", 0).await.unwrap();
         create(&p, "b", 0).await.unwrap();
-        let err = update_settings(&p, id, "b", None, None).await.unwrap_err().to_string();
+        let err = update_settings(
+            &p,
+            id,
+            "b",
+            None,
+            None,
+            crate::model::agent::NicAccountingMode::Sum,
+        ).await.unwrap_err().to_string();
         assert!(err.contains('b'), "错误里要指出冲突的名字: {err}");
     }
 
     #[tokio::test]
     async fn update_settings_on_a_missing_agent_errors() {
         let p = pool().await;
-        assert!(update_settings(&p, 999, "x", None, None).await.is_err());
+        assert!(
+            update_settings(
+                &p,
+                999,
+                "x",
+                None,
+                None,
+                crate::model::agent::NicAccountingMode::Sum,
+            )
+            .await
+            .is_err()
+        );
     }
 }

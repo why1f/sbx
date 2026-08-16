@@ -14,6 +14,7 @@
 - 主控是 sing-box 配置的唯一真源；agent 离线时按最后一次配置冷启动
 - 用户配额、到期、周期重置、流量倍率、手动/自动停用
 - agent 网卡流量、CPU、内存、地址和在线状态
+- 网卡记账口径每台可选:进出合计 / 仅出站 / 仅入站 / 进出取大
 - Base64 分享链接、Clash/Mihomo YAML、浏览器流量页
 - Telegram 绑定、用量查询、阈值告警和定时播报
 - 主控与 agent 自升级，发布资产自动校验 SHA-256
@@ -105,7 +106,7 @@ sbx --config /etc/sbx/config.toml tui
 | 页 | 主要操作 |
 |---|---|
 | 仪表盘 | 集群概况、网速曲线、用户/节点用量排行；`←/→` 换栏，`Enter` 看明细 |
-| 服务管理 | `a` 新增、`E` 编辑、`Enter` 网卡明细、`c` 查看完整 sing-box 配置、`o` 出站策略、`i` 接入命令、`u` 升级 agent、`r` 轮换 token、`d` 删除 |
+| 服务管理 | `a` 新增、`E` 编辑（含网卡记账口径）、`Enter` 网卡明细、`c` 查看完整 sing-box 配置、`o` 出站策略、`i` 接入命令、`u` 升级 agent、`r` 轮换 token、`d` 删除 |
 | 节点 | `a` 新增、`E` 编辑、`Enter` 用户明细、`d` 删除 |
 | 用户 | `a` 新增、`E` 编辑、`n` 分配节点、`b` 绑定网卡用量、`T` token、`r` 重置、`t` 启停、`s` 订阅、`d` 删除 |
 | 设置 | `Enter` 修改配置文件；修改后重启 daemon |
@@ -114,6 +115,8 @@ sbx --config /etc/sbx/config.toml tui
 
 - `[c]` 显示主控现场组装、实际下发的完整配置，**包含原始凭据且不脱敏**；不要截图或外传。
 - `[o]` 按 agent 设置自动、优先 IPv4、优先 IPv6、仅 IPv4、仅 IPv6。
+- `[E]` 里的「网卡记账口径」决定这台机器本周期算多少：进出合计 / 仅出站(TX) / 仅入站(RX) / 进出取大。
+  原始 RX/TX 始终完整保存，切换口径只重算显示，不清零也不改历史；`Enter` 的网卡明细同时给出两者。
 - `[u]` 可升级当前 agent 或全部在线 agent；daemon 负责真正下发。
 - TUI 与 daemon 是两个独立进程，只通过 SQLite 交换状态。
 
@@ -142,6 +145,8 @@ IPv6 输出规则：
 - agent 每 `heartbeat_secs` 主动发送心跳；主控静默超过 `max(3×heartbeat, 30s)` 判定掉线。
 - IPv6 由 agent 先询问内核的 RFC 6724 源地址选择；无全球地址时才查询外部服务。
 - 用户流量按 `(用户, inbound tag)` 记账，不能只按用户名。
+- agent 网卡流量按 `agents.nic_accounting_mode` 投影；原始 RX/TX 分别入库，模式只在读取时生效，
+  绑定网卡的订阅统计用同一份投影。
 - `config_revision` 与 `user_state_revision` 独立：前者重建 box，后者只更新内存禁用名单。
 - Reality、自签 TLS、Shadowsocks 等密钥在创建节点时生成一次并持久化，后续下发不得重新生成。
 - agent 必须由能在进程退出后重新拉起它的 supervisor 管理；systemd 的 `Restart=always` 与 OpenRC 的 `supervise-daemon` 都满足。自升级会原子替换二进制后主动退出，没有 supervisor 就会永久离线。

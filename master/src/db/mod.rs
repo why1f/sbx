@@ -29,6 +29,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/007_agent_commands.sql"),
     include_str!("migrations/008_agent_outbound_strategy.sql"),
     include_str!("migrations/009_agents_autoincrement.sql"),
+    include_str!("migrations/010_agent_nic_accounting_mode.sql"),
 ];
 
 /// 当前程序期望的 schema 版本(= 迁移脚本数量),供 doctor 比对实际库版本。
@@ -289,7 +290,16 @@ mod tests {
         // 再钉一遍那几个最容易漏的:光比「两边一致」的话,两边一起漏了也发现不了。
         let names: Vec<String> = columns(&fresh).await.into_iter().map(|(n, _)| n).collect();
         for must in
-            ["cpu_pct", "mem_used", "mem_total", "load1", "uptime_secs", "sysinfo_at", "outbound_strategy"]
+            [
+                "cpu_pct",
+                "mem_used",
+                "mem_total",
+                "load1",
+                "uptime_secs",
+                "sysinfo_at",
+                "outbound_strategy",
+                "nic_accounting_mode",
+            ]
         {
             assert!(names.contains(&must.to_string()), "重建后的 agents 缺列 {must}:{names:?}");
         }
@@ -357,6 +367,12 @@ mod tests {
         assert_eq!(rx, 111, "重建 agents 表把流量一起删了");
         let agents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents").fetch_one(&pool).await.unwrap();
         assert_eq!(agents, 1, "agent 自己也得留着");
+        let mode: String =
+            sqlx::query_scalar("SELECT nic_accounting_mode FROM agents WHERE name = 'keep-me'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode, "sum", "迁移 010 要给旧 agent 保持原来的 RX+TX 口径");
     }
 
     /// 跨 agent 求和视图(§13.1 第二条)。

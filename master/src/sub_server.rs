@@ -318,8 +318,9 @@ async fn usage_header(pool: &SqlitePool, user_id: i64) -> Result<String> {
 /// 把设了配额的几台加起来当上限,会给出一个「看起来精确但根本不是上限」的数字 ——
 /// 那比不给更糟,因为客户端会拿它算百分比。
 async fn nic_usage(pool: &SqlitePool, user_id: i64) -> Result<Option<(u64, u64, u64)>> {
-    let rows: Vec<(i64, i64, Option<i64>)> = sqlx::query_as(
-        "SELECT COALESCE(t.cycle_rx, 0), COALESCE(t.cycle_tx, 0), a.nic_quota_bytes
+    let rows: Vec<(i64, i64, Option<i64>, String)> = sqlx::query_as(
+        "SELECT COALESCE(t.cycle_rx, 0), COALESCE(t.cycle_tx, 0),
+                a.nic_quota_bytes, a.nic_accounting_mode
            FROM user_nic_bindings b
            JOIN agents a ON a.id = b.agent_id
            LEFT JOIN agent_nic_traffic t ON t.agent_id = b.agent_id
@@ -336,13 +337,13 @@ async fn nic_usage(pool: &SqlitePool, user_id: i64) -> Result<Option<(u64, u64, 
     let mut down: u64 = 0;
     let mut quota: u64 = 0;
     let mut all_capped = true;
-    for (rx, tx, q) in rows {
-        // **tx 是上行,rx 是下行**(站在被控机上看):`/proc/net/dev` 的
-        // Transmit 是它发出去的,Receive 是它收进来的。这两个值最终进
-        // `subscription-userinfo` 的 upload/download,客户端直接照着显示 ——
-        // 接反了就是每个用户的客户端里上下行都是反的。
-        up = up.saturating_add(tx.max(0) as u64);
-        down = down.saturating_add(rx.max(0) as u64);
+    for (rx, tx, q, mode) in rows {
+        // tx 是上行/出站,rx 是下行/入站(站在被控机上看)。每台机器先按自己的
+        // 记账口径投影,再汇总；这样订阅统计与服务管理页的已用量严格一致。
+        let (projected_up, projected_down) =
+            crate::model::agent::NicAccountingMode::parse(&mode).project(rx, tx);
+        up = up.saturating_add(projected_up);
+        down = down.saturating_add(projected_down);
         match q.filter(|v| *v > 0) {
             Some(v) => quota = quota.saturating_add(v as u64),
             None => all_capped = false,
@@ -363,7 +364,14 @@ mod tests {
     /// 建一个用户 + 一台 agent(带网卡用量),返回 `(user_id, agent_id)`。
     async fn fixture(p: &SqlitePool, quota: Option<i64>, rx: i64, tx: i64) -> (i64, i64) {
         let (aid, _) = crate::db::agent_repo::create(p, &format!("a{rx}"), 0).await.unwrap();
-        crate::db::agent_repo::update_settings(p, aid, &format!("a{rx}"), quota, None)
+        crate::db::agent_repo::update_settings(
+            p,
+            aid,
+            &format!("a{rx}"),
+            quota,
+            None,
+            crate::model::agent::NicAccountingMode::Sum,
+        )
             .await
             .unwrap();
         sqlx::query(
@@ -379,6 +387,19 @@ mod tests {
         .unwrap();
         let uid = crate::db::node_repo::add_user(p, &format!("u{rx}"), 0, 0).await.unwrap();
         (uid, aid)
+    }
+
+    async fn set_mode(
+        p: &SqlitePool,
+        agent_id: i64,
+        mode: crate::model::agent::NicAccountingMode,
+    ) {
+        sqlx::query("UPDATE agents SET nic_accounting_mode = ? WHERE id = ?")
+            .bind(mode.key())
+            .bind(agent_id)
+            .execute(p)
+            .await
+            .unwrap();
     }
 
     /// 没绑网卡时照旧:报用户自己的用量 × 倍率。
@@ -420,6 +441,43 @@ mod tests {
         assert!(h.contains("upload=2040"), "两台的 tx 之和,且不乘倍率: {h}");
         assert!(h.contains("download=1030"), "两台的 rx 之和: {h}");
         assert!(h.contains("total=500"), "两台配额之和: {h}");
+    }
+
+    #[tokio::test]
+    async fn nic_binding_applies_each_agents_accounting_mode() {
+        use crate::model::agent::NicAccountingMode;
+        let cases = [
+            (NicAccountingMode::Sum, 200, 300),
+            (NicAccountingMode::Outbound, 200, 0),
+            (NicAccountingMode::Inbound, 0, 300),
+            (NicAccountingMode::Max, 0, 300),
+        ];
+        for (mode, upload, download) in cases {
+            let p = nic_pool().await;
+            let (uid, aid) = fixture(&p, Some(1_000), 300, 200).await;
+            set_mode(&p, aid, mode).await;
+            crate::db::node_repo::set_user_nics(&p, uid, &[aid]).await.unwrap();
+            let h = usage_header(&p, uid).await.unwrap();
+            assert!(h.contains(&format!("upload={upload}")), "{mode:?}: {h}");
+            assert!(h.contains(&format!("download={download}")), "{mode:?}: {h}");
+            assert_eq!(upload + download, mode.account(300, 200), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_agent_modes_are_projected_before_aggregation() {
+        use crate::model::agent::NicAccountingMode;
+        let p = nic_pool().await;
+        let (uid, a1) = fixture(&p, Some(100), 1_000, 2_000).await;
+        let (_, a2) = fixture(&p, Some(400), 30, 40).await;
+        set_mode(&p, a1, NicAccountingMode::Outbound).await;
+        set_mode(&p, a2, NicAccountingMode::Inbound).await;
+        crate::db::node_repo::set_user_nics(&p, uid, &[a1, a2]).await.unwrap();
+
+        let h = usage_header(&p, uid).await.unwrap();
+        assert!(h.contains("upload=2000"), "a1 只计 TX: {h}");
+        assert!(h.contains("download=30"), "a2 只计 RX: {h}");
+        assert!(h.contains("total=500"), "配额规则不随模式变化: {h}");
     }
 
     /// **只要有一台没设配额,总量就报 0(不限)。**

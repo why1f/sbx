@@ -72,6 +72,15 @@ pub fn agent_add() -> Modal {
             vec![
                 Field::text("name", "名称 *必填", ""),
                 Field::text("quota", "网卡月配额 GB (0 = 不限)", "0"),
+                Field::select(
+                    "nic_mode",
+                    "网卡记账口径 (←/→ 切换)",
+                    crate::model::agent::NicAccountingMode::all()
+                        .iter()
+                        .map(|m| m.label().to_string())
+                        .collect(),
+                    0,
+                ),
                 Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", ""),
             ],
             Box::new(|f| {
@@ -87,13 +96,18 @@ pub fn agent_add() -> Modal {
                     name,
                     quota_bytes: if gb > 0.0 { Some((gb * 1_073_741_824.0) as i64) } else { None },
                     reset_day: parse_reset_day(&val(f, "reset"))?,
+                    nic_accounting_mode: crate::model::agent::NicAccountingMode::all()
+                        .get(f.iter().find(|x| x.key == "nic_mode").map(|x| x.index()).unwrap_or(0))
+                        .copied()
+                        .unwrap_or_default(),
                 })
             }),
         )
         .with_note(Box::new(|_| {
             vec![
                 "名称只是给人看的标识(例 tokyo-1),须唯一。".into(),
-                "网卡配额是**这台机器**进出总量的口径(§6.4),不是用户计费用量;".into(),
+                "网卡配额按所选口径读取这台机器的原始 RX/TX(§6.4),不是用户计费用量;".into(),
+                "出站 = TX,入站 = RX;切换口径不会清零或改写原始流量。".into(),
                 "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
                 "确定之后会给出一条填好 token 的接入命令,复制到被控机上跑即可。".into(),
             ]
@@ -385,11 +399,16 @@ pub fn bind_nics(u: &UserRow, agents: &[AgentRow]) -> Modal {
             label: a.name.clone(),
             note: match a.nic_quota_bytes.filter(|q| *q > 0) {
                 Some(q) => format!(
-                    "本周期 {} / 配额 {}",
+                    "本周期 {} / 配额 {} · {}",
                     crate::tui::theme::bytes(a.used()),
-                    crate::tui::theme::bytes(q)
+                    crate::tui::theme::bytes(q),
+                    a.nic_accounting_mode.short()
                 ),
-                None => format!("本周期 {} · 未设配额", crate::tui::theme::bytes(a.used())),
+                None => format!(
+                    "本周期 {} · 未设配额 · {}",
+                    crate::tui::theme::bytes(a.used()),
+                    a.nic_accounting_mode.short()
+                ),
             },
             checked: u.nic_agent_ids.contains(&a.id),
         })
@@ -643,6 +662,7 @@ mod preview {
             ipv6: None,
             nic_quota_bytes: None,
             nic_reset_day: None,
+            nic_accounting_mode: Default::default(),
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,

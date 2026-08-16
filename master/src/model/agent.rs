@@ -40,6 +40,88 @@ impl AgentStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NicAccountingMode {
+    /// RX + TX；保持升级前的默认口径。
+    #[default]
+    Sum,
+    /// 仅计算机器发出的 TX。
+    Outbound,
+    /// 仅计算机器收到的 RX。
+    Inbound,
+    /// 在完整周期累计 RX/TX 中取较大值。
+    Max,
+}
+
+impl NicAccountingMode {
+    pub fn all() -> &'static [Self] {
+        &[Self::Sum, Self::Outbound, Self::Inbound, Self::Max]
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::Outbound => "outbound",
+            Self::Inbound => "inbound",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sum => "进出合计",
+            Self::Outbound => "仅出站(TX)",
+            Self::Inbound => "仅入站(RX)",
+            Self::Max => "进出取大",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Sum => "合计",
+            Self::Outbound => "出站",
+            Self::Inbound => "入站",
+            Self::Max => "取大",
+        }
+    }
+
+    /// 未知值按原来的 RX+TX 口径处理。库可能被手工改过，也可能发生版本回滚。
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "outbound" => Self::Outbound,
+            "inbound" => Self::Inbound,
+            "max" => Self::Max,
+            _ => Self::Sum,
+        }
+    }
+
+    /// 从本周期完整的原始累计值投影记账用量。负值按 0，避免损坏的库产生负用量。
+    pub fn account(self, rx: i64, tx: i64) -> i64 {
+        let rx = rx.max(0);
+        let tx = tx.max(0);
+        match self {
+            Self::Sum => rx.saturating_add(tx),
+            Self::Outbound => tx,
+            Self::Inbound => rx,
+            Self::Max => rx.max(tx),
+        }
+    }
+
+    /// 投影到 subscription-userinfo 的 (upload, download)。未计入的方向归零，
+    /// 因而两项之和始终等于 `account`。相等时把取大值保留在出站/TX。
+    pub fn project(self, rx: i64, tx: i64) -> (u64, u64) {
+        let rx = rx.max(0) as u64;
+        let tx = tx.max(0) as u64;
+        match self {
+            Self::Sum => (tx, rx),
+            Self::Outbound => (tx, 0),
+            Self::Inbound => (0, rx),
+            Self::Max if tx >= rx => (tx, 0),
+            Self::Max => (0, rx),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Agent {
     pub id: i64,
@@ -62,6 +144,8 @@ pub struct Agent {
     pub nic_quota_bytes: Option<i64>,
     /// NULL = 无需重置;否则 1..31。
     pub nic_reset_day: Option<i64>,
+    /// 原始 cycle_rx/cycle_tx 的主控侧记账投影；默认 sum 保持旧行为。
+    pub nic_accounting_mode: String,
     pub config_revision: i64,
     /// 与 `config_revision` **独立递增**(§4.1)。
     pub user_state_revision: i64,
@@ -88,7 +172,8 @@ impl Agent {
     /// 否则很容易画出一个永远是 0% 的进度条。
     pub fn nic_used_percent(&self, cycle_rx: i64, cycle_tx: i64) -> Option<f64> {
         let q = self.nic_quota_bytes.filter(|q| *q > 0)?;
-        Some(((cycle_rx + cycle_tx) as f64 / q as f64 * 100.0).min(100.0))
+        let used = NicAccountingMode::parse(&self.nic_accounting_mode).account(cycle_rx, cycle_tx);
+        Some((used as f64 / q as f64 * 100.0).min(100.0))
     }
 }
 
@@ -131,6 +216,7 @@ mod tests {
             ipv6: None,
             nic_quota_bytes: nic_quota,
             nic_reset_day: None,
+            nic_accounting_mode: "sum".into(),
             config_revision: 0,
             user_state_revision: 0,
             created_at: 0,
@@ -153,10 +239,42 @@ mod tests {
     }
 
     #[test]
-    fn nic_percent_sums_rx_and_tx_and_clamps_at_100() {
-        let a = agent(Some(1_000));
-        assert_eq!(a.nic_used_percent(300, 200), Some(50.0), "口径是 RX+TX(§7.2)");
-        assert_eq!(a.nic_used_percent(9_000, 9_000), Some(100.0), "超出应截到 100");
+    fn nic_modes_use_complete_directional_totals() {
+        let cases = [
+            (NicAccountingMode::Sum, 300, 200, 500, (200, 300)),
+            (NicAccountingMode::Outbound, 300, 200, 200, (200, 0)),
+            (NicAccountingMode::Inbound, 300, 200, 300, (0, 300)),
+            (NicAccountingMode::Max, 300, 200, 300, (0, 300)),
+            (NicAccountingMode::Max, 200, 300, 300, (300, 0)),
+            (NicAccountingMode::Max, 300, 300, 300, (300, 0)),
+        ];
+        for (mode, rx, tx, used, projected) in cases {
+            assert_eq!(mode.account(rx, tx), used, "{mode:?}");
+            assert_eq!(mode.project(rx, tx), projected, "{mode:?}");
+            assert_eq!(projected.0 + projected.1, used as u64, "{mode:?}");
+        }
+        assert_eq!(NicAccountingMode::Sum.account(i64::MAX, i64::MAX), i64::MAX);
+        assert_eq!(NicAccountingMode::Sum.account(-1, 7), 7);
+    }
+
+    #[test]
+    fn nic_mode_keys_round_trip_and_unknown_falls_back_to_sum() {
+        for mode in NicAccountingMode::all() {
+            assert_eq!(NicAccountingMode::parse(mode.key()), *mode);
+        }
+        for bad in ["", "unknown", " SUM "] {
+            assert_eq!(NicAccountingMode::parse(bad), NicAccountingMode::Sum);
+        }
+    }
+
+    #[test]
+    fn nic_percent_uses_selected_mode_and_clamps_at_100() {
+        let mut a = agent(Some(1_000));
+        assert_eq!(a.nic_used_percent(300, 200), Some(50.0), "默认口径是 RX+TX");
+        a.nic_accounting_mode = "inbound".into();
+        assert_eq!(a.nic_used_percent(300, 200), Some(30.0));
+        a.nic_accounting_mode = "outbound".into();
+        assert_eq!(a.nic_used_percent(300, 2_000), Some(100.0), "超出应截到 100");
     }
 
     /// token_hash 绝不能出现在序列化结果里(§11.3 凭据处理)。

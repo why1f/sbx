@@ -227,7 +227,7 @@ impl App {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
                 Some(a) => vec![format!(
-                    "  选中: {}  token: {}…  节点: {} 个  状态: {}  出站: {}{}",
+                    "  选中: {}  token: {}…  节点: {} 个  状态: {}  网卡: {}  出站: {}{}",
                     a.name,
                     a.token_prefix,
                     a.node_count,
@@ -236,6 +236,7 @@ impl App {
                         "offline" => "● 离线",
                         _ => "○ 从未连接",
                     },
+                    a.nic_accounting_mode.short(),
                     a.outbound.label(),
                     if self.pending_cmds > 0 {
                         format!("   ⋯ {} 条升级待下发", self.pending_cmds)
@@ -1240,6 +1241,8 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
         _ => "0".into(),
     };
     let reset = a.nic_reset_day.map(|d| d.to_string()).unwrap_or_default();
+    let nic_modes = crate::model::agent::NicAccountingMode::all();
+    let nic_mode_idx = nic_modes.iter().position(|m| *m == a.nic_accounting_mode).unwrap_or(0);
 
     Modal::Form(
         Form::new(
@@ -1247,6 +1250,12 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
             vec![
                 Field::text("name", "名称 *必填", &a.name),
                 Field::text("quota", "网卡月配额 GB (0 = 不限)", &quota),
+                Field::select(
+                    "nic_mode",
+                    "网卡记账口径 (←/→ 切换)",
+                    nic_modes.iter().map(|m| m.label().to_string()).collect(),
+                    nic_mode_idx,
+                ),
                 Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", &reset),
             ],
             Box::new(move |f| {
@@ -1263,13 +1272,18 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                     name,
                     quota_bytes: if gb > 0.0 { Some((gb * 1_073_741_824.0) as i64) } else { None },
                     reset_day: forms::parse_reset_day(&val(f, "reset"))?,
+                    nic_accounting_mode: crate::model::agent::NicAccountingMode::all()
+                        .get(f.iter().find(|x| x.key == "nic_mode").map(|x| x.index()).unwrap_or(0))
+                        .copied()
+                        .unwrap_or_default(),
                 })
             }),
         )
         .head(format!("#{} {}(IP 由 agent 自探上报,改了会被下一次上报覆盖)", a.id, a.name))
         .with_note(Box::new(|_| {
             vec![
-                "网卡配额是**机器**进出总量的口径(§6.4),不是用户计费用量。".into(),
+                "网卡配额按所选口径读取机器原始 RX/TX,不是用户计费用量。".into(),
+                "出站 = TX,入站 = RX;切换只重算当前周期,不会清零原始流量。".into(),
                 "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
             ]
         })),
@@ -1303,12 +1317,18 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
     let now = chrono::Local::now().timestamp();
 
     match action {
-        Action::AddAgent { name, quota_bytes, reset_day } => {
+        Action::AddAgent { name, quota_bytes, reset_day, nic_accounting_mode } => {
             let (id, token) = agent_repo::create(&app.pool, name, now).await?;
-            // 配额与重置日在建的时候就填进去,免得建完还要再进一次编辑框。
-            if quota_bytes.is_some() || reset_day.is_some() {
-                agent_repo::update_settings(&app.pool, id, name, *quota_bytes, *reset_day).await?;
-            }
+            // 配额、重置日和记账口径在创建时一并写入。
+            agent_repo::update_settings(
+                &app.pool,
+                id,
+                name,
+                *quota_bytes,
+                *reset_day,
+                *nic_accounting_mode,
+            )
+            .await?;
             // token 明文只在这里出现这一次。库里只有 hash 与前 8 位(§8.1)。
             let host = app.master_host();
             app.modal = Some(install_modal(
@@ -1321,9 +1341,20 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已新增 agent #{id} {name}"))
         }
 
-        Action::EditAgent { id, name, quota_bytes, reset_day } => {
-            agent_repo::update_settings(&app.pool, *id, name, *quota_bytes, *reset_day).await?;
-            Ok(format!("已保存 agent #{id} {name} 的设置(只影响主控侧的记账口径)"))
+        Action::EditAgent { id, name, quota_bytes, reset_day, nic_accounting_mode } => {
+            agent_repo::update_settings(
+                &app.pool,
+                *id,
+                name,
+                *quota_bytes,
+                *reset_day,
+                *nic_accounting_mode,
+            )
+            .await?;
+            Ok(format!(
+                "已保存 agent #{id} {name} 的设置(网卡口径:{};不改 agent 配置)",
+                nic_accounting_mode.label()
+            ))
         }
 
         Action::ShowInstall { id, name } => {
@@ -2018,10 +2049,74 @@ mod tests {
         a.page = Page::Agents;
         a.agents = vec![data::AgentRow {
             outbound: OutboundStrategy::Ipv6Only,
+            nic_accounting_mode: crate::model::agent::NicAccountingMode::Max,
             ..stub_agent(1)
         }];
         let ops = a.ops_lines().join("\n");
         assert!(ops.contains("仅 IPv6"), "摘要里该有当前策略:\n{ops}");
+        // 网卡口径没有自己的列(那会让本来就挤的表更挤),所以摘要行是
+        // 唯一能扫到它的地方 —— 少了它,「这台为什么只算了一半」无从查起。
+        assert!(ops.contains("取大"), "摘要里该有当前网卡口径:\n{ops}");
+    }
+
+    /// 编辑框要**预选**这台机器当前的网卡口径,提交后原样带回来。
+    ///
+    /// 预选错的表现最阴:人只想改个配额,一保存却把口径顺手改回了默认,
+    /// 而界面上没有任何提示 —— 下个月的账就对不上了。
+    #[tokio::test]
+    async fn the_agent_form_round_trips_the_nic_accounting_mode() {
+        use crate::model::agent::NicAccountingMode;
+        use modal::Outcome;
+
+        for mode in NicAccountingMode::all() {
+            let row = data::AgentRow { nic_accounting_mode: *mode, ..stub_agent(9) };
+            let mut m = agent_edit(&row);
+            let Modal::Form(f) = &m else { panic!("应当是表单") };
+            let field = f.fields.iter().find(|x| x.key == "nic_mode").expect("该有口径字段");
+            assert_eq!(field.value(), mode.label(), "{mode:?} 该被预选中");
+
+            // 不动任何字段直接提交,取值必须原样回来。
+            let Outcome::Run(Action::EditAgent { nic_accounting_mode, .. }) =
+                m.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("Enter 该提交出一个 EditAgent")
+            };
+            assert_eq!(nic_accounting_mode, *mode, "提交后该还是 {mode:?}");
+        }
+    }
+
+    /// 新增框默认「进出合计」——升级到这一版的行为不该变。
+    /// ←/→ 循环一圈能取到全部四个口径。
+    #[tokio::test]
+    async fn the_add_agent_form_defaults_to_sum_and_cycles_through_every_mode() {
+        use crate::model::agent::NicAccountingMode;
+        use modal::Outcome;
+
+        let all = NicAccountingMode::all();
+        for (steps, want) in (0..all.len()).map(|i| (i, all[i])) {
+            let mut m = forms::agent_add();
+            // 焦点先落到口径那一栏(名称 → 配额 → 口径)。
+            for _ in 0..2 {
+                m.handle(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            }
+            for _ in 0..steps {
+                m.handle(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            }
+            let Modal::Form(f) = &m else { panic!("应当是表单") };
+            // 名称必填,补一个再提交。
+            let name_idx = f.fields.iter().position(|x| x.key == "name").unwrap();
+            let Modal::Form(f) = &mut m else { unreachable!() };
+            f.focus = name_idx;
+            for c in "a".chars() {
+                m.handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            let Outcome::Run(Action::AddAgent { nic_accounting_mode, .. }) =
+                m.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("Enter 该提交出一个 AddAgent")
+            };
+            assert_eq!(nic_accounting_mode, want, "按了 {steps} 下 → 该是 {want:?}");
+        }
     }
 
     /// `[T]` 打开 token 管理,`[r]` 弹重置流量的确认框。
@@ -2505,6 +2600,7 @@ mod tests {
             ipv6: None,
             nic_quota_bytes: None,
             nic_reset_day: None,
+            nic_accounting_mode: Default::default(),
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,

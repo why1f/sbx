@@ -28,6 +28,7 @@ pub struct AgentRow {
     pub ipv6: Option<String>,
     pub nic_quota_bytes: Option<i64>,
     pub nic_reset_day: Option<i64>,
+    pub nic_accounting_mode: crate::model::agent::NicAccountingMode,
     pub cycle_rx: i64,
     pub cycle_tx: i64,
     /// None = 还没有两次可比的采样(刚打开 TUI,或 boot_id 刚变)。
@@ -48,7 +49,7 @@ pub struct AgentRow {
 
 impl AgentRow {
     pub fn used(&self) -> i64 {
-        self.cycle_rx.saturating_add(self.cycle_tx)
+        self.nic_accounting_mode.account(self.cycle_rx, self.cycle_tx)
     }
 
     /// 用量占配额的比例。无配额返回 `None` —— 调用方**必须**显式处理这一态,
@@ -502,6 +503,7 @@ struct AgentQueryRow {
     ipv6: Option<String>,
     nic_quota_bytes: Option<i64>,
     nic_reset_day: Option<i64>,
+    nic_accounting_mode: String,
     cpu_pct: Option<f64>,
     mem_used: Option<i64>,
     mem_total: Option<i64>,
@@ -549,7 +551,7 @@ pub async fn load_agents(
     // 否则「加了但还没连上」的那台会直接看不见,而那正是最需要排查的一台。
     let rows: Vec<AgentQueryRow> = sqlx::query_as(
         "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.arch, a.outbound_strategy, a.ipv4, a.ipv6,
-                a.nic_quota_bytes, a.nic_reset_day,
+                a.nic_quota_bytes, a.nic_reset_day, a.nic_accounting_mode,
                 a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
                 a.last_seen,
                 t.boot_id,
@@ -589,6 +591,9 @@ pub async fn load_agents(
                 ipv6: r.ipv6,
                 nic_quota_bytes: r.nic_quota_bytes,
                 nic_reset_day: r.nic_reset_day,
+                nic_accounting_mode: crate::model::agent::NicAccountingMode::parse(
+                    &r.nic_accounting_mode,
+                ),
                 cycle_rx: r.cycle_rx,
                 cycle_tx: r.cycle_tx,
                 up_per_sec: up,
@@ -924,6 +929,7 @@ mod tests {
             ipv6: None,
             nic_quota_bytes: None,
             nic_reset_day: None,
+            nic_accounting_mode: Default::default(),
             cycle_rx: 50,
             cycle_tx: 50,
             up_per_sec: None,
@@ -944,6 +950,56 @@ mod tests {
         // 超额时夹到 1.0,不画出界。
         a.nic_quota_bytes = Some(10);
         assert_eq!(a.quota_ratio(), Some(1.0));
+    }
+
+    #[test]
+    fn agent_usage_and_quota_follow_the_selected_nic_mode() {
+        use crate::model::agent::NicAccountingMode;
+        let mut a = AgentRow {
+            nic_quota_bytes: Some(200),
+            cycle_rx: 120,
+            cycle_tx: 80,
+            nic_accounting_mode: NicAccountingMode::Sum,
+            ..agent_row_for_test()
+        };
+        for (mode, used, ratio) in [
+            (NicAccountingMode::Sum, 200, 1.0),
+            (NicAccountingMode::Outbound, 80, 0.4),
+            (NicAccountingMode::Inbound, 120, 0.6),
+            (NicAccountingMode::Max, 120, 0.6),
+        ] {
+            a.nic_accounting_mode = mode;
+            assert_eq!(a.used(), used, "{mode:?}");
+            assert_eq!(a.quota_ratio(), Some(ratio), "{mode:?}");
+        }
+    }
+
+    fn agent_row_for_test() -> AgentRow {
+        AgentRow {
+            id: 1,
+            name: "a".into(),
+            token_prefix: "abcd1234".into(),
+            status: "online".into(),
+            agent_version: None,
+            arch: Some("amd64".into()),
+            outbound: Default::default(),
+            ipv4: None,
+            ipv6: None,
+            nic_quota_bytes: None,
+            nic_reset_day: None,
+            nic_accounting_mode: Default::default(),
+            cycle_rx: 0,
+            cycle_tx: 0,
+            up_per_sec: None,
+            down_per_sec: None,
+            node_count: 0,
+            cpu_pct: None,
+            mem_used: None,
+            mem_total: None,
+            load1: None,
+            uptime_secs: None,
+            sysinfo_at: None,
+        }
     }
 
     /// 用户用量要乘倍率 —— 与 §6.3 的判定同一个口径。

@@ -537,7 +537,7 @@ fn top_nodes(
 pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = Vec::new();
 
-    let nic_total = a.cycle_rx.saturating_add(a.cycle_tx);
+    let accounted = a.used();
     out.push(Line::from(vec![
         Span::styled("  网卡本周期  ", Style::default().fg(theme::DIM)),
         // **tx 是上行,rx 是下行**(站在这台被控机上看):`/proc/net/dev` 的
@@ -546,8 +546,11 @@ pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
         // 时刻才露馅(涨的是 ↑)。
         Span::styled(format!("↑ {:<10}", theme::bytes(a.cycle_tx)), Style::default().fg(theme::UP)),
         Span::styled(format!("↓ {:<10}", theme::bytes(a.cycle_rx)), Style::default().fg(theme::DOWN)),
-        Span::styled("合计 ", Style::default().fg(theme::DIM)),
-        Span::styled(theme::bytes(nic_total), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("计入({}) ", a.nic_accounting_mode.short()),
+            Style::default().fg(theme::DIM),
+        ),
+        Span::styled(theme::bytes(accounted), Style::default().add_modifier(Modifier::BOLD)),
     ]));
 
     let mut quota = vec![Span::styled("  配额        ", Style::default().fg(theme::DIM))];
@@ -732,8 +735,9 @@ const RESET_LABEL_COLS: u16 = 15;
 const IPV6_COLS: u16 = 40;
 
 fn columns(total_width: u16) -> Cols {
-    // 减掉左右边框(2),以及 ratatui 在各列之间插的间隔(五列 = 四个;
-    // 加上主机列就是五个)。漏算的话总宽超出可用空间,ratatui 会静默压缩各列。
+    // 减掉左右边框(2),以及**基础形态**下 ratatui 在各列之间插的间隔:
+    // 四个内容列 + 末尾吃余量的空列 = 五列 = 四个间隔。
+    // 每多一个可选列就多一个间隔,那部分在下面逐项扣。
     let avail = total_width.saturating_sub(2 + 4);
     const IDEAL: (u16, u16, u16, u16) = (18, 22, 14, TRAFFIC_COL);
     const NARROW: (u16, u16, u16, u16) = (14, 18, 13, 0);
@@ -753,8 +757,6 @@ fn columns(total_width: u16) -> Cols {
     };
 
     // 主机列多占一个列间隔,所以门槛比它自身宽一格。
-    let host = if avail > ideal_sum + HOST_COL { HOST_COL } else { 0 };
-
     // 出站策略列排在主机列**前面**让位:主机那两个数字(CPU/内存)是锦上添花,
     // 而出站策略是一个「改了就得确认」的设置项 —— 窄屏上先保它。
     let outbound = if avail > ideal_sum + OUTBOUND_COL { OUTBOUND_COL } else { 0 };
@@ -767,6 +769,14 @@ fn columns(total_width: u16) -> Cols {
     // 不收的话右边会空出十几格,把重置/出站/主机整体推远,而百分比和重置日
     // 本来该是挨着的。这一行是那个「太远了」的直接修法。
     let traffic = if reset > 0 { traffic.min(TRAFFIC_COL_TIGHT) } else { traffic };
+
+    // 主机列**按已经定下来的那几列算余量**,不能像上面两列那样独立判断。
+    // 独立判断会让它在 121 列凭空出现:那时前面几列已经把宽度吃满,总宽被
+    // 撑过边框最多 8 格,而 ratatui 会静默压缩各列 ——「终端明明更宽了,
+    // 每一列反而更挤」正是这么来的。`+ 1` 是它自己多占的那个列间隔。
+    let fixed = name + ip + speed + traffic + outbound + reset;
+    let optional_cols = u16::from(outbound > 0) + u16::from(reset > 0);
+    let host = if fixed + HOST_COL + optional_cols < avail { HOST_COL } else { 0 };
 
     // 进度条用流量列里除去重置日之后剩下的地方。剩不下 4 格就别画了:
     // 三四格的条读不出比例,只是占地方 —— 那时改用文字百分比。
@@ -786,11 +796,11 @@ fn columns(total_width: u16) -> Cols {
     // 放在最后做:前面那些「够不够宽就加一列」的判断都基于常规宽度,
     // 先把 IP 撑宽会把出站/重置/主机列挤掉 —— 那几列比「看全 IPv6」更常用。
     //
-    // `avail` 在函数开头按 5 列扣了间隔,而这里实际最多 7 列。
+    // `avail` 开头只按基础形态扣了 4 个间隔,每个可选列还各多占一个。
     // 少扣的那部分不能算进可用余量,否则会把总宽撑过边框、
     // 让 ratatui 静默压缩各列(§13.4 要防的正是这个)。
     let shown_cols = 4 + u16::from(host > 0) + u16::from(outbound > 0) + u16::from(reset > 0);
-    let gaps_unaccounted = shown_cols.saturating_sub(5);
+    let gaps_unaccounted = shown_cols.saturating_sub(4);
     let used = name + ip + speed + traffic + host + outbound + reset + gaps_unaccounted;
     let ip = ip + avail.saturating_sub(used).min(IPV6_COLS.saturating_sub(ip));
 
@@ -799,10 +809,22 @@ fn columns(total_width: u16) -> Cols {
 
 pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now: i64) {
     let c = columns(area.width);
-    let table_rows: Vec<Row> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
+    // 一台 agent 占两行；一条终端空行就是用户所说的「半行」间距。
+    // 这张表目前没有滚动视口，所以只有全部记录都放得下时才加间距，
+    // 否则保持原来的紧凑布局，不能为了好看把选中项挤出屏幕。
+    let data_height = area.height.saturating_sub(3) as usize; // 上下边框 + 表头
+    let spaced_height = rows.len().saturating_mul(3).saturating_sub(1);
+    let add_spacing = !rows.is_empty() && spaced_height <= data_height;
+    let mut table_rows: Vec<Row> = Vec::with_capacity(rows.len() * 2);
+    for (i, a) in rows.iter().enumerate() {
+        // 间隔用一条**独立的空 Row**,不是给上一行加 `bottom_margin`:
+        // margin 属于它所在的那一行,选中态的底色会连着盖过去 ——
+        // 于是恰恰在正看着的那一台下面,间距被填成一整块实心底色,
+        // 白加了一行还看不出分隔。空 Row 没有 style,永远是干净的。
+        if add_spacing && i > 0 {
+            table_rows.push(Row::new(Vec::<Cell>::new()).height(1));
+        }
+        {
             let (dot, dot_color, state_text) = match a.status.as_str() {
                 "online" => ("●", theme::ONLINE, "在线"),
                 "offline" => ("●", theme::OFFLINE, "离线"),
@@ -891,13 +913,17 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
                     second.extend(inline_reset);
                     (Line::from(format!("{used}/{quota}")), Line::from(second))
                 }
-                None => (
-                    Line::from(vec![
-                        Span::raw(used),
-                        Span::styled(" · 不限流量", Style::default().fg(theme::DIM)),
-                    ]),
-                    Line::from(inline_reset.into_iter().collect::<Vec<_>>()),
-                ),
+                None => {
+                    let mut second = vec![Span::styled(" —", Style::default().fg(theme::DIM))];
+                    second.extend(inline_reset);
+                    (
+                        Line::from(vec![
+                            Span::raw(used),
+                            Span::styled(" · 不限流量", Style::default().fg(theme::DIM)),
+                        ]),
+                        Line::from(second),
+                    )
+                }
             };
 
             // 重置列:两行式,跟着表格本来的两行走。
@@ -962,9 +988,9 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
                 cells.push(host_cell);
             }
             cells.push(Cell::from(""));
-            Row::new(cells).height(2).style(row_style(i == selected))
-        })
-        .collect();
+            table_rows.push(Row::new(cells).height(2).style(row_style(i == selected)));
+        }
+    }
 
     let mut constraints = vec![
         Constraint::Length(c.name),
@@ -1687,6 +1713,7 @@ mod tests {
             ipv6: Some("2001:db8:1:aaaa:1234:5678:9abc:def0".into()),
             nic_quota_bytes: quota,
             nic_reset_day: day,
+            nic_accounting_mode: Default::default(),
             cycle_rx: 34 * 1_073_741_824,
             cycle_tx: 0,
             up_per_sec: Some(8_600.0),
@@ -2118,12 +2145,161 @@ mod tests {
 
     #[test]
     fn column_widths_always_fit() {
-        for w in 20..200u16 {
+        for w in 20..260u16 {
             let c = columns(w);
-            let used = c.name + c.ip + c.speed + c.traffic;
-            let avail = w.saturating_sub(2 + 4);
-            assert!(used <= avail.max(1) || avail == 0, "宽度 {w}:列合计 {used} > 可用 {avail}");
+            // 每一根 `Constraint::Length` 都要算进去,还有 ratatui 在列之间插的
+            // 间隔(列数 - 1,末尾那根吃余量的空列也占一个位)和左右边框。
+            // 只核对四个基础列的话,「变宽了反而更挤」那类溢出根本抓不到:
+            // 主机列在 121 列凭空出现时,总���一次撑过边框 8 格。
+            let cols = 4 + u16::from(c.host > 0) + u16::from(c.outbound > 0)
+                + u16::from(c.reset > 0)
+                + 1;
+            let total = c.name + c.ip + c.speed + c.traffic + c.host + c.outbound + c.reset
+                + (cols - 1)
+                + 2;
+            assert!(total <= w.max(1), "宽度 {w}:列合计 {total} 超了");
         }
+    }
+
+    /// 一台机器的用量、进度条、网卡明细都要跟着**它自己的**记账口径走。
+    #[test]
+    fn the_traffic_column_follows_the_agents_accounting_mode() {
+        use crate::model::agent::NicAccountingMode;
+        let base = AgentRow {
+            cycle_rx: 30 * 1_073_741_824,
+            cycle_tx: 10 * 1_073_741_824,
+            ..agent(Some(100 * 1_073_741_824), Some(22))
+        };
+        for (mode, used, pct) in [
+            (NicAccountingMode::Sum, "40.00 GB", "40%"),
+            (NicAccountingMode::Outbound, "10.00 GB", "10%"),
+            (NicAccountingMode::Inbound, "30.00 GB", "30%"),
+            (NicAccountingMode::Max, "30.00 GB", "30%"),
+        ] {
+            let a = AgentRow { nic_accounting_mode: mode, ..base.clone() };
+            let out =
+                draw_to_string(140, 6, |f| agents(f, f.area(), std::slice::from_ref(&a), 0, NOW));
+            assert!(out.contains(used), "{mode:?} 的已用量该是 {used}:\n{out}");
+            assert!(out.contains(pct), "{mode:?} 的百分比该是 {pct}:\n{out}");
+        }
+    }
+
+    /// 网卡明细要同时给出**原始方向**和**按口径计入**的那个数 ——
+    /// 少了前者没法和厂商账单对,少了后者不知道进度条是怎么算出来的。
+    #[test]
+    fn nic_info_shows_raw_directions_and_the_accounted_total() {
+        use crate::model::agent::NicAccountingMode;
+        let a = AgentRow {
+            nic_accounting_mode: NicAccountingMode::Outbound,
+            cycle_rx: 30 * 1_073_741_824,
+            cycle_tx: 10 * 1_073_741_824,
+            ..agent(Some(100 * 1_073_741_824), Some(22))
+        };
+        let text: String = nic_info(&a, NOW)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains("↑ 10.00 GB"), "原始 TX 要在:{text}");
+        assert!(text.contains("↓ 30.00 GB"), "原始 RX 要在:{text}");
+        assert!(has_cjk(&text, "计入(出站)"), "要写明按哪个口径计:{text}");
+        assert!(text.contains("10.00 GB / 100.00 GB"), "配额行该用计入值:{text}");
+        assert!(has_cjk(&text, "剩 90.00 GB"), "剩余也该按计入值算:{text}");
+    }
+
+    /// 不限流量的那一行,第二行画一条**暗色短横线**而不是留空。
+    ///
+    /// 留空的那一版看起来像这一行只有一行内容,和上下两台机器黏在一起 ——
+    /// 而缺 IPv6 时早就是用 `—` 占位的,两处要一致。
+    #[test]
+    fn unlimited_traffic_draws_a_dim_dash_instead_of_a_gap() {
+        let mut term = Terminal::new(TestBackend::new(140, 6)).unwrap();
+        term.draw(|f| agents(f, f.area(), &[agent(None, None)], 0, NOW)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // y=2 是第一行内容,y=3 是它的第二行。IPv4/IPv6 这一台都有,
+        // 所以第二行上的 `—` 只可能来自流量列。
+        let dashes: Vec<u16> =
+            (0..buf.area.width).filter(|x| buf[(*x, 3)].symbol() == "—").collect();
+        assert_eq!(dashes.len(), 1, "第二行该正好有一条短横线:{dashes:?}");
+        assert_eq!(
+            buf[(dashes[0], 3)].style().fg,
+            Some(theme::DIM),
+            "占位的短横线要用暗色,不能抢眼"
+        );
+    }
+
+    /// 缺 IPv6 同样是一条短横线 —— 这条规则一直在,但没人钉过。
+    #[test]
+    fn a_missing_ipv6_renders_as_a_dash() {
+        let a = AgentRow { ipv6: None, ..agent(Some(500 * 1_073_741_824), Some(22)) };
+        let out =
+            draw_to_string(140, 6, |f| agents(f, f.area(), std::slice::from_ref(&a), 0, NOW));
+        assert!(out.contains('—'), "缺 IPv6 该占位:\n{out}");
+    }
+
+    /// 放得下的时候,相邻两台机器之间空一行 —— 用户说的「半行」间距。
+    ///
+    /// 一台机器占两行,而终端画不出半行,所以一条空行就是最小的那一档。
+    /// **最后一台后面不加**:加了会在底边框前面多出一条空白,
+    /// 而且会让恰好放得下的那一屏少掉一行内容。
+    #[test]
+    fn agents_are_separated_by_one_blank_line_when_there_is_room() {
+        let rows = vec![
+            agent(Some(500 * 1_073_741_824), Some(22)),
+            AgentRow { id: 2, name: "osaka".into(), ..agent(None, None) },
+        ];
+        // 边框 2 + 表头 1 + (2 + 1 + 2) = 8,正好放得下。
+        let out = draw_to_string(140, 8, |f| agents(f, f.area(), &rows, 0, NOW));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[2].contains("tokyo-1"), "第一台在这儿:\n{out}");
+        assert!(lines[3].contains("v0.1.0"), "它的第二行:\n{out}");
+        assert!(blank_inner(lines[4]), "两台之间该空一行:\n{out}");
+        assert!(lines[5].contains("osaka"), "第二台紧跟着空行:\n{out}");
+        assert!(lines[6].contains("v0.1.0"), "它的第二行:\n{out}");
+        assert!(lines[7].starts_with('└'), "最后一台后面不该再插空行:\n{out}");
+    }
+
+    /// 一行除了左右边框之外什么都没有。`draw_to_string` 只裁行尾空白,
+    /// 表格的竖边框仍在,所以不能直接 `trim().is_empty()`。
+    fn blank_inner(line: &str) -> bool {
+        line.trim_matches(|c| c == '│' || c == ' ').is_empty()
+    }
+
+    /// 空行**不属于选中行**:选中态的底色只该盖住那两行内容。
+    #[test]
+    fn the_spacer_row_is_not_part_of_the_selection() {
+        let rows = vec![
+            agent(Some(500 * 1_073_741_824), Some(22)),
+            AgentRow { id: 2, name: "osaka".into(), ..agent(None, None) },
+        ];
+        let mut term = Terminal::new(TestBackend::new(140, 8)).unwrap();
+        term.draw(|f| agents(f, f.area(), &rows, 0, NOW)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in [2u16, 3] {
+            assert_eq!(buf[(2, y)].style().bg, Some(theme::ROW_BG), "选中行第 {y} 行该有底色");
+        }
+        assert_ne!(buf[(2, 4)].style().bg, Some(theme::ROW_BG), "空行不该跟着高亮");
+    }
+
+    /// **高度不够就退回紧凑布局。** 这张表没有滚动视口,行数一多就从底下裁掉;
+    /// 无条件加空行等于凭空少放三分之一的机器,而被裁掉的那台看不出来。
+    #[test]
+    fn spacing_is_dropped_when_the_rows_would_not_all_fit() {
+        let rows: Vec<AgentRow> = (1..=3)
+            .map(|i| AgentRow { id: i, name: format!("m{i}"), ..agent(None, None) })
+            .collect();
+        // 三台紧凑要 6 行,带间距要 8 行。给 7 行数据高度(总高 10)只能紧凑。
+        let out = draw_to_string(140, 10, |f| agents(f, f.area(), &rows, 0, NOW));
+        let lines: Vec<&str> = out.lines().collect();
+        for (i, y) in [2usize, 4, 6].iter().enumerate() {
+            assert!(lines[*y].contains(&format!("m{}", i + 1)), "第 {i} 台该在第 {y} 行:\n{out}");
+        }
+
+        // 再给一行就放得开了。
+        let out = draw_to_string(140, 11, |f| agents(f, f.area(), &rows, 0, NOW));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(blank_inner(lines[4]), "宽裕时该插空行:\n{out}");
+        assert!(lines[8].contains("m3"), "第三台该被推到第 8 行:\n{out}");
     }
 
     #[test]
@@ -2864,11 +3040,16 @@ mod tests {
                 &nic_rows
             ))
         );
-        println!("── 服务管理 ──\n{}\n", draw_to_string(120, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW)));
+        println!("── 服务管理 ──\n{}\n", draw_to_string(120, 12, |f| agents(f, f.area(), &agents_rows, 1, NOW)));
         // 宽一点才画得下「主机」列(CPU / 内存)。
         println!(
             "── 服务管理(140 列,多一个主机列)──\n{}\n",
-            draw_to_string(140, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW))
+            draw_to_string(140, 12, |f| agents(f, f.area(), &agents_rows, 1, NOW))
+        );
+        // 高度不够时自动退回紧凑布局,不留空行。
+        println!(
+            "── 服务管理(高度不足,紧凑)──\n{}\n",
+            draw_to_string(120, 9, |f| agents(f, f.area(), &agents_rows, 1, NOW))
         );
         println!("── 节点 ──\n{}\n", draw_to_string(120, 9, |f| nodes(f, f.area(), &node_rows, 1)));
         println!(

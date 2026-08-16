@@ -42,12 +42,14 @@ pub enum Action {
         /// `None` = 不限流量。0 和 NULL 在界面上是同一件事,库里统一存 NULL。
         quota_bytes: Option<i64>,
         reset_day: Option<i64>,
+        nic_accounting_mode: crate::model::agent::NicAccountingMode,
     },
     EditAgent {
         id: i64,
         name: String,
         quota_bytes: Option<i64>,
         reset_day: Option<i64>,
+        nic_accounting_mode: crate::model::agent::NicAccountingMode,
     },
     RotateToken { id: i64, name: String },
     DeleteAgent { id: i64, name: String },
