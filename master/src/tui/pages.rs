@@ -1369,11 +1369,6 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
                         let label = forms::reset_day_label(u.reset_day);
                         // 今天正好是重置日 → 标出来。用量突然归零时,
                         // 第一反应是「统计坏了」,而这一格能立刻解释清楚。
-                        //
-                        // **光有颜色不够。** 有人报过「16 号那天这个字是黄的、
-                        // 别的日子是白的,是不是坏了」—— 颜色说不出它在标什么。
-                        // 这一列只有 6 格,塞不下「今天」两个字,所以那句话在
-                        // 「操作」面板的摘要行里(`mod.rs::ops_lines`),两处配套。
                         if u.reset_day == Some(today as i64) {
                             Cell::from(Span::styled(label, Style::default().fg(theme::ACCENT)))
                         } else {
