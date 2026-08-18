@@ -806,7 +806,8 @@ agent 的 tracker 从进程启动才开始数,`new` 就是这段时间真实发�
   而这条命令已经够长了;`SBX_TOKEN` 非空本身就足以让脚本判定「这是在装被控」,
   于是连 `SBX_TARGET=agent` 都不用带(`packaging/install.sh`)。
   脚本收到这三个值会写好 `/etc/sbx/agent.toml`(**0600**,里面是明文 token),然后按当前机器
-  的 supervisor 接入:systemd `enable --now`,OpenRC 加入 `default` runlevel 并启动。
+  的 supervisor 接入:systemd `enable` + `restart`,OpenRC 加入 `default` runlevel 并启动,
+  最后回读一次运行状态(§11.4)。
   没有 supervisor 时只安装并打印手动命令,不会把一次性后台进程伪装成可靠服务。
   **主控地址不问人**(`install::resolve_host`),按这个次序定:
 
@@ -1099,7 +1100,8 @@ reality 依赖 uTLS、hysteria2 / tuic 依赖 QUIC(§9.1 的跨语言 golden 测
 - **每个产物配一个独立的 `.sha256`**,`agent.upgrade`(§4.2)按 `<asset>.sha256` 下载校验
 
 Release 共八项:主控双架构 tar.gz 与各自校验和、agent 双架构裸二进制与各自校验和。
-`agent.example.toml`、systemd/OpenRC service 不重复上传；安装脚本从目标版本源码 tag 获取。
+`agent.example.toml` 不重复上传,安装脚本从目标版本源码 tag 获取；systemd/OpenRC
+service 内嵌在 `install.sh` 里(§11.4),既不占资产也不依赖网络。
 主控 `config.example.toml` 与 `sbx.service` 仍留在已校验的 tar.gz 内。
 
 ### 11.2 主控配置文件
@@ -1159,9 +1161,22 @@ supervisor。Linux 安装脚本按命令是否真实存在分流:
 - 没有任一 supervisor 的容器仍可手动 `exec /usr/local/bin/sbx-agent /etc/sbx/agent.toml`,
   但崩溃或 `agent.upgrade` 主动退出后不会自动恢复。
 
-主控运行管理不随 agent 分流改变,仍由 systemd unit 负责。服务文件和 agent 示例配置是
-tracked 源码资产,安装脚本从与二进制相同的 `v${VERSION}` tag 获取,避免旧版本二进制
-误配未来 `main` 的启动参数。
+**service 文件由 `install.sh` 自带,不从网络获取。** v0.4.18 曾改成按 tag 从
+`raw.githubusercontent.com` 拉取；那台主机在部分网络里不可达,取不到时脚本只提示
+「跳过」,于是机器上根本没有 service,agent 只能手工前台运行 —— 表现是「装完能用,
+关机再开机就再也不上线」,而主控侧只看到一盏灭掉的灯。两个 service 文件是静态文本,
+不该让部署能否熬过一次重启依赖第二个必须可达的域名。`packaging/test-install.sh` 有
+golden 用例保证内嵌副本与 `packaging/` 下的文件逐字节一致。仅 `agent.example.toml`
+仍按 `v${VERSION}` tag 获取:它只是参考样本,取不到不影响运行。
+
+**开机自启是部署的一部分,不是「现在要不要提供服务」的策略选择。** 一台在跑但没
+enable 的 agent 从外面完全正常,直到下一次重启才失联,而主控无法区分「机器关着」和
+「服务没设自启」。因此每条安装/升级路径都调用 `ensure_boot_autostart`(已设好时是空
+操作),设不上时打印可照抄的命令并继续 —— 不能因为一条警告让整条安装命令带着 `set -e`
+退出,那会把「二进制已经换好了」也一起吞掉。启动之后回读 `is-active`:起不来要当场
+说,不能照样打一句成功提示。
+
+主控运行管理不随 agent 分流改变,仍由 systemd unit 负责。
 
 ---
 
