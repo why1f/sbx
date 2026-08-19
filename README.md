@@ -61,9 +61,8 @@ sbx --config /etc/sbx/config.toml doctor
 ```
 
 它会安装 `sbx-agent`、写入 `/etc/sbx/agent.toml`（0600）并加入当前机器的 supervisor：
-有 systemd 时放置 `sbx-agent.service`、`systemctl enable` 后 restart，有 OpenRC 时安装 `/etc/init.d/sbx-agent`、加入 `default` runlevel 并启动；启动后回读一次运行状态，起不来会当场报出来并给查日志的命令。
-两个 service 文件内嵌在安装脚本里，不走网络——它们决定这台机器重启后还能不能回来，不该多依赖一个必须可达的域名。`agent.example.toml` 按目标版本从源码 tag 下载，取不到只是少一份样本。
-**开机自启每次安装/升级都会确保一遍**，所以一台在跑但当初没设上自启的机器，重跑一次安装命令就修好了。
+有 systemd 时执行 `systemctl enable --now sbx-agent`，有 OpenRC 时安装 `/etc/init.d/sbx-agent`、加入 `default` runlevel 并启动。
+服务文件和 `agent.example.toml` 按目标版本从源码 tag 下载，不占 GitHub Release 静态资产。
 没有 supervisor 时只安装文件，不会伪造一个无法自愈的后台服务；手动启动命令为
 `/usr/local/bin/sbx-agent /etc/sbx/agent.toml`，崩溃或自升级退出后不会自动拉起。
 轮换 token 后，把 TUI 新生成的命令再运行一次即可；旧配置会备份为

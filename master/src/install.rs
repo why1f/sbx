@@ -163,7 +163,7 @@ pub fn command(cfg: &Config, host: &str, token: Option<&str>) -> String {
 pub fn notes(host: &str, has_token: bool) -> Vec<String> {
     let mut out = vec![
         "整条复制到被控机上跑(root)。脚本会装好 sbx-agent、写 /etc/sbx/agent.toml(0600)、".into(),
-        "把它接进本机的 systemd/OpenRC 并设好开机自启。以后重跑同一条命令就是升级。".into(),
+        "并 enable --now sbx-agent。以后重跑同一条命令就是升级。".into(),
     ];
     if host.trim().is_empty() || host.starts_with('<') {
         out.push(String::new());

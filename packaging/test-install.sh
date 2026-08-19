@@ -129,86 +129,33 @@ contains "有 rc-service/rc-update/openrc-run → openrc" "openrc" "$out"
 out=$(run PATH="$empty_path" /bin/sh -c ". '$INSTALL_SH'; detect_init_system; printf '%s' \"\$INIT_SYSTEM\"")
 contains "两种 init 都没有 → none" "none" "$out"
 
-out=$(run sh -c ". '$INSTALL_SH'; source_asset_url 1.2.3 agent.example.toml")
-check "示例配置按版本 tag 取" \
-    "https://raw.githubusercontent.com/why1f/sbx/v1.2.3/packaging/agent.example.toml" "$out"
+out=$(run sh -c ". '$INSTALL_SH'; source_asset_url 1.2.3 sbx-agent.openrc")
+check "服务文件按版本 tag 取" \
+    "https://raw.githubusercontent.com/why1f/sbx/v1.2.3/packaging/sbx-agent.openrc" "$out"
 
-# service 文件是脚本自带的,不走网络。这两条 golden 用例是那份自带副本和
-# packaging/ 下真文件之间的唯一约束 —— 改了一边忘了另一边,这里就挂。
-run sh -c ". '$INSTALL_SH'; write_agent_unit_systemd '$TMP/emb.service'" >/dev/null
-if diff -u "$SCRIPT_DIR/sbx-agent.service" "$TMP/emb.service" >"$TMP/emb.diff" 2>&1; then
-    ok "install.sh 内嵌的 sbx-agent.service 与源文件逐字节一致"
-else
-    no "install.sh 内嵌的 sbx-agent.service 与源文件逐字节一致" "$(cat "$TMP/emb.diff")"
-fi
-run sh -c ". '$INSTALL_SH'; write_agent_unit_openrc '$TMP/emb.openrc'" >/dev/null
-if diff -u "$SCRIPT_DIR/sbx-agent.openrc" "$TMP/emb.openrc" >"$TMP/emb.diff" 2>&1; then
-    ok "install.sh 内嵌的 sbx-agent.openrc 与源文件逐字节一致"
-else
-    no "install.sh 内嵌的 sbx-agent.openrc 与源文件逐字节一致" "$(cat "$TMP/emb.diff")"
-fi
-
-# **v0.4.18 回归锚点。** 当时 unit 文件改成从 raw.githubusercontent.com 按 tag 取,
-# 那台主机在国内 VPS 上时常连不上;取不到时脚本只说一句「跳过」,于是机器上根本
-# 没有 service,agent 只能手工跑 —— 关机再开机就再也不上线,而主控只显示离线。
-# 所以这里让 fetch_asset 全线失败,unit 仍然必须落地。
-rm -rf "$TMP/init" "$TMP/etc" "$TMP/unit"
-mkdir -p "$TMP/init" "$TMP/etc" "$TMP/unit"
-run sh -c "
-    . '$INSTALL_SH'
-    INIT_SYSTEM=openrc
-    fetch_asset() { return 1; }
-    install_agent_assets 1.2.3
-" >/dev/null
-[ -x "$TMP/init/sbx-agent" ] && ok "网络全断时 OpenRC service 仍然安装为可执行文件" \
-    || no "网络全断时 OpenRC service 仍然安装为可执行文件" "文件不存在或不可执行"
-contains "OpenRC unit 使用 supervise-daemon" 'supervisor="supervise-daemon"' "$(cat "$TMP/init/sbx-agent")"
-contains "OpenRC unit 自升级后无限拉起" 'respawn_max=0' "$(cat "$TMP/init/sbx-agent")"
-contains "OpenRC unit 修正配置权限" 'checkpath --file --mode 0600 /etc/sbx/agent.toml' "$(cat "$TMP/init/sbx-agent")"
-
-run /bin/sh -c "
-    . '$INSTALL_SH'
-    INIT_SYSTEM=systemd
-    fetch_asset() { return 1; }
-    install_agent_assets 1.2.3
-" >/dev/null
-[ -f "$TMP/unit/sbx-agent.service" ] && ok "网络全断时 sbx-agent.service 仍然落地" \
-    || no "网络全断时 sbx-agent.service 仍然落地" "文件不存在"
-contains "unit 里有 Restart=always(自升级的前提)" "Restart=always" "$(cat "$TMP/unit/sbx-agent.service")"
-
-# 已有的 unit 不能被覆盖:人可能改过 LimitNOFILE 或加过代理环境变量。
-printf 'CUSTOM\n' > "$TMP/unit/sbx-agent.service"
-run /bin/sh -c "
-    . '$INSTALL_SH'
-    INIT_SYSTEM=systemd
-    fetch_asset() { return 1; }
-    install_agent_assets 1.2.3
-" >/dev/null
-check "已存在的 unit 不被覆盖" "CUSTOM" "$(cat "$TMP/unit/sbx-agent.service")"
-rm -f "$TMP/unit/sbx-agent.service"
-
-mkdir -p "$TMP/etc"
-run sh -c "
+rm -rf "$TMP/init" "$TMP/etc"
+mkdir -p "$TMP/init" "$TMP/etc"
+out=$(run sh -c "
     . '$INSTALL_SH'
     INIT_SYSTEM=openrc
     fetch_asset() {
         case \"\$3\" in
+            sbx-agent.openrc) cp '$SCRIPT_DIR/sbx-agent.openrc' \"\$2\" ;;
             agent.example.toml) cp '$SCRIPT_DIR/agent.example.toml' \"\$2\" ;;
             *) return 1 ;;
         esac
     }
     install_agent_assets 1.2.3
-" >/dev/null
+")
+[ -x "$TMP/init/sbx-agent" ] && ok "OpenRC service 安装为可执行文件" || no "OpenRC service 安装为可执行文件" "文件不存在或不可执行"
+contains "OpenRC unit 使用 supervise-daemon" 'supervisor="supervise-daemon"' "$(cat "$TMP/init/sbx-agent")"
+contains "OpenRC unit 自升级后无限拉起" 'respawn_max=0' "$(cat "$TMP/init/sbx-agent")"
+contains "OpenRC unit 修正配置权限" 'checkpath --file --mode 0600 /etc/sbx/agent.toml' "$(cat "$TMP/init/sbx-agent")"
 [ -f "$TMP/etc/agent.example.toml" ] && ok "agent.example.toml 从源码 tag 安装" || no "agent.example.toml 从源码 tag 安装" "文件不存在"
 
 # 用 fake OpenRC 记录 start/restart/rc-update 调用,不碰本机 init。
-#
-# rc-update 是**有状态**的:`add` 往 $ENABLED_DB 里写一行,`show default` 再读出来。
-# ensure_boot_autostart 在 enable 之后会重新查一次确认(enable 报成功但其实没生效
-# 是真会发生的事),假命令必须能反映这一点,否则测的就不是同一条路径。
 fake_service="$TMP/fake-service"
 calls="$TMP/service-calls"
-enabled_db="$TMP/openrc-enabled"
 mkdir -p "$fake_service"
 cat > "$fake_service/rc-service" <<'EOF'
 #!/bin/sh
@@ -222,123 +169,62 @@ EOF
 cat > "$fake_service/rc-update" <<'EOF'
 #!/bin/sh
 printf 'rc-update %s\n' "$*" >> "$CALLS"
-case "${1:-}" in
-    add)
-        [ "${FAKE_ENABLE_FAILS:-0}" = "1" ] && exit 1
-        printf '%s\n' "${2:-}" >> "$ENABLED_DB"
-        ;;
-    show)
-        [ -f "$ENABLED_DB" ] && awk '{ printf "   %s | default\n", $1 }' "$ENABLED_DB"
-        ;;
-esac
 exit 0
 EOF
 chmod +x "$fake_service"/*
 
 : > "$calls"
-rm -f "$enabled_db"
-run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" SBX_TOKEN=tok FAKE_ACTIVE=0 \
+run PATH="$fake_service:$PATH" CALLS="$calls" SBX_TOKEN=tok FAKE_ACTIVE=0 \
     sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; start_agent" >/dev/null
 body=$(cat "$calls")
 contains "OpenRC 首次接入加入 default runlevel" "rc-update add sbx-agent default" "$body"
 contains "OpenRC 未运行时 start" "rc-service sbx-agent start" "$body"
 
 : > "$calls"
-run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" SBX_TOKEN=tok FAKE_ACTIVE=1 \
+run PATH="$fake_service:$PATH" CALLS="$calls" SBX_TOKEN=tok FAKE_ACTIVE=1 \
     sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; start_agent" >/dev/null
 contains "OpenRC 已运行且换 token 时 restart" "rc-service sbx-agent restart" "$(cat "$calls")"
 
-# 上一条已经把 sbx-agent 加进 default 了,这一条不该再 add 一遍。
 : > "$calls"
-run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" SBX_TOKEN=tok FAKE_ACTIVE=1 \
-    sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; start_agent" >/dev/null
-lacks "已在 default runlevel 里就不重复 add" "rc-update add" "$(cat "$calls")"
-
-: > "$calls"
-run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" FAKE_ACTIVE=1 \
+run PATH="$fake_service:$PATH" CALLS="$calls" FAKE_ACTIVE=1 \
     sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; start_agent" >/dev/null
 contains "只升级二进制时,原服务在跑才 restart" "rc-service sbx-agent restart" "$(cat "$calls")"
 
-# **这条是这次故障的正面用例。** 一台在跑但没设开机自启的机器(v0.4.18~v0.4.22
-# 取不到 unit、只能手工跑起来的那些)跑一次升级命令,就该把开机自启补上 ——
-# 不然它下一次重启还是回不来,而人以为「升级过了应该没问题」。
 : > "$calls"
-rm -f "$enabled_db"
-out=$(run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" FAKE_ACTIVE=1 \
-    sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; restart_if_running sbx-agent")
-contains "升级时给在跑但没自启的服务补上开机自启" "rc-update add sbx-agent default" "$(cat "$calls")"
-contains "补上之后要说出来" "已设置 sbx-agent 开机自启" "$out"
-
-# enable 本身失败时不能报成功 —— 那台机器重启后是真的回不来,必须留一句话。
-: > "$calls"
-rm -f "$enabled_db"
-out=$(run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" \
-        FAKE_ACTIVE=1 FAKE_ENABLE_FAILS=1 \
-    sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; restart_if_running sbx-agent")
-contains "设不上开机自启要明确警告" "重启后不会自动上线" "$out"
-contains "警告里带可照抄的命令" "rc-update add sbx-agent default" "$out"
-
-: > "$calls"
-run PATH="$fake_service:$PATH" CALLS="$calls" ENABLED_DB="$enabled_db" SBX_TOKEN=tok FAKE_ACTIVE=1 \
+run PATH="$fake_service:$PATH" CALLS="$calls" SBX_TOKEN=tok FAKE_ACTIVE=1 \
     sh -c ". '$INSTALL_SH'; INIT_SYSTEM=openrc; NO_RESTART=1; start_agent" >/dev/null
 check "--no-restart 不调用 OpenRC" "" "$(cat "$calls")"
 
 # systemd 路径保留原来的接入/仅升级语义,也不让主控误走 OpenRC。
 fake_systemctl_calls="$TMP/systemctl-calls"
-systemd_enabled_db="$TMP/systemd-enabled"
 cat > "$fake_systemd/systemctl" <<'EOF'
 #!/bin/sh
 printf 'systemctl %s\n' "$*" >> "$CALLS"
-case "${1:-}" in
-    is-active)
-        [ "${FAKE_ACTIVE:-0}" = "1" ]
-        exit $?
-        ;;
-    is-enabled)
-        [ -f "$ENABLED_DB" ]
-        exit $?
-        ;;
-    enable)
-        [ "${FAKE_ENABLE_FAILS:-0}" = "1" ] && exit 1
-        : > "$ENABLED_DB"
-        ;;
-esac
+if [ "${1:-}" = "is-active" ]; then
+    [ "${FAKE_ACTIVE:-0}" = "1" ]
+    exit $?
+fi
 exit 0
 EOF
 chmod +x "$fake_systemd/systemctl"
 mkdir -p "$TMP/unit"
 : > "$TMP/unit/sbx-agent.service"
 : > "$fake_systemctl_calls"
-rm -f "$systemd_enabled_db"
-run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" ENABLED_DB="$systemd_enabled_db" \
-        SBX_TOKEN=tok FAKE_ACTIVE=1 \
+run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" SBX_TOKEN=tok FAKE_ACTIVE=1 \
     /bin/sh -c ". '$INSTALL_SH'; INIT_SYSTEM=systemd; start_agent" >/dev/null
 body=$(cat "$fake_systemctl_calls")
-contains "systemd 接入时 enable" "systemctl enable sbx-agent" "$body"
+contains "systemd 接入时 enable" "systemctl enable --now sbx-agent" "$body"
 contains "systemd 接入时 restart" "systemctl restart sbx-agent" "$body"
-
-# 起不来的时候必须说「没起来」,不能照样打一句成功。
 : > "$fake_systemctl_calls"
-rm -f "$systemd_enabled_db"
-out=$(run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" ENABLED_DB="$systemd_enabled_db" \
-        SBX_TOKEN=tok FAKE_ACTIVE=0 \
-    /bin/sh -c ". '$INSTALL_SH'; INIT_SYSTEM=systemd; start_agent")
-contains "systemd 启动失败要当场报出来" "sbx-agent 没起来" "$out"
-contains "失败提示带查日志的命令" "journalctl -u sbx-agent" "$out"
-lacks "失败时不能同时说已启动" "sbx-agent 已启动" "$out"
-
-: > "$fake_systemctl_calls"
-run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" ENABLED_DB="$systemd_enabled_db" FAKE_ACTIVE=1 \
+run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" FAKE_ACTIVE=1 \
     /bin/sh -c ". '$INSTALL_SH'; INIT_SYSTEM=systemd; start_agent" >/dev/null
 contains "systemd 无 token 且 active 时 restart" "systemctl restart sbx-agent" "$(cat "$fake_systemctl_calls")"
 : > "$fake_systemctl_calls"
-run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" ENABLED_DB="$systemd_enabled_db" \
-        SBX_TOKEN=tok FAKE_ACTIVE=1 \
+run PATH="$fake_systemd" CALLS="$fake_systemctl_calls" SBX_TOKEN=tok FAKE_ACTIVE=1 \
     /bin/sh -c ". '$INSTALL_SH'; INIT_SYSTEM=systemd; NO_RESTART=1; start_agent" >/dev/null
 check "--no-restart 不调用 systemd" "" "$(cat "$fake_systemctl_calls")"
 : > "$calls"
-run PATH="$fake_service" CALLS="$calls" ENABLED_DB="$enabled_db" \
-    /bin/sh -c ". '$INSTALL_SH'; restart_master_if_running"
+run PATH="$fake_service" CALLS="$calls" /bin/sh -c ". '$INSTALL_SH'; restart_master_if_running"
 check "主控仍只使用 systemd" "" "$(cat "$calls")"
 
 out=$(run SBX_TOKEN=tok sh -c ". '$INSTALL_SH'; INIT_SYSTEM=none; start_agent")

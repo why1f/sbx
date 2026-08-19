@@ -169,12 +169,8 @@ detect_init_system() {
     info "init 系统:$INIT_SYSTEM"
 }
 
-# agent.example.toml 属于源码,不重复占 GitHub Release 资产。按**目标版本 tag**取,
-# 不能固定 main:用 --version 装旧二进制时示例配置也该是同版本的。
-#
-# 只有这个示例文件走网络。**service 文件不走** —— 它们是部署能不能熬过一次重启的
-# 前提,不能挂在第二个必须可达的域名上(见 write_agent_unit_systemd 上面那段)。
-# 这个取不到只是少一份参考样本,不影响 agent 运行。
+# 服务文件属于源码,不重复占 GitHub Release 资产。按**目标版本 tag**取,
+# 不能固定 main:用 --version 装旧二进制时必须配同版本的 unit/config。
 source_asset_url() {
     printf 'https://raw.githubusercontent.com/%s/v%s/packaging/%s' "$REPO" "$1" "$2"
 }
@@ -289,66 +285,12 @@ manual_restart_command() {
     esac
 }
 
-manual_enable_command() {
-    case "$INIT_SYSTEM" in
-        systemd) printf 'systemctl enable --now %s' "$1" ;;
-        openrc)  printf 'rc-update add %s default && rc-service %s start' "$1" "$1" ;;
-        *)       printf '这台机器没有 systemd/OpenRC,开机自启得自己接一个 supervisor' ;;
-    esac
-}
-
 service_is_active() {
     case "$INIT_SYSTEM" in
         systemd) systemctl is-active --quiet "$1" 2>/dev/null ;;
         openrc)  rc-service "$1" status >/dev/null 2>&1 ;;
         *)       return 1 ;;
     esac
-}
-
-# 开机自启是否已经设好。
-#
-# OpenRC 侧不用 `grep sbx-agent` —— `rc-update show default` 的输出是
-# `   sbx-agent | default` 这种带分隔符的表格,子串匹配会被别的服务名蹭上
-# (比如某天多一个 sbx-agent-exporter)。用 awk 精确比第一个字段。
-service_is_enabled() {
-    case "$INIT_SYSTEM" in
-        systemd) systemctl is-enabled --quiet "$1" 2>/dev/null ;;
-        openrc)  rc-update show default 2>/dev/null |
-                     awk -v n="$1" '$1 == n { hit = 1 } END { exit !hit }' ;;
-        *)       return 1 ;;
-    esac
-}
-
-service_enable() {
-    case "$INIT_SYSTEM" in
-        # 只 enable,不 --now:「开机要不要起」和「现在要不要起」是两件事,
-        # 调用方各自决定后者(接入时 restart,升级时沿用原来的运行状态)。
-        systemd) systemctl enable "$1" >/dev/null 2>&1 ;;
-        openrc)  rc-update add "$1" default >/dev/null 2>&1 ;;
-        *)       return 1 ;;
-    esac
-}
-
-# 确保 agent 开机自启。**每条安装/升级路径都要过一遍。**
-#
-# 这不是「要不要现在开始提供服务」那类策略选择,而是部署的一部分:一台在跑但没
-# enable 的 agent 从外面看完全正常,直到下一次重启 —— 它再也不上线,而主控只显示
-# 一盏灭掉的灯,不会告诉你「这台机器的服务没设开机自启」。v0.4.18~v0.4.22 取不到
-# unit 文件的机器就是这样:靠手工命令跑着,重启即失联。所以升级时顺手补上,
-# 已经 enable 的是无副作用的空操作。
-ensure_boot_autostart() {
-    _unit="$1"
-    case "$INIT_SYSTEM" in
-        systemd|openrc) ;;
-        *) return 0 ;;
-    esac
-    service_is_enabled "$_unit" && return 0
-    if service_enable "$_unit" && service_is_enabled "$_unit"; then
-        info "已设置 $_unit 开机自启($INIT_SYSTEM)"
-        return 0
-    fi
-    info "警告:$_unit 没设开机自启,这台机器重启后不会自动上线。手动执行:$(manual_enable_command "$_unit")"
-    return 1
 }
 
 service_restart() {
@@ -376,8 +318,6 @@ restart_master_if_running() {
 
 # agent 单元在跑才重启。没跑的话装完不该顺手把它拉起来 ——
 # 那等于替用户决定「这台机器现在开始提供服务」。systemd/OpenRC 语义一致。
-#
-# 但**开机自启要补**:在跑说明这台机器就是要提供服务的,那它重启后也应该回来。
 restart_if_running() {
     _unit="$1"
     if [ "$NO_RESTART" -ne 0 ]; then
@@ -385,13 +325,9 @@ restart_if_running() {
         return 0
     fi
     if service_is_active "$_unit"; then
-        # `|| true`:设不上开机自启只是一条警告,不该让整条安装命令带着 set -e 退出
-        # —— 那会把「二进制已经换好了」这件事也一起吞掉。
-        ensure_boot_autostart "$_unit" || true
         service_restart "$_unit" && info "已重启 $_unit($INIT_SYSTEM)"
     else
         info "$_unit 未在运行,只替换了二进制"
-        info "要让它现在启动并开机自启:$(manual_enable_command "$_unit")"
     fi
 }
 
@@ -498,130 +434,28 @@ install_master() {
     restart_master_if_running
 }
 
-# ── 服务文件由脚本自带,不从网络取 ──
-#
-# v0.4.18 把 unit / OpenRC 文件从 Release 资产改成按 tag 去
-# raw.githubusercontent.com 取。那台主机在不少网络里(尤其是国内 VPS)会被
-# DNS 污染或 TLS 重置;取不到时 fetch_asset 只说一句「跳过」,紧接着
-# start_agent 因为找不到 unit 而退化成「你自己手动跑一下」——
-# **手动跑起来的进程熬不过一次重启**。现场症状是「装完能用,关机再开机就
-# 再也不上线了」,而且从主控那边只看到一盏灭掉的灯,完全看不出跟网络有关。
-#
-# 这两个文件是几十行静态文本,本来就不该多依赖一个必须可达的域名。写死在
-# 这里之后接入流程只需要 GitHub Release 一个下载源;
-# `test-install.sh` 有一条 golden 用例保证它们和 packaging/ 下的文件逐字节一致,
-# 改了那边忘了改这边会在 CI 里挂掉,而不是等下一次重启才在机房里暴露。
-write_agent_unit_systemd() {
-    cat > "$1" <<'SBX_AGENT_SERVICE_EOF'
-[Unit]
-Description=sbx agent (embedded sing-box, managed by sbx master)
-Documentation=https://github.com/why1f/sbx
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/sbx-agent /etc/sbx/agent.toml
-
-# Restart=always 是 §11.2 自升级的**前提**,不是可选的加固项:
-# agent.upgrade 的收尾动作是「替换掉自己的二进制,然后退出」——
-# 靠 supervisor 拉起新版本。没有它,一次升级等于一次永久下线。
-Restart=always
-RestartSec=3
-
-# last-applied.json 落在 /var/lib/sbx-agent(agent.toml 里的 state_dir)。
-# StateDirectory 让 systemd 建好目录并设属主。
-StateDirectory=sbx-agent
-StateDirectoryMode=0750
-ConfigurationDirectory=sbx
-ConfigurationDirectoryMode=0750
-
-# sing-box 要监听特权端口(443 等),但不需要 root 的其余能力。
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-
-# 自升级要用 rename 覆盖 /usr/local/bin/sbx-agent,所以那条路径必须可写 ——
-# 这是 ProtectSystem=strict 下唯一需要额外开口的地方。
-# 不用自升级的部署可以删掉这一行,那时 agent.upgrade 会明确报错而不是静默失败。
-ProtectSystem=strict
-ReadWritePaths=/usr/local/bin
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictNamespaces=true
-LockPersonality=true
-
-# 代理进程的连接数很容易顶到默认的 1024。
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-SBX_AGENT_SERVICE_EOF
-}
-
-write_agent_unit_openrc() {
-    cat > "$1" <<'SBX_AGENT_OPENRC_EOF'
-#!/sbin/openrc-run
-# sbx-agent OpenRC service.
-#
-# `supervise-daemon` is deliberate: agent.upgrade replaces the running binary and
-# exits so it can be re-execed. OpenRC must bring it back just like systemd's
-# `Restart=always` does on the other supported Linux distributions.
-
-name="sbx-agent"
-description="sbx agent (embedded sing-box, managed by sbx master)"
-
-command="/usr/local/bin/sbx-agent"
-command_args="/etc/sbx/agent.toml"
-command_user="root:root"
-
-supervisor="supervise-daemon"
-respawn_delay=3
-respawn_max=0
-
-output_log="/var/log/sbx-agent.log"
-error_log="/var/log/sbx-agent.log"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    if [ ! -r /etc/sbx/agent.toml ]; then
-        eerror "缺少 /etc/sbx/agent.toml;请先运行主控生成的一键接入命令"
-        return 1
-    fi
-    checkpath --file --mode 0600 /etc/sbx/agent.toml
-    checkpath --directory --mode 0750 /var/lib/sbx-agent
-    checkpath --file --mode 0640 /var/log/sbx-agent.log
-}
-SBX_AGENT_OPENRC_EOF
-}
-
 install_agent_assets() {
     _asset_ver="$1"
     [ -d "$CONF_DIR" ] || install -d -m750 "$CONF_DIR"
     case "$INIT_SYSTEM" in
         systemd)
             [ -d "$UNIT_DIR" ] || install -d -m755 "$UNIT_DIR"
-            # 已有的 unit 绝不覆盖 —— 人可能改过 LimitNOFILE、加过代理环境变量。
             if [ ! -f "$UNIT_DIR/sbx-agent.service" ]; then
-                write_agent_unit_systemd "$UNIT_DIR/sbx-agent.service"
-                chmod 644 "$UNIT_DIR/sbx-agent.service"
-                systemctl daemon-reload 2>/dev/null || true
-                info "已放置 sbx-agent.service"
+                if fetch_asset "$(source_asset_url "$_asset_ver" sbx-agent.service)" \
+                    "$UNIT_DIR/sbx-agent.service" "sbx-agent.service"; then
+                    systemctl daemon-reload || true
+                    info "已放置 sbx-agent.service"
+                fi
             fi
             ;;
         openrc)
             [ -d "$INIT_DIR" ] || install -d -m755 "$INIT_DIR"
             if [ ! -f "$INIT_DIR/sbx-agent" ]; then
-                write_agent_unit_openrc "$INIT_DIR/sbx-agent"
-                chmod 755 "$INIT_DIR/sbx-agent"
-                info "已放置 OpenRC service:$INIT_DIR/sbx-agent"
+                if fetch_asset "$(source_asset_url "$_asset_ver" sbx-agent.openrc)" \
+                    "$INIT_DIR/sbx-agent" "sbx-agent.openrc"; then
+                    chmod 755 "$INIT_DIR/sbx-agent"
+                    info "已放置 OpenRC service:$INIT_DIR/sbx-agent"
+                fi
             fi
             ;;
         none)
@@ -671,48 +505,37 @@ start_agent() {
         systemd)
             [ -f "$UNIT_DIR/sbx-agent.service" ] || {
                 info "没有 sbx-agent.service,不启动。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
-                info "注意:这样跑起来的进程重启后不会自动回来"
                 return 0
             }
-            ensure_boot_autostart sbx-agent || true
-            # 已经在跑的进程读的是旧配置(比如旧 token),必须重启才会用新的。
-            # restart 对没在跑的单元等价于 start,所以这一条同时覆盖首次接入。
-            systemctl restart sbx-agent 2>/dev/null || true
+            if systemctl enable --now sbx-agent 2>/dev/null; then
+                # 已经在跑的进程读的是旧配置(比如旧 token),必须重启才会用新的。
+                systemctl restart sbx-agent || true
+                info "sbx-agent 已启用并启动。看日志:journalctl -u sbx-agent -f"
+            else
+                info "systemctl enable --now sbx-agent 失败,自己看一眼:systemctl status sbx-agent"
+            fi
             ;;
         openrc)
             [ -x "$INIT_DIR/sbx-agent" ] || {
                 info "没有 OpenRC service,不启动。手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
-                info "注意:这样跑起来的进程重启后不会自动回来"
                 return 0
             }
-            ensure_boot_autostart sbx-agent || true
-            if rc-service sbx-agent status >/dev/null 2>&1; then
-                rc-service sbx-agent restart || true
-            else
-                rc-service sbx-agent start || true
+            if ! rc-update add sbx-agent default >/dev/null 2>&1; then
+                info "rc-update add sbx-agent default 失败"
+                return 0
             fi
+            if rc-service sbx-agent status >/dev/null 2>&1; then
+                rc-service sbx-agent restart
+            else
+                rc-service sbx-agent start
+            fi
+            info "sbx-agent 已加入 default runlevel 并启动。看日志:tail -f /var/log/sbx-agent.log"
             ;;
         none)
             info "没有 systemd/OpenRC,手动跑:$BIN_DIR/sbx-agent $AGENT_CONF"
             info "没有 supervisor 时 agent 自升级退出后不会自动拉起"
-            return 0
             ;;
     esac
-
-    # **起来了没有,要当场说。** 之前这里只报告「已启用并启动」,
-    # 那句话在单元起不来时同样会打出来,人看到成功提示就走了,等主控那盏灯
-    # 一直不亮才回来查 —— 而那时早就不记得装的时候有没有异常了。
-    if service_is_active sbx-agent; then
-        case "$INIT_SYSTEM" in
-            systemd) info "sbx-agent 已启动。看日志:journalctl -u sbx-agent -f" ;;
-            openrc)  info "sbx-agent 已启动。看日志:tail -f /var/log/sbx-agent.log" ;;
-        esac
-    else
-        case "$INIT_SYSTEM" in
-            systemd) info "警告:sbx-agent 没起来。看原因:systemctl status sbx-agent;journalctl -u sbx-agent -n 30 --no-pager" ;;
-            openrc)  info "警告:sbx-agent 没起来。看原因:rc-service sbx-agent status;tail -n 30 /var/log/sbx-agent.log" ;;
-        esac
-    fi
 }
 
 main() {

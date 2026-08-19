@@ -185,34 +185,6 @@ systemctl start sbx
 B 机应退避重试并自动重连。主控默认在 30 秒静默后把 agent 标为离线；TUI 中掉线灯为红色。
 重连后 revision 一致时不应重复重建 box。
 
-### 3.5b 关机再开机（被控端）
-
-这条要单独测，因为它验证的不是重连逻辑而是**开机自启**——两者在 TUI 上看起来完全一样。
-
-```sh
-# B 机
-systemctl is-enabled sbx-agent        # systemd，应输出 enabled
-rc-update show default | grep sbx-agent   # OpenRC，应能看到 sbx-agent
-poweroff
-# 从面板重新开机后
-systemctl is-active sbx-agent
-```
-
-开机后 1 分钟内主控的服务管理页应重新亮起（agent 退避上限 60 秒）。
-
-**开机后一直不上线时按这个顺序查**（都在 B 机上）：
-
-```sh
-systemctl is-enabled sbx-agent        # disabled/not-found → 就是开机自启没设上
-systemctl is-active  sbx-agent        # inactive/failed    → 起来了但崩了
-journalctl -u sbx-agent -n 30 --no-pager    # 崩的原因；OpenRC 看 /var/log/sbx-agent.log
-ls -l /etc/systemd/system/sbx-agent.service # 文件不存在 → 当初 unit 没装上
-```
-
-`is-enabled` 报 `disabled` 或 unit 根本不存在，说明这台机器当时是被手工拉起来的
-（v0.4.18~v0.4.22 取不到 service 文件时会走到那条路）。重跑一次不带 `SBX_TOKEN` 的
-安装命令即可修好：它会补上 service 文件和开机自启，不动现有配置。
-
 ### 3.6 流量记账与进程重启
 
 用真实客户端经过 B 机节点产生流量，然后在 A 机检查：
