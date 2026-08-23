@@ -1241,6 +1241,13 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
         _ => "0".into(),
     };
     let reset = a.nic_reset_day.map(|d| d.to_string()).unwrap_or_default();
+    let tz = forms::nic_offset_label(a.nic_reset_offset_secs);
+    // agent 报了什么就写进标签里,而不是再加一条 note —— 弹窗高度已经接近 80×24 的
+    // 上限,`render_form` 超了是**静默截断**,牺牲的是底下那行 [Enter]确定 提示。
+    let tz_hint = match a.reported_utc_offset_secs {
+        Some(s) => format!("留空 = 跟随 agent 上报 {}", crate::tg::fmt::format_offset(s as i32)),
+        None => "留空 = 跟随 agent 上报(这台还没报过)".into(),
+    };
     let nic_modes = crate::model::agent::NicAccountingMode::all();
     let nic_mode_idx = nic_modes.iter().position(|m| *m == a.nic_accounting_mode).unwrap_or(0);
 
@@ -1257,6 +1264,7 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                     nic_mode_idx,
                 ),
                 Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", &reset),
+                Field::text("tz", &format!("重置时区 (例 -07:00,{tz_hint})"), &tz),
             ],
             Box::new(move |f| {
                 let name = val(f, "name");
@@ -1276,6 +1284,7 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                         .get(f.iter().find(|x| x.key == "nic_mode").map(|x| x.index()).unwrap_or(0))
                         .copied()
                         .unwrap_or_default(),
+                    nic_reset_offset_secs: forms::parse_nic_offset(&val(f, "tz"))?,
                 })
             }),
         )
@@ -1318,9 +1327,15 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
     let now = chrono::Local::now().timestamp();
 
     match action {
-        Action::AddAgent { name, quota_bytes, reset_day, nic_accounting_mode } => {
+        Action::AddAgent {
+            name,
+            quota_bytes,
+            reset_day,
+            nic_accounting_mode,
+            nic_reset_offset_secs,
+        } => {
             let (id, token) = agent_repo::create(&app.pool, name, now).await?;
-            // 配额、重置日和记账口径在创建时一并写入。
+            // 配额、重置日、记账口径和重置时区在创建时一并写入。
             agent_repo::update_settings(
                 &app.pool,
                 id,
@@ -1328,6 +1343,7 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 *quota_bytes,
                 *reset_day,
                 *nic_accounting_mode,
+                *nic_reset_offset_secs,
             )
             .await?;
             // token 明文只在这里出现这一次。库里只有 hash 与前 8 位(§8.1)。
@@ -1342,7 +1358,14 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             Ok(format!("已新增 agent #{id} {name}"))
         }
 
-        Action::EditAgent { id, name, quota_bytes, reset_day, nic_accounting_mode } => {
+        Action::EditAgent {
+            id,
+            name,
+            quota_bytes,
+            reset_day,
+            nic_accounting_mode,
+            nic_reset_offset_secs,
+        } => {
             agent_repo::update_settings(
                 &app.pool,
                 *id,
@@ -1350,10 +1373,15 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 *quota_bytes,
                 *reset_day,
                 *nic_accounting_mode,
+                *nic_reset_offset_secs,
             )
             .await?;
+            let tz = match nic_reset_offset_secs {
+                Some(s) => format!("重置时区 {}", crate::tg::fmt::format_offset(*s as i32)),
+                None => "重置时区跟随 agent".into(),
+            };
             Ok(format!(
-                "已保存 agent #{id} {name} 的设置(网卡口径:{};不改 agent 配置)",
+                "已保存 agent #{id} {name} 的设置(网卡口径:{};{tz};下一拍生效,不改 agent 配置)",
                 nic_accounting_mode.label()
             ))
         }
@@ -2086,6 +2114,77 @@ mod tests {
         }
     }
 
+    /// 重置时区往返。两个方向都要测:
+    ///   * 有覆盖值 → 预填成 `-07:00`,原样提交回来;
+    ///   * 没有覆盖值 → 预填是**空串**,提交回 `None`(= 跟随 agent)。
+    ///
+    /// 后一半是那个空串陷阱真正会被踩到的地方:`parse_timezone("")` 是 `+00:00`,
+    /// 少一层判断就会把「跟随」变成「钉死 UTC」。
+    #[tokio::test]
+    async fn the_agent_form_round_trips_the_nic_reset_offset() {
+        use modal::Outcome;
+
+        let row = data::AgentRow { nic_reset_offset_secs: Some(-25200), ..stub_agent(9) };
+        let mut m = agent_edit(&row);
+        let Modal::Form(f) = &m else { panic!("应当是表单") };
+        let field = f.fields.iter().find(|x| x.key == "tz").expect("该有时区字段");
+        assert_eq!(field.value(), "-07:00", "该按 ±HH:MM 预填");
+        let Outcome::Run(Action::EditAgent { nic_reset_offset_secs, .. }) =
+            m.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter 该提交出一个 EditAgent")
+        };
+        assert_eq!(nic_reset_offset_secs, Some(-25200));
+
+        let row = data::AgentRow { nic_reset_offset_secs: None, ..stub_agent(9) };
+        let mut m = agent_edit(&row);
+        let Modal::Form(f) = &m else { panic!("应当是表单") };
+        assert_eq!(
+            f.fields.iter().find(|x| x.key == "tz").unwrap().value(),
+            "",
+            "没有覆盖值时预填必须是空串,不能是 +00:00"
+        );
+        let Outcome::Run(Action::EditAgent { nic_reset_offset_secs, .. }) =
+            m.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter 该提交出一个 EditAgent")
+        };
+        assert_eq!(nic_reset_offset_secs, None, "留空 = 跟随 agent,不是 UTC");
+    }
+
+    /// 编辑框的时区标签里要写出 agent 报的是什么 —— 一个人要决定填不填覆盖值,
+    /// 得先看见 agent 自己说它在哪个时区。
+    #[tokio::test]
+    async fn the_edit_form_shows_what_the_agent_reported() {
+        let row = data::AgentRow { reported_utc_offset_secs: Some(-25200), ..stub_agent(9) };
+        let m = agent_edit(&row);
+        let Modal::Form(f) = &m else { panic!("应当是表单") };
+        let label = &f.fields.iter().find(|x| x.key == "tz").unwrap().label;
+        assert!(label.contains("-07:00"), "标签里该有 agent 报的值:{label}");
+
+        let row = data::AgentRow { reported_utc_offset_secs: None, ..stub_agent(9) };
+        let m = agent_edit(&row);
+        let Modal::Form(f) = &m else { panic!("应当是表单") };
+        let label = &f.fields.iter().find(|x| x.key == "tz").unwrap().label;
+        assert!(label.contains("还没报过"), "没报过要说清楚:{label}");
+    }
+
+    /// 新增框不填时区 → `None`,也就是「装上之后跟随 agent 自己上报」。
+    #[tokio::test]
+    async fn the_add_agent_form_leaves_the_timezone_to_the_agent() {
+        use modal::Outcome;
+        let mut m = forms::agent_add();
+        for c in "tokyo".chars() {
+            m.handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let Outcome::Run(Action::AddAgent { nic_reset_offset_secs, .. }) =
+            m.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter 该提交出一个 AddAgent")
+        };
+        assert_eq!(nic_reset_offset_secs, None);
+    }
+
     /// 新增框默认「入出总计」——升级到这一版的行为不该变。
     /// ←/→ 循环一圈能取到全部四个口径。
     #[tokio::test]
@@ -2602,6 +2701,8 @@ mod tests {
             nic_quota_bytes: None,
             nic_reset_day: None,
             nic_accounting_mode: Default::default(),
+        reported_utc_offset_secs: None,
+        nic_reset_offset_secs: None,
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,

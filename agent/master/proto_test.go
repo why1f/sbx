@@ -172,3 +172,26 @@ func TestStatsReportEmptyUsersIsArray(t *testing.T) {
 		t.Errorf("users = %s, 期望 []", m["users"])
 	}
 }
+
+// utc_offset_secs **不带 omitempty**,所以 0 也必须出现在线上。
+//
+// 省掉它的话主控会读成「老 agent 没报」并回落到自己的时区 ——
+// 于是一台真在 UTC 的机器会跟着主控的时区翻月,而不是自己的。
+// 与上面两个 revision 完全同一个理由。
+func TestHelloAlwaysCarriesTheOffset(t *testing.T) {
+	data, err := json.Marshal(AgentHello{Token: "t", ProtoVersion: ProtoVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := m["utc_offset_secs"]
+	if !ok {
+		t.Fatalf("utc_offset_secs 必须上线,哪怕是 0: %s", data)
+	}
+	if string(raw) != "0" {
+		t.Errorf("零值该序列化成 0,得到 %s", raw)
+	}
+}

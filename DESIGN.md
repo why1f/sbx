@@ -216,7 +216,7 @@ agent 连上后的**第一帧必须**是 `agent.hello`;10 秒内没收到就断�
 
 | 方向 | method | payload |
 |---|---|---|
-| A→M | `agent.hello` | `token`, `agent_version`, `proto_version`, `os`, `arch`, `hostname`, `boot_id`, `singbox_version`, **`config_revision`**, **`user_state_revision`**(后两者取自本地 `last-applied.json`,从未落过盘时为 0) |
+| A→M | `agent.hello` | `token`, `agent_version`, `proto_version`, `os`, `arch`, `hostname`, `boot_id`, `singbox_version`, **`config_revision`**, **`user_state_revision`**(后两者取自本地 `last-applied.json`,从未落过盘时为 0)、`utc_offset_secs`(可选,当前 UTC 偏移秒数,用作网卡月重置边界的默认时区;老 agent 不发 → 主控回落自己的时区。**纯新增可选字段,`PROTO_VERSION` 不动** —— 它是相等判定,+1 会把所有未升级的 agent 锁在门外) |
 | M→A | `agent.hello_ack` | `agent_id`, `server_time`, `heartbeat_secs`, `report_interval_secs`, `config_revision`, `user_state_revision` |
 
 **两个 revision 分别比对、分别补齐**(缺一不可):
@@ -474,10 +474,11 @@ GROUP BY u.id;
 
 - 数据来自 agent 的 `sysinfo.report`(§7.2),epoch 是 `boot_id`
 - delta 算法与用户流量**同一个**(§5.2),累进 `cycle_rx` / `cycle_tx`
-- 配额在 `agents.nic_quota_bytes`,`NULL` = 不限流量;重置日在 `agents.nic_reset_day`,`NULL` = 无需重置
+- 配额在 `agents.nic_quota_bytes`,`NULL` = 不限流量;重置日在 `agents.nic_reset_day`,`NULL` = 无需重置。
+  **重置日只说了「几号」,时区由每台自己决定**(迁移 011,见下)
 - **口径是整机物理网卡,与 VPS 服务商面板对齐**,和 `user_traffic` 不是同一套数字(§7.2 的警告)
 
-#### 记账口径:四选一,而���可以随时改回去
+#### 记账口径:四选一,而且可以随时改回去
 
 厂商按什么收钱各家不同,所以「本周期用了多少」由 `agents.nic_accounting_mode` 决定
 (迁移 010,默认 `sum` = 升级前的行为)。**方向站在被控机看**,与 `/proc/net/dev` 一致:
@@ -510,6 +511,50 @@ GROUP BY u.id;
 `sum` → `(upload=tx, download=rx)`,`outbound` → `(tx, 0)`,`inbound` → `(0, rx)`,
 `max` → 把较大的那个方向留在它自己的位置、另一个归零。于是每台的
 `upload + download` 恒等于它计入的用量,几台混着不同口径也能直接相加。
+
+#### 月重置的边界:每台按自己的时区
+
+**重置日只说了「几号」,没说「谁的几号」。** 厂商按被控机所在地的当地零点结算,
+而主控可能跑在别的时区上。现场量化过一次:一台 UTC−7 的机器,厂商与第三方探针都在
+当地 22 日 00:00(= 07:00 UTC)翻月,而主控跑在 UTC、00:00 UTC 就清了 ——
+每个周期多算 7 小时,读数比厂商面板高约 13%。同一时刻两边的基线只差百万分之 5.7,
+所以记账链条本身是准的,**差的只是边界**。
+
+生效偏移三层回落(`model::agent::reset_offset`,迁移 011):
+
+| 来源 | 列 | 存在的理由 |
+|---|---|---|
+| 手工 | `nic_reset_offset_secs` | agent 本机时区常常**不等于**厂商计费时区(VPS 镜像出厂多为 UTC),要对齐的是账单边界 |
+| agent 上报 | `reported_utc_offset_secs` | 新机器接入即对齐;每次握手刷新,夏令时自动跟随 |
+| 主控本机 | 无 | 老版本 agent 两列都是 NULL,行为与升级前**逐字节一致** |
+
+存**偏移秒数**而不是 IANA 名字:主控不引 `chrono-tz`(与 `tg::fmt::parse_timezone`
+同一条约束,那里也因此只接受 `±HH:MM` 和一张不走夏令时的别名表)。代价是走夏令时的
+机器在换季后要等下一次握手才更正,而那种机器应该直接手工填显式偏移。
+
+**判定必须整体搬进 agent 的日历,三个量一个都不能用主控的**
+(`supervisor::reset_nic_cycles`,所以日期比较从 SQL 搬到了 Rust ——
+一条 SQL 里没法用一个标量 `day` 同时代表所有机器):
+
+1. `date` —— 今天几号;
+2. `ym` —— 一月只清一次的闸门(`last_reset_ym`)。跨月的那几个小时里,agent 本地的
+   月份可能和主控不是同一个月。混用会双向出错:一台 UTC−7 已在自己的 8 月清过,
+   主控 9/1 03:00 UTC 时它当地还是 8/31,用主控的 `ym` 会**多清一次**;
+   一台 UTC+14 在主控还是 8/31 时当地已进 9 月,用主控的 `ym` 落闸会让它在主控跨月后
+   **再清一次**。两种都要等一个月才复现;
+3. `last_day_of_month` —— 短月夹取的上界。用主控的月份长度,会让偏西的机器在 2 月
+   **整月不重置**(`min(31, 31)`),正是当初加 `MIN()` 要防的那个 bug 的翻版。
+
+`>=`(而非 `==`)与 `last_reset_ym` 闸门两条性质不变:前者让主控在重置日当天停机也能
+第二天补上,后者保证一月一次。这一项**不推进任何 revision** —— 它是主控侧记账,
+agent 根本不需要知道,改一次时区不会让任何机器重建 box。
+
+**用户周期(`users.reset_day`)不跟着改**,继续走主控时区:用户不绑定某台机器,
+没有「他那边的月份」这回事。两条路径在 `supervisor::tick` 里就分叉。
+
+已知的两个限制,都指向那个手工覆盖:上报值只在握手时刷新(长连接跨过夏令时会有一小时
+的滞后);以及**机器上装的时区不等于厂商计费的时区** —— 后者更常见,而且升级后这一列
+被填上了,看起来反而更可信。所以网卡明细弹窗里必须同时显示**生效值和它的来源**。
 
 
 **网速不落库。** 由主控在内存里用相邻两次 `sysinfo.report` 的 rx/tx 差值 ÷ 时间间隔算出(§8.2)。
@@ -603,6 +648,9 @@ b.Start()
 - 公网 IP 自探:把旧项目 `node_service.rs::get_server_ips()` 那套搬到 agent 侧——
   `api4.ipify.org` / `api6.ipify.org` 并发探测、3s 超时、`ifconfig.me` 兜底、600s 缓存。
   结果随 `agent.hello` 上报,主控写入 `agents.ipv4/ipv6`,**并允许手工覆盖**。
+- 当前 UTC 偏移:`time.Time.Zone()`(`sysinfo.UTCOffsetSecs`),随 `agent.hello` 上报,
+  主控写入 `agents.reported_utc_offset_secs`,用作网卡月重置边界的**默认**时区,
+  **并允许手工覆盖**(§6.4)。故意不做进程级缓存 —— 夏令时会变,而它每次握手只调一次。
 
 ### 7.4 sing-box 生命周期
 
@@ -837,7 +885,7 @@ agent 的 tracker 从进程启动才开始数,`new` 就是这段时间真实发�
   也打同一条命令,那里用鼠标选中复制没有任何依赖。
 - **`[r]` 轮换 token**:新 token 使旧的立即失效。**在线连接不立刻踢**,下次重连时生效。
   弹窗直接给出带新 token 的完整命令 —— 轮换之后要做的事恰好就是「在那台机器上重跑一遍」。
-- **`[E]` 编辑 agent**:名称、网卡月配额、配额重置日、网卡记账口径(§6.4)。
+- **`[E]` 编辑 agent**:名称、网卡月配额、配额重置日、网卡记账口径、重置时区(§6.4)。
   口径是 `Select`(←/→ 循环)而不是手打:它只有四个取值,打错一个字母的反馈会是
   提交之后一句「无法识别」,而正确的四个一个都没显示出来(§8.1.1 的通则)。
   **IP 不在可改之列** ——

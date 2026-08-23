@@ -59,14 +59,18 @@ pub async fn tick(
 
     // 时间戳转本地日期。转不出来(时间戳损坏)时跳过重置但仍做配额判定——
     // 宁可少做一件事,也不要 panic 掉整个巡检循环。
+    //
+    // **用户周期用主控时区,网卡周期按每台 agent 自己的时区。** 用户不绑定某台机器,
+    // 没有「他那边的月份」这回事;而网卡配额要对齐的是各家 VPS 厂商的账单边界,
+    // 而厂商按各自机房的本地日界翻月(§6.4)。所以两条路径从这里就分叉。
     if let Some(date) = local_date(now) {
         let ym = format!("{:04}-{:02}", date.year(), date.month());
         let last_day = last_day_of_month(date);
         sum.users_reset = reset_user_cycles(pool, date.day(), last_day, &ym, now).await?;
-        sum.nics_reset = reset_nic_cycles(pool, date.day(), last_day, &ym, now).await?;
     } else {
-        tracing::warn!(now, "无法解析时间戳,本轮跳过月重置");
+        tracing::warn!(now, "无法解析时间戳,本轮跳过用户周期重置");
     }
+    sum.nics_reset = reset_nic_cycles(pool, now).await?;
 
     let (disabled, reenabled) = evaluate_quotas(pool, now).await?;
     sum.disabled = disabled;
@@ -94,6 +98,14 @@ pub async fn tick(
     push_config(pool, registry, rpc).await;
 
     Ok(sum)
+}
+
+/// 时间戳在某个 UTC 偏移下落在哪一天。
+///
+/// 网卡重置要按每台 agent 自己的偏移算,所以日期计算必须能换时区 ——
+/// `local_date` 只是它在主控偏移上的特例。写法与 `tui/forms.rs::today_day` 一致。
+fn date_in(ts: i64, off: chrono::FixedOffset) -> Option<chrono::NaiveDate> {
+    chrono::DateTime::from_timestamp(ts, 0).map(|dt| dt.with_timezone(&off).date_naive())
 }
 
 fn local_date(ts: i64) -> Option<chrono::NaiveDate> {
@@ -188,34 +200,61 @@ async fn reset_user_cycles(
     Ok(candidates.len())
 }
 
-/// 网卡流量的月重置(§6.4)。与用户流量走完全独立的一套。
-async fn reset_nic_cycles(
-    pool: &SqlitePool,
-    day: u32,
-    last_day: u32,
-    ym: &str,
-    now: i64,
-) -> Result<usize> {
-    let candidates: Vec<i64> = sqlx::query_scalar(
-        "SELECT a.id FROM agents a
+/// 网卡流量的月重置(§6.4)。与用户流量走完全独立的一套,而且**边界按每台 agent
+/// 自己的时区算** —— 各家 VPS 厂商按自己机房的本地日界翻月。
+///
+/// 日期判定从 SQL 搬到了 Rust。三个量都必须用**这台自己的**偏移算,少一个就是 bug:
+///
+///   1. `date` —— 今天几号,决定够不够到重置日;
+///   2. `ym` —— 一月只清一次的闸门(`last_reset_ym`)。跨月的那几个小时里,agent
+///      本地的月份可能和主控不是同一个月;用主控的 `ym` 会把闸门开在错误的月份上,
+///      表现是「这个月清了两次」或者「整个月没清」,而且要等一个月才复现;
+///   3. `last_day_of_month` —— 短月夹取的上界,同样取决于 agent 本地落在哪个月。
+///
+/// 两条原有性质保持不变:`>=` 而不是 `==`(主控在重置日当天停机,第二天起来能补上),
+/// `last_reset_ym != ym`(一个月只清一次)。
+async fn reset_nic_cycles(pool: &SqlitePool, now: i64) -> Result<usize> {
+    /// `(id, nic_reset_day, nic_reset_offset_secs, reported_utc_offset_secs, last_reset_ym)`
+    type Row = (i64, i64, Option<i64>, Option<i64>, String);
+
+    // SQL 只做「设过重置日吗」这一层粗筛,日期比较交给 Rust —— 每台的时区不同,
+    // 一条 SQL 里没法用一个标量 day 同时代表所有机器。
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT a.id, a.nic_reset_day, a.nic_reset_offset_secs,
+                a.reported_utc_offset_secs, t.last_reset_ym
+           FROM agents a
            JOIN agent_nic_traffic t ON t.agent_id = a.id
-          WHERE a.nic_reset_day IS NOT NULL AND a.nic_reset_day > 0
-            AND ? >= MIN(a.nic_reset_day, ?)
-            AND t.last_reset_ym != ?",
+          WHERE a.nic_reset_day IS NOT NULL AND a.nic_reset_day > 0",
     )
-    .bind(day as i64)
-    .bind(last_day as i64)
-    .bind(ym)
     .fetch_all(pool)
     .await?;
 
-    if candidates.is_empty() {
+    let mut due: Vec<(i64, String)> = Vec::new();
+    for (agent_id, reset_day, manual, reported, last_reset_ym) in rows {
+        let (off, _) = crate::model::agent::reset_offset(manual, reported, now);
+        let Some(date) = date_in(now, off) else {
+            tracing::warn!(agent_id, now, "无法解析时间戳,本轮跳过这台的网卡重置");
+            continue;
+        };
+        let ym = format!("{:04}-{:02}", date.year(), date.month());
+        if last_reset_ym == ym {
+            continue; // 这个月已经清过
+        }
+        let clamped = reset_day.min(last_day_of_month(date) as i64);
+        if (date.day() as i64) < clamped {
+            continue; // 本地还没到重置日
+        }
+        due.push((agent_id, ym));
+    }
+
+    if due.is_empty() {
         return Ok(0);
     }
 
     let mut tx = pool.begin().await?;
-    for agent_id in &candidates {
+    for (agent_id, ym) in &due {
         // 同上:last_rx / last_tx 是 delta 基线,不能清。
+        // 绑定的 `ym` 是**这台自己**算出来的,不是全局值。
         sqlx::query(
             "UPDATE agent_nic_traffic
                 SET cycle_rx = 0, cycle_tx = 0, cycle_start = ?, last_reset_ym = ?
@@ -229,7 +268,7 @@ async fn reset_nic_cycles(
     }
     tx.commit().await?;
 
-    Ok(candidates.len())
+    Ok(due.len())
 }
 
 /// `evaluate_quotas` 的一行:
@@ -678,6 +717,56 @@ mod tests {
             .timestamp()
     }
 
+    /// 一个**确定的 UTC 时刻**。
+    ///
+    /// 跨时区的边界测试不能用 `ts()` —— 那个给的是主控本机中午,值跟着 CI 机器的
+    /// `TZ` 走,而这些用例要断言的正是「谁在哪一拍翻月」。正午对 |偏移| < 12h
+    /// 不跨日,所以旧用例继续用 `ts()` 没问题;新用例必须锚在 UTC 上。
+    fn utc_ts(y: i32, m: u32, d: u32, h: u32) -> i64 {
+        chrono::Utc.with_ymd_and_hms(y, m, d, h, 0, 0).single().unwrap().timestamp()
+    }
+
+    /// 造一台带网卡用量的 agent,可选地设重置日与重置时区偏移。
+    async fn nic_agent(
+        p: &SqlitePool,
+        name: &str,
+        reset_day: i64,
+        manual_offset: Option<i64>,
+        reported_offset: Option<i64>,
+    ) -> i64 {
+        let (id, _) = crate::db::agent_repo::create(p, name, 0).await.unwrap();
+        sqlx::query(
+            "UPDATE agents SET nic_reset_day = ?, nic_reset_offset_secs = ?,
+                               reported_utc_offset_secs = ? WHERE id = ?",
+        )
+        .bind(reset_day)
+        .bind(manual_offset)
+        .bind(reported_offset)
+        .bind(id)
+        .execute(p)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_nic_traffic
+               (agent_id, boot_id, last_rx, last_tx, cycle_rx, cycle_tx, cycle_start, updated_at)
+             VALUES (?, 'b', 9000, 9000, 500, 600, 1, 1)",
+        )
+        .bind(id)
+        .execute(p)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// 这台机器本周期用量与闸门月份。
+    async fn nic_state(p: &SqlitePool, id: i64) -> (i64, i64, String) {
+        sqlx::query_as("SELECT cycle_rx, cycle_tx, last_reset_ym FROM agent_nic_traffic WHERE agent_id = ?")
+            .bind(id)
+            .fetch_one(p)
+            .await
+            .unwrap()
+    }
+
     /// 造一个用户,可选地给它一个节点和一份用量。
     async fn user_with_usage(
         p: &SqlitePool,
@@ -1011,6 +1100,147 @@ mod tests {
         assert_eq!((crx, ctx), (0, 0), "cycle 应清零");
         assert_eq!(start, when, "cycle_start 应更新到重置时刻");
         assert_eq!(lrx, 5000, "last_rx 是 delta 基线(§5.2),绝不能清零");
+    }
+
+    /// **本次故障的正面复现。** 两台机器同一个重置日 22,一台 UTC-7 一台 UTC:
+    /// 它们必须在**不同的拍**上翻月。这条挂了,就是又回到了「全网按主控时区翻月」。
+    #[tokio::test]
+    async fn a_minus_seven_agent_and_a_utc_agent_reset_on_different_ticks() {
+        let p = pool().await;
+        let dmit = nic_agent(&p, "dmit", 22, Some(-7 * 3600), None).await;
+        let utc = nic_agent(&p, "utc", 22, Some(0), None).await;
+
+        // 8/22 00:30 UTC —— UTC 那台已经进 22 号,dmit 当地还是 21 号 17:30。
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(), 1);
+        assert_eq!(nic_state(&p, utc).await, (0, 0, "2026-08".into()), "UTC 那台该清了");
+        let (rx, tx, ym) = nic_state(&p, dmit).await;
+        assert_eq!((rx, tx, ym.as_str()), (500, 600, ""), "dmit 当地还没到 22 号,不该动");
+
+        // 8/22 08:00 UTC = dmit 当地 01:00,过了它自己的零点。
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 8)).await.unwrap(), 1);
+        assert_eq!(nic_state(&p, dmit).await, (0, 0, "2026-08".into()), "这一拍才轮到 dmit");
+    }
+
+    /// 跨月:主控已经进 9 月,而 UTC-7 的机器当地还是 8/31。它这个月清过了,
+    /// **不能再清一次**。闸门用主控的 `ym` 的话这里会多清一次 —— 而且要等一个月才复现。
+    #[tokio::test]
+    async fn an_agent_still_in_last_month_locally_does_not_reset_again() {
+        let p = pool().await;
+        let id = nic_agent(&p, "dmit", 22, Some(-7 * 3600), None).await;
+        sqlx::query("UPDATE agent_nic_traffic SET last_reset_ym = '2026-08' WHERE agent_id = ?")
+            .bind(id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        // 9/1 03:00 UTC = 当地 8/31 20:00。日子够(31 >= 22),但月份还是 8。
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 9, 1, 3)).await.unwrap(), 0);
+        assert_eq!(nic_state(&p, id).await, (500, 600, "2026-08".into()), "不该被清第二次");
+    }
+
+    /// 反方向:UTC+14 的机器当地已经进下个月,该清、而且**只清一次**。
+    /// 闸门写成主控的月份(还是上个月)会让它在主控跨月时再清一次。
+    #[tokio::test]
+    async fn an_agent_already_in_next_month_locally_resets_once_not_twice() {
+        let p = pool().await;
+        let id = nic_agent(&p, "kiritimati", 1, Some(14 * 3600), None).await;
+
+        // 8/31 15:00 UTC = 当地 9/1 05:00。
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 31, 15)).await.unwrap(), 1);
+        assert_eq!(nic_state(&p, id).await.2, "2026-09", "闸门要写当地的月份");
+        // 主控随后也跨进 9 月 —— 不能因此再清一次。
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 9, 1, 2)).await.unwrap(), 0);
+    }
+
+    /// 短月夹取按 **agent 当地的月份**算。同一时刻两台机器落在不同的月里:
+    /// UTC-7 的当地是 2/28(2 月只有 28 天,`min(31,28)` → 该清),
+    /// UTC+14 的当地已是 3/1(`min(31,31)` → 1 号还不该清)。
+    #[tokio::test]
+    async fn a_short_month_clamps_in_the_agents_own_calendar() {
+        let p = pool().await;
+        let west = nic_agent(&p, "west", 31, Some(-7 * 3600), None).await;
+        let east = nic_agent(&p, "east", 31, Some(14 * 3600), None).await;
+
+        // 2026-02-28 20:00 UTC → west 当地 2/28 13:00;east 当地 3/1 10:00。
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 2, 28, 20)).await.unwrap(), 1);
+        assert_eq!(nic_state(&p, west).await, (0, 0, "2026-02".into()), "2 月最后一天要补上");
+        let (rx, _, ym) = nic_state(&p, east).await;
+        assert_eq!((rx, ym.as_str()), (500, ""), "当地才 3/1,离 31 号还远");
+    }
+
+    /// 手工覆盖压过 agent 上报的值 —— agent 本机时区不等于厂商计费时区时,
+    /// 人说的必须算。同时也验证候选查询真的把两列都取回来了。
+    #[tokio::test]
+    async fn the_manual_override_beats_what_the_agent_reported() {
+        let p = pool().await;
+        // agent 报自己在 UTC-7,但人手工钉成 UTC。
+        let id = nic_agent(&p, "a", 22, Some(0), Some(-7 * 3600)).await;
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(), 1, "该按手工的 UTC 翻");
+        assert_eq!(nic_state(&p, id).await, (0, 0, "2026-08".into()));
+    }
+
+    /// 只有上报值时用上报值。
+    #[tokio::test]
+    async fn the_reported_offset_is_used_when_nobody_overrode_it() {
+        let p = pool().await;
+        let id = nic_agent(&p, "a", 22, None, Some(-7 * 3600)).await;
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(), 0, "当地还是 21 号");
+        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 8)).await.unwrap(), 1);
+        assert_eq!(nic_state(&p, id).await.2, "2026-08");
+    }
+
+    /// **老 agent 护栏。** 两列都空时必须与升级前逐字节一致 ——
+    /// 判定基准就是当年那个 `local_date(now)`,所以这条不看 CI 机器的时区。
+    #[tokio::test]
+    async fn an_agent_that_reports_nothing_keeps_the_master_timezone_boundary() {
+        let p = pool().await;
+        let now = ts(2026, 3, 12);
+        let today = local_date(now).unwrap().day() as i64;
+        // 重置日正好是主控的今天:偏移只要错一天,这条就挂。
+        let id = nic_agent(&p, "legacy", today, None, None).await;
+        assert_eq!(reset_nic_cycles(&p, now).await.unwrap(), 1, "两列都空 → 走主控时区");
+        assert_eq!(nic_state(&p, id).await.0, 0);
+    }
+
+    /// 库里躺着一个离谱的偏移(手改过、或者以后哪个 agent 报错了)时回落,
+    /// 而不是 panic、也不是把整轮巡检连带跳过 —— 那会停掉**所有**机器的重置。
+    #[tokio::test]
+    async fn an_absurd_offset_falls_back_instead_of_breaking_the_whole_tick() {
+        let p = pool().await;
+        let now = ts(2026, 3, 12);
+        let today = local_date(now).unwrap().day() as i64;
+        let broken = nic_agent(&p, "broken", today, Some(99 * 3600), None).await;
+        let ok = nic_agent(&p, "ok", today, None, None).await;
+        assert_eq!(reset_nic_cycles(&p, now).await.unwrap(), 2, "坏的那台回落,好的那台照常");
+        assert_eq!(nic_state(&p, broken).await.0, 0);
+        assert_eq!(nic_state(&p, ok).await.0, 0);
+    }
+
+    /// 用户周期与网卡周期用**两套日历**:用户跟主控,网卡跟 agent(§6.4)。
+    #[tokio::test]
+    async fn user_and_nic_cycles_use_different_calendars() {
+        let p = pool().await;
+        let (reg, rpc) = empty_state();
+        let uid = user_with_usage(&p, "alice", 0, GB, 0).await;
+        sqlx::query("UPDATE users SET reset_day = 22 WHERE id = ?")
+            .bind(uid)
+            .execute(&p)
+            .await
+            .unwrap();
+        // 这台 agent 被钉在 UTC+14,当地已经进了下一天/下个月边界之外。
+        let aid = nic_agent(&p, "east", 22, Some(14 * 3600), None).await;
+
+        let s = tick(&p, &reg, &rpc, ts(2026, 8, 22)).await.unwrap();
+        assert_eq!(s.users_reset, 1, "用户按主控日历该清");
+        assert_eq!(s.nics_reset, 1, "这台 agent 当地也过了 22 号");
+        // 关键是两者各自记的月份来自各自的日历,互不干扰。
+        let uym: String = sqlx::query_scalar("SELECT last_reset_ym FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(uym, format!("{:04}-{:02}", 2026, 8));
+        assert_eq!(nic_state(&p, aid).await.2, "2026-08");
     }
 
     /// 没有 reset_day 的用户永不重置(NULL = 无需重置)。

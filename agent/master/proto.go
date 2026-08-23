@@ -116,6 +116,13 @@ type AgentHello struct {
 	// 主控的 mark_online 用 COALESCE,null 保留库里已有的值,空串会把它冲掉。
 	IPv4 *string `json:"ipv4,omitempty"`
 	IPv6 *string `json:"ipv6,omitempty"`
+	// 本机当前的 UTC 偏移秒数。主控拿它当网卡月重置边界的默认时区 ——
+	// 厂商按自己机房的本地日界翻月。报偏移而不是时区名:主控不引 tzdata。
+	// 夏令时靠每次握手重报跟随,所以这是「现在多少」而不是「属于哪个时区」。
+	//
+	// **不加 omitempty**:0 是有意义的值(机器就在 UTC),省掉它主控会当成
+	// 「老 agent 什么都没报」而回落到自己的时区 —— 与上面两个 revision 同一个理由。
+	UTCOffsetSecs int32 `json:"utc_offset_secs"`
 }
 
 type AgentHelloAck struct {

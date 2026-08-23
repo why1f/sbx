@@ -594,11 +594,17 @@ async fn load_revisions(pool: &SqlitePool, agent_id: i64) -> Result<Revisions> {
 async fn mark_online(pool: &SqlitePool, agent_id: i64, hello: &AgentHello, now: i64) -> Result<()> {
     // ipv4/ipv6 用 COALESCE(?, 旧值):agent 探测失败时上报 None,
     // 不该把库里已有的(可能是管理员手工填的)地址擦掉(§7.3「允许手工覆盖」)。
+    //
+    // reported_utc_offset_secs **不用 COALESCE**,故意与上面两列不同:IP 缺失是
+    // 「这次探测失败了」,保留旧值是对的;而偏移缺失是「这个 agent 老得不会报」,
+    // 留着一个没人再声称过的值只会骗人 —— 界面会显示「agent 上报 -07:00」,
+    // 而那台机器几个月前就不这么说了。这一列的语义是「它最后一次告诉我们什么」。
     sqlx::query(
         "UPDATE agents SET
            status = 'online', last_seen = ?,
            agent_version = ?, singbox_version = ?, os = ?, arch = ?, hostname = ?,
-           ipv4 = COALESCE(?, ipv4), ipv6 = COALESCE(?, ipv6)
+           ipv4 = COALESCE(?, ipv4), ipv6 = COALESCE(?, ipv6),
+           reported_utc_offset_secs = ?
          WHERE id = ?",
     )
     .bind(now)
@@ -609,10 +615,26 @@ async fn mark_online(pool: &SqlitePool, agent_id: i64, hello: &AgentHello, now: 
     .bind(&hello.hostname)
     .bind(&hello.ipv4)
     .bind(&hello.ipv6)
+    .bind(sane_offset(agent_id, hello.utc_offset_secs))
     .bind(agent_id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// 收下 agent 报的 UTC 偏移,离谱的值丢掉并留一条日志。
+///
+/// `FixedOffset` 的上限是 ±24h,超出的值存进去只会在 `model::agent::reset_offset`
+/// 那边被静默丢弃 —— 那时已经离现场很远了。在入口挡住并说出来,坏掉的 agent
+/// 才能在日志里被找到,而不是表现成「这台机器的重置边界莫名回落到主控时区」。
+fn sane_offset(agent_id: i64, secs: Option<i64>) -> Option<i64> {
+    let s = secs?;
+    if i32::try_from(s).is_ok_and(|s| chrono::FixedOffset::east_opt(s).is_some()) {
+        Some(s)
+    } else {
+        tracing::warn!(agent_id, secs = s, "agent 上报的 UTC 偏移越界,已忽略");
+        None
+    }
 }
 
 async fn mark_offline(pool: &SqlitePool, agent_id: i64, now: i64) -> Result<()> {
@@ -647,6 +669,7 @@ mod tests {
             user_state_revision: 0,
             ipv4: Some("203.0.113.7".into()),
             ipv6: None,
+            utc_offset_secs: None,
         }
     }
 
@@ -690,6 +713,62 @@ mod tests {
         assert_eq!(a.hostname.as_deref(), Some("vps-1"));
         assert_eq!(a.ipv4.as_deref(), Some("203.0.113.7"));
         assert_eq!(a.singbox_version.as_deref(), Some("1.14.0"));
+    }
+
+    /// agent 上报的 UTC 偏移要落进库里 —— 网卡月重置的边界默认按它算(§6.4)。
+    #[tokio::test]
+    async fn mark_online_records_the_reported_utc_offset() {
+        let p = pool().await;
+        let (id, tok) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let mut h = hello(&tok);
+        h.utc_offset_secs = Some(-7 * 3600);
+        mark_online(&p, id, &h, 1).await.unwrap();
+
+        let a = crate::db::agent_repo::get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.reported_utc_offset_secs, Some(-25200));
+        assert_eq!(a.nic_reset_offset_secs, None, "握手不该动人手工填的那一列");
+    }
+
+    /// **这一列故意不用 COALESCE**,与 ipv4/ipv6 相反。
+    ///
+    /// IP 缺失是「这次探测失败了」,保留旧值是对的;偏移缺失是「这个 agent 老得
+    /// 不认识这个字段」,留着一个它已经不再声称的值只会骗人 —— 界面会显示
+    /// 「agent 上报 -07:00」,而那台机器降级之后早就不这么说了。
+    #[tokio::test]
+    async fn a_hello_without_an_offset_clears_the_reported_column() {
+        let p = pool().await;
+        let (id, tok) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        sqlx::query("UPDATE agents SET reported_utc_offset_secs = -25200 WHERE id = ?")
+            .bind(id)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let mut h = hello(&tok);
+        h.utc_offset_secs = None; // 老版本 agent
+        mark_online(&p, id, &h, 1).await.unwrap();
+
+        let a = crate::db::agent_repo::get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.reported_utc_offset_secs, None, "老 agent 连上后该清成「没报过」");
+    }
+
+    /// 越界的偏移在入口就挡掉并留日志。存进去只会在 `reset_offset` 那边被静默丢弃,
+    /// 那时离现场已经很远,表现成「这台机器的边界莫名回落到主控时区」。
+    #[tokio::test]
+    async fn an_absurd_reported_offset_is_dropped_not_stored() {
+        let p = pool().await;
+        let (id, tok) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let mut h = hello(&tok);
+        h.utc_offset_secs = Some(99 * 3600);
+        mark_online(&p, id, &h, 1).await.unwrap();
+
+        let a = crate::db::agent_repo::get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.reported_utc_offset_secs, None);
+        // 边界值必须收下:parse_timezone 能接受到 ±14:59。
+        h.utc_offset_secs = Some(14 * 3600 + 59 * 60);
+        mark_online(&p, id, &h, 2).await.unwrap();
+        let a = crate::db::agent_repo::get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.reported_utc_offset_secs, Some(53_940));
     }
 
     /// agent 探测失败(ipv4 = None)时不能擦掉库里已有的地址——

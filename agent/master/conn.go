@@ -246,6 +246,7 @@ func (c *Conn) handshake(ws *websocket.Conn, v4, v6 *string) (*AgentHelloAck, er
 		UserStateRevision: c.st.UserStateRevision,
 		IPv4:              v4,
 		IPv6:              v6,
+		UTCOffsetSecs:     sysinfo.UTCOffsetSecs(),
 	}
 	c.mu.Unlock()
 

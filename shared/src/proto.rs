@@ -146,6 +146,17 @@ pub struct AgentHello {
     pub ipv4: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6: Option<String>,
+    /// agent 本机**当前**的 UTC 偏移秒数(东正西负)。主控用它当网卡月重置边界的
+    /// 默认时区 —— 各家 VPS 厂商按自己机房的本地日界翻月(§6.4)。
+    ///
+    /// 报偏移而不是时区名:主控不引 tzdata。夏令时靠**每次握手重报**来跟随,
+    /// 所以这个值是「现在多少」,不是「这台机器属于哪个时区」。
+    ///
+    /// **没有 `skip_serializing_if`** —— 与两个 revision 同一个理由:`0` 是有意义的值
+    /// (机器就在 UTC),省掉它主控会当成「老 agent 什么都没报」而回落到自己的时区。
+    /// `None` 只表示「老版本 agent 不认识这个字段」,那时主控回落 = 升级前行为。
+    #[serde(default)]
+    pub utc_offset_secs: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,13 +350,21 @@ mod tests {
             user_state_revision: 3,
             ipv4: None,
             ipv6: None,
+            utc_offset_secs: Some(0),
         };
         let v = serde_json::to_value(&h).unwrap();
         assert_eq!(v["config_revision"], 7);
         assert_eq!(v["user_state_revision"], 3);
+        // 偏移 0 必须**出现在线上**。省掉它主控会读成「老 agent 没报」并回落到
+        // 自己的时区,于是一台真在 UTC 的机器会跟着主控的时区翻月(§6.4)。
+        assert_eq!(v["utc_offset_secs"], 0, "0 是有意义的值,不能被省掉");
     }
 
     /// 老 agent(或 stub)不带 revision 字段时应解成 0,而不是解码失败。
+    ///
+    /// `utc_offset_secs` 一起在这里钉住:它缺失时必须是 `None` 而不是 `Some(0)` ——
+    /// 两者的含义完全不同(「不认识这个字段」vs「我在 UTC」),主控据此决定
+    /// 是回落到自己的时区还是相信 agent。
     #[test]
     fn hello_revisions_default_to_zero_when_absent() {
         let h: AgentHello = serde_json::from_value(serde_json::json!({
@@ -356,5 +375,15 @@ mod tests {
         .unwrap();
         assert_eq!(h.config_revision, 0);
         assert_eq!(h.user_state_revision, 0);
+        assert_eq!(h.utc_offset_secs, None, "老 agent 没报偏移 ≠ 报了 0");
+    }
+
+    /// **不要动 `PROTO_VERSION`。** 握手是相等判定(`cluster/server.rs` 的
+    /// `proto_version != PROTO_VERSION` → 拒绝),没有协商;加一个带
+    /// `#[serde(default)]` 的可选字段属于纯新增,按 `version.rs` 的规则不该 +1。
+    /// 真 +1 了,每一台还没升级的 agent 会在下一次重连时被锁在门外。
+    #[test]
+    fn adding_optional_fields_does_not_bump_the_protocol_version() {
+        assert_eq!(crate::PROTO_VERSION, 1);
     }
 }

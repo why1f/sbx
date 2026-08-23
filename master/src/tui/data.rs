@@ -29,6 +29,10 @@ pub struct AgentRow {
     pub nic_quota_bytes: Option<i64>,
     pub nic_reset_day: Option<i64>,
     pub nic_accounting_mode: crate::model::agent::NicAccountingMode,
+    /// agent 握手时自报的当前 UTC 偏移(秒)。只是重置边界的**默认**来源。
+    pub reported_utc_offset_secs: Option<i64>,
+    /// 手工覆盖。`None` = 用上报值,上报也没有就用主控时区(§6.4)。
+    pub nic_reset_offset_secs: Option<i64>,
     pub cycle_rx: i64,
     pub cycle_tx: i64,
     /// None = 还没有两次可比的采样(刚打开 TUI,或 boot_id 刚变)。
@@ -50,6 +54,21 @@ pub struct AgentRow {
 impl AgentRow {
     pub fn used(&self) -> i64 {
         self.nic_accounting_mode.account(self.cycle_rx, self.cycle_tx)
+    }
+
+    /// 这台机器的网卡月重置边界用哪个时区,以及这个值是谁给的(§6.4)。
+    ///
+    /// 包一层是为了让**优先级只有一个定义处** —— 界面和 supervisor 各自推一遍的话,
+    /// 迟早会出现「弹窗说按 -07:00 翻月,实际按主控时区翻」这种自相矛盾。
+    pub fn nic_offset(
+        &self,
+        now: i64,
+    ) -> (chrono::FixedOffset, crate::model::agent::OffsetSource) {
+        crate::model::agent::reset_offset(
+            self.nic_reset_offset_secs,
+            self.reported_utc_offset_secs,
+            now,
+        )
     }
 
     /// 用量占配额的比例。无配额返回 `None` —— 调用方**必须**显式处理这一态,
@@ -504,6 +523,8 @@ struct AgentQueryRow {
     nic_quota_bytes: Option<i64>,
     nic_reset_day: Option<i64>,
     nic_accounting_mode: String,
+    reported_utc_offset_secs: Option<i64>,
+    nic_reset_offset_secs: Option<i64>,
     cpu_pct: Option<f64>,
     mem_used: Option<i64>,
     mem_total: Option<i64>,
@@ -552,6 +573,7 @@ pub async fn load_agents(
     let rows: Vec<AgentQueryRow> = sqlx::query_as(
         "SELECT a.id, a.name, a.token_prefix, a.status, a.agent_version, a.arch, a.outbound_strategy, a.ipv4, a.ipv6,
                 a.nic_quota_bytes, a.nic_reset_day, a.nic_accounting_mode,
+                a.reported_utc_offset_secs, a.nic_reset_offset_secs,
                 a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
                 a.last_seen,
                 t.boot_id,
@@ -594,6 +616,8 @@ pub async fn load_agents(
                 nic_accounting_mode: crate::model::agent::NicAccountingMode::parse(
                     &r.nic_accounting_mode,
                 ),
+                reported_utc_offset_secs: r.reported_utc_offset_secs,
+                nic_reset_offset_secs: r.nic_reset_offset_secs,
                 cycle_rx: r.cycle_rx,
                 cycle_tx: r.cycle_tx,
                 up_per_sec: up,
@@ -930,6 +954,8 @@ mod tests {
             nic_quota_bytes: None,
             nic_reset_day: None,
             nic_accounting_mode: Default::default(),
+            reported_utc_offset_secs: None,
+            nic_reset_offset_secs: None,
             cycle_rx: 50,
             cycle_tx: 50,
             up_per_sec: None,
@@ -988,6 +1014,8 @@ mod tests {
             nic_quota_bytes: None,
             nic_reset_day: None,
             nic_accounting_mode: Default::default(),
+            reported_utc_offset_secs: None,
+            nic_reset_offset_secs: None,
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,

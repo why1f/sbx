@@ -329,6 +329,24 @@ func BootID() string {
 	return bootID
 }
 
+// UTCOffsetSecs 是本机**当前**的 UTC 偏移秒数(东正西负)。
+//
+// 主控拿它当网卡月配额重置边界的默认时区:各家 VPS 厂商按自己机房的本地日界翻月,
+// 而主控自己可能跑在 UTC 上,两者差几小时就会让账目对不上(§6.4)。
+//
+// **故意不用 sync.Once 记住它。** 夏令时会变(美西 PDT −7 → PST −8),而这个函数
+// 每次握手只调一次、纳秒级 —— 缓存下来只会让偏移在换季后一直是错的,直到进程重启。
+func UTCOffsetSecs() int32 {
+	return utcOffsetAt(time.Now())
+}
+
+// 拆出来才能拿一个**固定时刻**测,不看 CI 机器自己的时区 ——
+// 与本文件里 readNetDev/parseNetDev 那几对是同一个理由。
+func utcOffsetAt(t time.Time) int32 {
+	_, off := t.Zone()
+	return int32(off)
+}
+
 // RandomUUID 生成一个 v4 UUID。
 //
 // 自己拼而不是引 google/uuid:整个 agent 只有两处要它(boot_id 兜底、

@@ -371,6 +371,7 @@ mod tests {
             quota,
             None,
             crate::model::agent::NicAccountingMode::Sum,
+            None,
         )
             .await
             .unwrap();

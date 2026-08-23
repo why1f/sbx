@@ -574,12 +574,19 @@ pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
     }
     out.push(Line::from(quota));
 
+    let (off, off_src) = a.nic_offset(now);
     let mut cycle = vec![
         Span::styled("  重置        ", Style::default().fg(theme::DIM)),
         Span::raw(format!("每月 {}", forms::reset_day_label(a.nic_reset_day))),
     ];
     if let Some(d) = a.nic_reset_day.filter(|d| (1..=31).contains(d)) {
-        let today = forms::today_day(now) as i64;
+        use chrono::Datelike;
+        // **按这台自己的时区算「今天几号」**,不是 TUI 进程的时区。
+        // 用 `forms::today_day` 的话,一台 UTC-7 的机器在主控的傍晚会被说成
+        // 「就是今天」,而它当地还要等好几个小时才翻月 —— 弹窗自己和边界打架。
+        let today = chrono::DateTime::from_timestamp(now, 0)
+            .map(|dt| dt.with_timezone(&off).day() as i64)
+            .unwrap_or(0);
         // 同一天就是「今天」,否则算到下一个该日子还有几天(跨月按 30 天估)。
         let days = if d == today {
             0
@@ -594,6 +601,15 @@ pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
         ));
     }
     out.push(Line::from(cycle));
+
+    // 生效时区**和它的来源**都要写出来。只写值不写来源的话,最常见的那种错
+    // (VPS 镜像出厂是 UTC,厂商却按机房当地时间计费,于是 agent 老实上报 +00:00)
+    // 看起来和「人手工确认过是 UTC」一模一样。
+    out.push(Line::from(vec![
+        Span::styled("  重置时区    ", Style::default().fg(theme::DIM)),
+        Span::raw(crate::tg::fmt::format_offset(off.local_minus_utc())),
+        Span::styled(format!("  ({})", off_src.label()), Style::default().fg(theme::DIM)),
+    ]));
 
     let speed = match (a.up_per_sec, a.down_per_sec) {
         (Some(u), Some(d)) => vec![
@@ -1718,6 +1734,8 @@ mod tests {
             nic_quota_bytes: quota,
             nic_reset_day: day,
             nic_accounting_mode: Default::default(),
+        reported_utc_offset_secs: None,
+        nic_reset_offset_secs: None,
             cycle_rx: 34 * 1_073_741_824,
             cycle_tx: 0,
             up_per_sec: Some(8_600.0),
@@ -2240,6 +2258,70 @@ mod tests {
         assert!(has_cjk(&text, "计入(出站)"), "要写明按哪个口径计:{text}");
         assert!(text.contains("10.00 GB / 100.00 GB"), "配额行该用计入值:{text}");
         assert!(has_cjk(&text, "剩 90.00 GB"), "剩余也该按计入值算:{text}");
+    }
+
+    /// 网卡明细要写出**生效的重置时区和它的来源**。
+    ///
+    /// 只写值不写来源是不够的:最常见的错法是 VPS 镜像出厂就是 UTC、厂商却按机房
+    /// 当地时间计费,于是 agent 老老实实报 `+00:00`,看起来和「人确认过是 UTC」
+    /// 一模一样。标出来源才能把这两种区分开。
+    #[test]
+    fn nic_info_says_which_timezone_the_month_rolls_in() {
+        let base = agent(Some(100 * 1_073_741_824), Some(22));
+        let render = |a: &AgentRow| -> String {
+            nic_info(a, NOW)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+
+        let reported =
+            AgentRow { reported_utc_offset_secs: Some(-25200), ..base.clone() };
+        let text = render(&reported);
+        assert!(text.contains("-07:00"), "该写出生效偏移:{text}");
+        assert!(has_cjk(&text, "agent 上报"), "该标明来源是 agent:{text}");
+
+        let manual = AgentRow {
+            reported_utc_offset_secs: Some(-25200),
+            nic_reset_offset_secs: Some(0),
+            ..base.clone()
+        };
+        let text = render(&manual);
+        assert!(text.contains("+00:00"), "手工值该压过上报值:{text}");
+        assert!(has_cjk(&text, "手工"), "该标明是人填的:{text}");
+
+        let neither = AgentRow { ..base };
+        assert!(has_cjk(&render(&neither), "主控时区"), "都没有时该说明回落到主控");
+    }
+
+    /// 倒计时按**这台自己的时区**算。用 TUI 进程的时区的话,一台 UTC-7 的机器
+    /// 会在主控的傍晚被说成「就是今天」,而它当地还要等好几个小时 —— 弹窗自己
+    /// 和真正的重置边界打架。
+    #[test]
+    fn nic_info_counts_down_in_the_agents_own_timezone() {
+        use chrono::TimeZone;
+        // 2026-08-22 03:00 UTC:UTC 那台已经是 22 号,UTC-7 那台当地还是 21 号。
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 22, 3, 0, 0).single().unwrap().timestamp();
+        let render = |a: &AgentRow| -> String {
+            nic_info(a, now)
+                .iter()
+                .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+                .collect()
+        };
+
+        let utc = AgentRow {
+            nic_reset_offset_secs: Some(0),
+            ..agent(Some(100 * 1_073_741_824), Some(22))
+        };
+        assert!(has_cjk(&render(&utc), "就是今天"), "UTC 那台当地已是 22 号");
+
+        let west = AgentRow {
+            nic_reset_offset_secs: Some(-7 * 3600),
+            ..agent(Some(100 * 1_073_741_824), Some(22))
+        };
+        let text = render(&west);
+        assert!(!has_cjk(&text, "就是今天"), "UTC-7 那台当地还是 21 号:{text}");
+        assert!(has_cjk(&text, "约 1 天后"), "还差一天:{text}");
     }
 
     /// 不限流量的那一行,第二行画一条**暗色短横线**而不是留空。

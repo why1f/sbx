@@ -82,6 +82,10 @@ pub fn agent_add() -> Modal {
                     0,
                 ),
                 Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", ""),
+                // **必须放在最后。** `the_add_agent_form_defaults_to_sum_and_cycles_
+                // through_every_mode` 靠按两次 Tab 走到 nic_mode;插在它前面会静默
+                // 改掉那条测试的目标字段,失败信息还会去怪记账口径。
+                Field::text("tz", "重置时区 (例 -07:00,留空 = 跟随 agent 上报)", ""),
             ],
             Box::new(|f| {
                 let name = val(f, "name");
@@ -100,6 +104,7 @@ pub fn agent_add() -> Modal {
                         .get(f.iter().find(|x| x.key == "nic_mode").map(|x| x.index()).unwrap_or(0))
                         .copied()
                         .unwrap_or_default(),
+                    nic_reset_offset_secs: parse_nic_offset(&val(f, "tz"))?,
                 })
             }),
         )
@@ -109,6 +114,7 @@ pub fn agent_add() -> Modal {
                 "网卡配额按所选口径读取这台机器的原始进出字节(§6.4),不是用户计费用量;".into(),
                 "出站 = 机器发出(服务器→客户端,即客户端那边的下载),入站 = 机器收到;".into(),
                 "原始两个方向一直分开记,换口径只重算显示,不清零也不改历史。".into(),
+                "重置时区决定每月哪一刻翻月:厂商按机房当地零点结算,留空则跟随 agent 上报。".into(),
                 "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
                 "确定之后会给出一条填好 token 的接入命令,复制到被控机上跑即可。".into(),
             ]
@@ -503,6 +509,31 @@ pub fn parse_reset_day(s: &str) -> Result<Option<i64>, String> {
     }
 }
 
+/// 表单里的「重置时区」框 → 偏移秒数。`None` = 不覆盖,跟随 agent 上报(§6.4)。
+///
+/// **留空必须先判,不能直接丢给 `parse_timezone`。** 那个函数对空串返回
+/// `Some(+00:00)`(它服务的是 `telegram.timezone`,那里空 = 用 UTC),
+/// 于是「留空 = 跟随 agent」会变成「钉死在 UTC」—— 语义正好相反,
+/// 而且只有非 UTC 的机器才看得出错,是那种能活很久的 bug。
+pub fn parse_nic_offset(s: &str) -> Result<Option<i64>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    match crate::tg::fmt::parse_timezone(s) {
+        Some(off) => Ok(Some(off.local_minus_utc() as i64)),
+        None => Err(format!(
+            "时区要写成 ±HH:MM(例 -07:00),或留空跟随 agent 上报。\
+             会夏令时的时区(America/Los_Angeles 这类)请填显式偏移(收到:{s})"
+        )),
+    }
+}
+
+/// 覆盖值的显示/预填形式。`None`(没覆盖)是空串 —— 表单预填空串才能表达「跟随」。
+pub fn nic_offset_label(secs: Option<i64>) -> String {
+    secs.map(|s| crate::tg::fmt::format_offset(s as i32)).unwrap_or_default()
+}
+
 /// 「距离到期还有几天」。负数表示已经过期。给用户页的到期列用。
 pub fn days_until(ts: i64, now: i64) -> i64 {
     (ts - now).div_euclid(86_400)
@@ -579,6 +610,31 @@ mod tests {
         assert!(parse_expire("2026/12/31").is_err());
         assert!(parse_expire("2026-13-01").is_err());
         assert!(parse_expire("明年").is_err());
+    }
+
+    /// 表单里的「重置时区」框。
+    ///
+    /// **最重要的一条是空串。** `parse_timezone("")` 返回 `Some(+00:00)`
+    /// (它服务的是 `telegram.timezone`,那里空 = UTC),而表单里空 = 「跟随 agent」。
+    /// 直接转手会把「跟随」悄悄变成「钉死 UTC」,而且只有非 UTC 的机器看得出来。
+    #[test]
+    fn nic_offset_field_treats_empty_as_follow_not_as_utc() {
+        assert_eq!(parse_nic_offset("").unwrap(), None, "留空 = 跟随 agent,不是 UTC");
+        assert_eq!(parse_nic_offset("   ").unwrap(), None, "全空白也一样");
+        assert_eq!(parse_nic_offset("UTC").unwrap(), Some(0), "显式写 UTC 才是钉成 0");
+
+        assert_eq!(parse_nic_offset("-07:00").unwrap(), Some(-25200));
+        assert_eq!(parse_nic_offset("-0700").unwrap(), Some(-25200));
+        assert_eq!(parse_nic_offset("-7").unwrap(), Some(-25200));
+        assert_eq!(parse_nic_offset("Asia/Shanghai").unwrap(), Some(28800));
+        // 会夏令时的时区必须被拒:主控不带 tzdata,算不出规则(§6.4)。
+        assert!(parse_nic_offset("America/Los_Angeles").is_err());
+        assert!(parse_nic_offset("胡说").is_err());
+
+        // 预填/显示形式与解析必须闭环 —— None 是空串,才能表达「跟随」。
+        assert_eq!(nic_offset_label(None), "");
+        assert_eq!(nic_offset_label(Some(-25200)), "-07:00");
+        assert_eq!(parse_nic_offset(&nic_offset_label(Some(28800))).unwrap(), Some(28800));
     }
 
     #[test]
@@ -664,6 +720,8 @@ mod preview {
             nic_quota_bytes: None,
             nic_reset_day: None,
             nic_accounting_mode: Default::default(),
+        reported_utc_offset_secs: None,
+        nic_reset_offset_secs: None,
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,

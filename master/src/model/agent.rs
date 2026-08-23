@@ -128,6 +128,65 @@ impl NicAccountingMode {
     }
 }
 
+/// 生效的重置偏移是哪来的。界面上要标出来 —— 一个填错的时区如果不说明来源,
+/// 表现就是「重置日看着对、清零时刻却差几小时」,而那是最难查的一类问题。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetSource {
+    /// 人手工填的,压过一切。
+    Manual,
+    /// agent 握手时报的本机偏移。
+    Reported,
+    /// 两者都没有 —— 回落主控本机时区,也就是升级前的行为。
+    Master,
+}
+
+impl OffsetSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "手工",
+            Self::Reported => "agent 上报",
+            Self::Master => "主控时区",
+        }
+    }
+}
+
+/// 这台 agent 的网卡月重置边界用哪个 UTC 偏移(§6.4)。
+///
+/// 优先级 **手工 > agent 上报 > 主控本机**,三层各有理由:
+///   * 手工 —— agent 本机时区常常**不等于**厂商计费时区(VPS 镜像出厂多为 UTC),
+///     而要对齐的是账单边界,不是机器的显示时区;
+///   * agent 上报 —— 新机器接入即对齐,且夏令时靠每次握手重报自动跟随;
+///   * 主控本机 —— 老版本 agent 两列都是 NULL,回落到升级前的行为。
+///
+/// 越界的秒数(`FixedOffset::east_opt` 收不下)**当作没填、继续往下回落**,
+/// 既不 panic 也不跳过:库里躺着一个离谱的数不该让整轮巡检失效 ——
+/// 那会连带停掉**所有**机器的重置,而症状看起来跟这台毫无关系。
+pub fn reset_offset(
+    manual: Option<i64>,
+    reported: Option<i64>,
+    now: i64,
+) -> (chrono::FixedOffset, OffsetSource) {
+    for (secs, src) in [(manual, OffsetSource::Manual), (reported, OffsetSource::Reported)] {
+        if let Some(off) =
+            secs.and_then(|s| i32::try_from(s).ok()).and_then(chrono::FixedOffset::east_opt)
+        {
+            return (off, src);
+        }
+    }
+    (master_offset(now), OffsetSource::Master)
+}
+
+/// 主控本机在 `now` **那一刻**的 UTC 偏移。取那一刻而不是 `Local::now()`,
+/// 与 `supervisor::local_date` 同一个取法 —— 巡检处理的可能是一个稍早的时间戳。
+fn master_offset(now: i64) -> chrono::FixedOffset {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(now, 0)
+        .single()
+        .map(|dt| *dt.offset())
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("偏移 0 必然合法"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Agent {
     pub id: i64,
@@ -152,6 +211,11 @@ pub struct Agent {
     pub nic_reset_day: Option<i64>,
     /// 原始 cycle_rx/cycle_tx 的主控侧记账投影；默认 sum 保持旧行为。
     pub nic_accounting_mode: String,
+    /// agent 握手时报上来的**当前** UTC 偏移秒数(迁移 011)。只作 `reset_offset`
+    /// 的默认值来源,**永不权威** —— 它跟着被控机的 OS 设置走,而那是可变的。
+    pub reported_utc_offset_secs: Option<i64>,
+    /// 人手工指定的重置边界偏移。非 NULL 时压过上报值(见 `reset_offset`)。
+    pub nic_reset_offset_secs: Option<i64>,
     pub config_revision: i64,
     /// 与 `config_revision` **独立递增**(§4.1)。
     pub user_state_revision: i64,
@@ -223,10 +287,49 @@ mod tests {
             nic_quota_bytes: nic_quota,
             nic_reset_day: None,
             nic_accounting_mode: "sum".into(),
+            reported_utc_offset_secs: None,
+            nic_reset_offset_secs: None,
             config_revision: 0,
             user_state_revision: 0,
             created_at: 0,
         }
+    }
+
+    /// 三层优先级:手工 > agent 上报 > 主控本机。中间那层是「新机器接入即对齐」,
+    /// 最后那层是「老 agent 行为不变」—— 少任何一层都会让某一类机器算错(§6.4)。
+    #[test]
+    fn reset_offset_prefers_manual_then_reported_then_master() {
+        let now = 1_787_356_801;
+        let (off, src) = reset_offset(Some(0), Some(-7 * 3600), now);
+        assert_eq!((off.local_minus_utc(), src), (0, OffsetSource::Manual), "手工的说了算");
+
+        let (off, src) = reset_offset(None, Some(-7 * 3600), now);
+        assert_eq!((off.local_minus_utc(), src), (-25200, OffsetSource::Reported));
+
+        let (off, src) = reset_offset(None, None, now);
+        assert_eq!(src, OffsetSource::Master, "两列都空 → 回落主控");
+        // 回落值必须等于主控在**那一刻**的偏移,不是 `Local::now()` ——
+        // 这样跨夏令时的历史时间戳也和升级前的判定一致。
+        use chrono::TimeZone;
+        let want = chrono::Local.timestamp_opt(now, 0).single().unwrap().offset().local_minus_utc();
+        assert_eq!(off.local_minus_utc(), want);
+    }
+
+    /// 越界的偏移**往下回落**,不 panic 也不让整轮巡检失效 ——
+    /// 库里躺着一个手改坏的数,不该连带停掉所有机器的重置。
+    #[test]
+    fn an_out_of_range_offset_falls_through_instead_of_being_trusted() {
+        let now = 1_787_356_801;
+        // 手工那一层坏掉 → 用上报值。
+        let (off, src) = reset_offset(Some(99 * 3600), Some(8 * 3600), now);
+        assert_eq!((off.local_minus_utc(), src), (28800, OffsetSource::Reported));
+        // 两层都坏 → 回落主控。
+        let (_, src) = reset_offset(Some(i64::MAX), Some(-99 * 3600), now);
+        assert_eq!(src, OffsetSource::Master);
+        // `parse_timezone` 能接受到 ±14:59,这个上界必须收得下,否则会出现
+        // 「表单存进去了、判定时又被丢掉」这种「保存成功但没生效」的 bug。
+        let (off, src) = reset_offset(Some(14 * 3600 + 59 * 60), None, now);
+        assert_eq!((off.local_minus_utc(), src), (53_940, OffsetSource::Manual));
     }
 
     #[test]

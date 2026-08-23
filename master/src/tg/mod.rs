@@ -25,7 +25,10 @@
 //! 网络抖动重放的聊天界面上并不合适。这里只保留**只读查询 + 通知开关**。
 
 mod api;
-mod fmt;
+// `pub(crate)`:TUI 的「网卡重置时区」表单要用 `fmt::parse_timezone` / `format_offset`
+// 解析同一种 `±HH:MM` 写法。宁可把这个模块开放给 crate 内部,也不要为了「模块边界好看」
+// 复制一份解析器 —— 两份解析器迟早会在某个边角上分叉,而那种分叉查起来很痛。
+pub(crate) mod fmt;
 mod repo;
 mod ui;
 

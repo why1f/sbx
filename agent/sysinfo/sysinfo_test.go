@@ -231,3 +231,39 @@ func TestLocalSourceIPDoesNotBlock(t *testing.T) {
 		t.Errorf("本机源地址查询耗时 %v,它不该阻塞", d)
 	}
 }
+
+// utcOffsetAt 必须报**那个时刻所在时区**的偏移。
+//
+// 用 time.FixedZone 而不是 time.LoadLocation:后者要机器上有 tzdata,
+// CI 的容器里未必有,那会让这条测试变成一个随环境闪烁的失败。
+func TestUTCOffsetAtUsesTheZoneOfTheInstant(t *testing.T) {
+	cases := []struct {
+		name string
+		zone *time.Location
+		want int32
+	}{
+		{"UTC", time.UTC, 0},
+		{"美西 PDT", time.FixedZone("PDT", -7*3600), -25200},
+		{"美西 PST", time.FixedZone("PST", -8*3600), -28800},
+		{"东八区", time.FixedZone("CST", 8*3600), 28800},
+		{"印度半小时时区", time.FixedZone("IST", 5*3600+30*60), 19800},
+	}
+	for _, c := range cases {
+		got := utcOffsetAt(time.Date(2026, 8, 22, 0, 0, 0, 0, c.zone))
+		if got != c.want {
+			t.Errorf("%s: 期望 %d,得到 %d", c.name, c.want, got)
+		}
+	}
+}
+
+// UTCOffsetSecs 走的是本机时区,所以不能断言具体值 —— 只断言它是个像样的偏移。
+// 这条能抓住的是单位写错(毫秒/纳秒)这类最现实的错法。
+func TestUTCOffsetSecsIsSane(t *testing.T) {
+	off := UTCOffsetSecs()
+	if off < -14*3600 || off > 14*3600 {
+		t.Errorf("偏移离谱: %d", off)
+	}
+	if off%60 != 0 {
+		t.Errorf("偏移不该有秒级零头(单位写错了?): %d", off)
+	}
+}

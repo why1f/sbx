@@ -43,6 +43,9 @@ pub enum Action {
         quota_bytes: Option<i64>,
         reset_day: Option<i64>,
         nic_accounting_mode: crate::model::agent::NicAccountingMode,
+        /// 重置边界的 UTC 偏移覆盖值(秒)。`None` = 跟随 agent 上报,
+        /// 上报也没有就用主控时区(§6.4)。
+        nic_reset_offset_secs: Option<i64>,
     },
     EditAgent {
         id: i64,
@@ -50,6 +53,7 @@ pub enum Action {
         quota_bytes: Option<i64>,
         reset_day: Option<i64>,
         nic_accounting_mode: crate::model::agent::NicAccountingMode,
+        nic_reset_offset_secs: Option<i64>,
     },
     RotateToken { id: i64, name: String },
     DeleteAgent { id: i64, name: String },

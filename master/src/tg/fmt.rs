@@ -236,6 +236,19 @@ pub fn parse_timezone(s: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(sign * (h * 3600 + m * 60))
 }
 
+/// `parse_timezone` 的反向:把偏移秒数写回 `±HH:MM`。
+///
+/// 和它成对放在这里,而不是丢到调用方(TUI 表单要用它做预填、网卡明细要用它做展示):
+/// 分开写的话很容易出现「能解析但显示成另一种格式」,于是编辑一次表单值就变了样。
+///
+/// 分钟部分照样写出来(`+08:00` 而不是 `+8`),因为印度那类 `+05:30` 存在,
+/// 省掉分钟会让它变成一个静默错误的输入。
+pub fn format_offset(secs: i32) -> String {
+    let sign = if secs < 0 { '-' } else { '+' };
+    let abs = secs.abs();
+    format!("{}{:02}:{:02}", sign, abs / 3600, (abs % 3600) / 60)
+}
+
 /// 按字符切分长消息。Telegram 单条消息上限 4096 **字符**(不是字节)。
 pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
@@ -365,6 +378,24 @@ mod tests {
         for z in ["nonsense", "+25:00", "+08:99", "08:00", "++08"] {
             assert_eq!(parse_timezone(z), None, "{z}");
         }
+    }
+
+    /// `format_offset` 必须是 `parse_timezone` 的逆:表单预填走前者、提交走后者,
+    /// 两者对不上就会出现「打开编辑框、什么都不动、一按确定值就变了」。
+    #[test]
+    fn format_offset_round_trips_through_parse_timezone() {
+        for secs in [0, 8 * 3600, -7 * 3600, 5 * 3600 + 30 * 60, -3 * 3600 - 30 * 60, 53_940] {
+            let text = format_offset(secs);
+            assert_eq!(
+                parse_timezone(&text).map(|o| o.local_minus_utc()),
+                Some(secs),
+                "{secs} → {text} 又解不回来"
+            );
+        }
+        assert_eq!(format_offset(0), "+00:00", "0 也要带符号,不能写成裸 00:00");
+        assert_eq!(format_offset(-25200), "-07:00");
+        // 分钟不能省:印度那类 +05:30 存在,省掉会变成一个静默错误的值。
+        assert_eq!(format_offset(19800), "+05:30");
     }
 
     #[test]

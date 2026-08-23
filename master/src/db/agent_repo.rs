@@ -133,15 +133,21 @@ pub async fn update_settings(
     nic_quota_bytes: Option<i64>,
     nic_reset_day: Option<i64>,
     nic_accounting_mode: crate::model::agent::NicAccountingMode,
+    // **放在 mode 后面,而不是紧挨着 nic_reset_day。** 两个 `Option<i64>` 挨在一起时
+    // 调用方写反了编译器一句话都不会说,而后果是重置边界悄悄挪几个小时 ——
+    // 隔一个月才复现。中间垫一个不同类型的参数,写反就编译不过。
+    nic_reset_offset_secs: Option<i64>,
 ) -> Result<()> {
     let n = sqlx::query(
         "UPDATE agents SET name = ?, nic_quota_bytes = ?, nic_reset_day = ?,
-                           nic_accounting_mode = ? WHERE id = ?",
+                           nic_accounting_mode = ?, nic_reset_offset_secs = ?
+         WHERE id = ?",
     )
     .bind(name)
     .bind(nic_quota_bytes)
     .bind(nic_reset_day)
     .bind(nic_accounting_mode.key())
+    .bind(nic_reset_offset_secs)
     .bind(id)
     .execute(pool)
     .await
@@ -326,6 +332,7 @@ mod tests {
             Some(500 * 1_073_741_824),
             Some(22),
             crate::model::agent::NicAccountingMode::Sum,
+            Some(-7 * 3600),
         )
         .await
         .unwrap();
@@ -334,6 +341,8 @@ mod tests {
         assert_eq!(a.nic_quota_bytes, Some(500 * 1_073_741_824));
         assert_eq!(a.nic_reset_day, Some(22));
         assert_eq!(a.nic_accounting_mode, "sum");
+        assert_eq!(a.nic_reset_offset_secs, Some(-25200), "重置时区要往返");
+        assert_eq!(a.reported_utc_offset_secs, None, "手工覆盖不该动 agent 上报那一列");
 
         let revs: (i64, i64) =
             sqlx::query_as("SELECT config_revision, user_state_revision FROM agents WHERE id = ?")
@@ -351,6 +360,7 @@ mod tests {
             None,
             None,
             crate::model::agent::NicAccountingMode::Max,
+            None,
         )
         .await
         .unwrap();
@@ -358,6 +368,7 @@ mod tests {
         assert_eq!(a.nic_quota_bytes, None);
         assert_eq!(a.nic_reset_day, None);
         assert_eq!(a.nic_accounting_mode, "max");
+        assert_eq!(a.nic_reset_offset_secs, None, "也能清回「跟随 agent」");
         let raw: (String, i64, i64, i64, i64, i64, String, i64) = sqlx::query_as(
             "SELECT boot_id, last_rx, last_tx, cycle_rx, cycle_tx, cycle_start,
                     last_reset_ym, updated_at
@@ -383,6 +394,7 @@ mod tests {
             None,
             None,
             crate::model::agent::NicAccountingMode::Sum,
+            None,
         ).await.unwrap_err().to_string();
         assert!(err.contains('b'), "错误里要指出冲突的名字: {err}");
     }
@@ -398,6 +410,7 @@ mod tests {
                 None,
                 None,
                 crate::model::agent::NicAccountingMode::Sum,
+                None,
             )
             .await
             .is_err()

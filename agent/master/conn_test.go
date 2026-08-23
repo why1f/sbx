@@ -17,6 +17,7 @@ import (
 	"github.com/yourorg/sbx-agent/boxctl"
 	"github.com/yourorg/sbx-agent/config"
 	"github.com/yourorg/sbx-agent/state"
+	"github.com/yourorg/sbx-agent/sysinfo"
 	"github.com/yourorg/sbx-agent/tracker"
 )
 
@@ -197,6 +198,13 @@ func TestHandshakeSendsRequiredFields(t *testing.T) {
 	}
 	if hello.OS == "" || hello.Arch == "" {
 		t.Error("os/arch 为空")
+	}
+	// 时区偏移:主控靠它决定网卡月配额在哪一刻翻月(§6.4)。
+	// 这条挡的是「helper 写了但忘了接进 hello 字面量」——
+	// 那种漏法编译得过、测试也过,只有到了真机上才表现成「边界还是按主控算的」。
+	if hello.UTCOffsetSecs != sysinfo.UTCOffsetSecs() {
+		t.Errorf("utc_offset_secs 没接上: hello=%d 本机=%d",
+			hello.UTCOffsetSecs, sysinfo.UTCOffsetSecs())
 	}
 }
 
