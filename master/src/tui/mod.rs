@@ -1242,11 +1242,12 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
     };
     let reset = a.nic_reset_day.map(|d| d.to_string()).unwrap_or_default();
     let tz = forms::nic_offset_label(a.nic_reset_offset_secs);
-    // agent 报了什么就写进标签里,而不是再加一条 note —— 弹窗高度已经接近 80×24 的
-    // 上限,`render_form` 超了是**静默截断**,牺牲的是底下那行 [Enter]确定 提示。
-    let tz_hint = match a.reported_utc_offset_secs {
-        Some(s) => format!("留空 = 跟随 agent 上报 {}", crate::tg::fmt::format_offset(s as i32)),
-        None => "留空 = 跟随 agent 上报(这台还没报过)".into(),
+    // agent 报了什么写进**标题行**,不写进字段标签:标签列宽被夹在 34 列以内
+    // (`modal.rs` 的 `label_w`),超了会被静默截成 `…`,而标题行是整宽的。
+    // 也不新开 note 行 —— 弹窗高度在 80×24 上已经接近上限,超了牺牲的是底部按键提示。
+    let reported = match a.reported_utc_offset_secs {
+        Some(s) => format!(",agent 报 {}", crate::tg::fmt::format_offset(s as i32)),
+        None => ",agent 还没报过时区".into(),
     };
     let nic_modes = crate::model::agent::NicAccountingMode::all();
     let nic_mode_idx = nic_modes.iter().position(|m| *m == a.nic_accounting_mode).unwrap_or(0);
@@ -1264,7 +1265,7 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                     nic_mode_idx,
                 ),
                 Field::text("reset", "配额重置日 (1-31,留空 = 不重置)", &reset),
-                Field::text("tz", &format!("重置时区 (例 -07:00,{tz_hint})"), &tz),
+                Field::text("tz", "重置时区 (留空 = 跟随 agent 上报)", &tz),
             ],
             Box::new(move |f| {
                 let name = val(f, "name");
@@ -1288,12 +1289,16 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                 })
             }),
         )
-        .head(format!("#{} {}(IP 由 agent 自探上报,改了会被下一次上报覆盖)", a.id, a.name))
+        .head(format!(
+            "#{} {}(IP 由 agent 自探上报,改了会被下一次上报覆盖{reported})",
+            a.id, a.name
+        ))
         .with_note(Box::new(|_| {
             vec![
                 "网卡配额按所选口径读取机器原始进出字节,不是用户计费用量。".into(),
                 "出站 = 机器发出(服务器→客户端,即客户端那边的下载),入站 = 机器收到。".into(),
                 "两个方向一直分开记,换口径只重算当前周期的显示,不清零原始流量。".into(),
+                "重置时区写 UTC-07:00 这种形式,决定每月哪一刻翻月(厂商按机房当地零点结算)。".into(),
                 "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
             ]
         })),
@@ -2128,7 +2133,7 @@ mod tests {
         let mut m = agent_edit(&row);
         let Modal::Form(f) = &m else { panic!("应当是表单") };
         let field = f.fields.iter().find(|x| x.key == "tz").expect("该有时区字段");
-        assert_eq!(field.value(), "-07:00", "该按 ±HH:MM 预填");
+        assert_eq!(field.value(), "UTC-07:00", "该按 UTC±HH:MM 预填");
         let Outcome::Run(Action::EditAgent { nic_reset_offset_secs, .. }) =
             m.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         else {
@@ -2152,21 +2157,42 @@ mod tests {
         assert_eq!(nic_reset_offset_secs, None, "留空 = 跟随 agent,不是 UTC");
     }
 
-    /// 编辑框的时区标签里要写出 agent 报的是什么 —— 一个人要决定填不填覆盖值,
+    /// 编辑框的标题行里要写出 agent 报的是什么 —— 一个人要决定填不填覆盖值,
     /// 得先看见 agent 自己说它在哪个时区。
+    ///
+    /// 写在**标题行**而不是字段标签里:标签列宽被夹在 34 列以内,超了会被静默截成 `…`。
     #[tokio::test]
     async fn the_edit_form_shows_what_the_agent_reported() {
         let row = data::AgentRow { reported_utc_offset_secs: Some(-25200), ..stub_agent(9) };
         let m = agent_edit(&row);
         let Modal::Form(f) = &m else { panic!("应当是表单") };
-        let label = &f.fields.iter().find(|x| x.key == "tz").unwrap().label;
-        assert!(label.contains("-07:00"), "标签里该有 agent 报的值:{label}");
+        let head = f.head.as_deref().unwrap_or_default();
+        assert!(head.contains("UTC-07:00"), "标题行里该有 agent 报的值:{head}");
 
         let row = data::AgentRow { reported_utc_offset_secs: None, ..stub_agent(9) };
         let m = agent_edit(&row);
         let Modal::Form(f) = &m else { panic!("应当是表单") };
-        let label = &f.fields.iter().find(|x| x.key == "tz").unwrap().label;
-        assert!(label.contains("还没报过"), "没报过要说清楚:{label}");
+        let head = f.head.as_deref().unwrap_or_default();
+        assert!(head.contains("还没报过"), "没报过要说清楚:{head}");
+    }
+
+    /// **字段标签不能超过 34 列。**
+    ///
+    /// `modal.rs` 的 `label_w` 把标签列夹在 `[14, 34]`,超出的部分被 `theme::pad`
+    /// **静默截成 `…`** —— 现场表现是「标签后半截看不见」,而且它是最长的那个标签
+    /// 决定整列宽度,所以一个人加长自己那一项会顺带把别人的挤掉。
+    /// 这条守的就是那个静默:超了在 CI 里挂,而不是等有人截图问「为什么被省略了」。
+    #[tokio::test]
+    async fn agent_form_labels_fit_the_label_column() {
+        const CAP: usize = 34;
+        let row = data::AgentRow { reported_utc_offset_secs: Some(-25200), ..stub_agent(9) };
+        for (what, m) in [("编辑", agent_edit(&row)), ("新增", forms::agent_add())] {
+            let Modal::Form(f) = &m else { panic!("应当是表单") };
+            for field in &f.fields {
+                let w = theme::cols(&field.label);
+                assert!(w <= CAP, "{what}表单的「{}」标签占 {w} 列,超过 {CAP}", field.label);
+            }
+        }
     }
 
     /// 新增框不填时区 → `None`,也就是「装上之后跟随 agent 自己上报」。

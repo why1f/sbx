@@ -195,9 +195,22 @@ pub fn due_times(
 /// 比「回落到默认时区」更难被发现。那些时区请填显式偏移。
 pub fn parse_timezone(s: &str) -> Option<FixedOffset> {
     let s = s.trim();
-    if s.is_empty() || s.eq_ignore_ascii_case("UTC") || s.eq_ignore_ascii_case("Z") {
+    if s.is_empty()
+        || s.eq_ignore_ascii_case("UTC")
+        || s.eq_ignore_ascii_case("GMT")
+        || s.eq_ignore_ascii_case("Z")
+    {
         return FixedOffset::east_opt(0);
     }
+    // 允许 `UTC-07:00` / `GMT+8` 这种带前缀的写法。**必须接受**,因为
+    // `format_offset` 现在就是这么显示的 —— 不认自己的输出会让「打开表单、
+    // 什么都不动、按确定」直接报错,那是最气人的一类 bug。
+    let s = ["UTC", "GMT"]
+        .iter()
+        .find_map(|p| s.get(..p.len()).filter(|h| h.eq_ignore_ascii_case(p)).map(|_| &s[p.len()..]))
+        .map(str::trim)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(s);
     let aliased = match s {
         "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Taipei" | "Asia/Singapore" | "Asia/Macau"
         | "Asia/Kuala_Lumpur" | "Asia/Manila" => Some(8 * 3600),
@@ -236,17 +249,25 @@ pub fn parse_timezone(s: &str) -> Option<FixedOffset> {
     FixedOffset::east_opt(sign * (h * 3600 + m * 60))
 }
 
-/// `parse_timezone` 的反向:把偏移秒数写回 `±HH:MM`。
+/// `parse_timezone` 的反向:把偏移秒数写成 `UTC±HH:MM`(零点写成 `UTC`)。
 ///
 /// 和它成对放在这里,而不是丢到调用方(TUI 表单要用它做预填、网卡明细要用它做展示):
 /// 分开写的话很容易出现「能解析但显示成另一种格式」,于是编辑一次表单值就变了样。
 ///
-/// 分钟部分照样写出来(`+08:00` 而不是 `+8`),因为印度那类 `+05:30` 存在,
+/// **带 `UTC` 前缀**是因为裸 `-07:00` 读起来像个数字而不是时区。但**只加 UTC**,
+/// 不做 `PDT`/`CST` 这类字母缩写:`CST` 同时是中国标准时间(+8)和美国中部时间(−6),
+/// `PDT`/`PST` 还随夏令时变 —— 而这里存的就是一个固定偏移(主控不带 tzdata)。
+/// 一个偏移也对应很多时区(−07:00 夏天是 PDT,亚利桑那全年是 MST),挑哪个都是猜。
+///
+/// 分钟部分照样写出来(`UTC+08:00` 而不是 `UTC+8`),因为印度那类 `+05:30` 存在,
 /// 省掉分钟会让它变成一个静默错误的输入。
 pub fn format_offset(secs: i32) -> String {
+    if secs == 0 {
+        return "UTC".into();
+    }
     let sign = if secs < 0 { '-' } else { '+' };
     let abs = secs.abs();
-    format!("{}{:02}:{:02}", sign, abs / 3600, (abs % 3600) / 60)
+    format!("UTC{}{:02}:{:02}", sign, abs / 3600, (abs % 3600) / 60)
 }
 
 /// 按字符切分长消息。Telegram 单条消息上限 4096 **字符**(不是字节)。
@@ -392,10 +413,28 @@ mod tests {
                 "{secs} → {text} 又解不回来"
             );
         }
-        assert_eq!(format_offset(0), "+00:00", "0 也要带符号,不能写成裸 00:00");
-        assert_eq!(format_offset(-25200), "-07:00");
+        assert_eq!(format_offset(0), "UTC", "零点写成 UTC,不是 +00:00");
+        assert_eq!(format_offset(-25200), "UTC-07:00");
         // 分钟不能省:印度那类 +05:30 存在,省掉会变成一个静默错误的值。
-        assert_eq!(format_offset(19800), "+05:30");
+        assert_eq!(format_offset(19800), "UTC+05:30");
+        // 带前缀的写法必须能解回来 —— 这正是 format_offset 的输出格式,
+        // 不认自己的输出会让「打开表单、什么都不动、按确定」直接报错。
+        for (text, want) in [
+            ("UTC-07:00", -25200),
+            ("utc+8", 28800),
+            ("GMT+05:30", 19800),
+            ("UTC-0700", -25200),
+            ("UTC +8", 28800),
+        ] {
+            assert_eq!(
+                parse_timezone(text).map(|o| o.local_minus_utc()),
+                Some(want),
+                "{text} 该解成 {want}"
+            );
+        }
+        // 但纯前缀仍然是 UTC 本身,不是「前缀后面空了」那种错误。
+        assert_eq!(parse_timezone("UTC").map(|o| o.local_minus_utc()), Some(0));
+        assert_eq!(parse_timezone("GMT").map(|o| o.local_minus_utc()), Some(0));
     }
 
     #[test]

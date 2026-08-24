@@ -85,7 +85,7 @@ pub fn agent_add() -> Modal {
                 // **必须放在最后。** `the_add_agent_form_defaults_to_sum_and_cycles_
                 // through_every_mode` 靠按两次 Tab 走到 nic_mode;插在它前面会静默
                 // 改掉那条测试的目标字段,失败信息还会去怪记账口径。
-                Field::text("tz", "重置时区 (例 -07:00,留空 = 跟随 agent 上报)", ""),
+                Field::text("tz", "重置时区 (留空 = 跟随 agent 上报)", ""),
             ],
             Box::new(|f| {
                 let name = val(f, "name");
@@ -114,7 +114,8 @@ pub fn agent_add() -> Modal {
                 "网卡配额按所选口径读取这台机器的原始进出字节(§6.4),不是用户计费用量;".into(),
                 "出站 = 机器发出(服务器→客户端,即客户端那边的下载),入站 = 机器收到;".into(),
                 "原始两个方向一直分开记,换口径只重算显示,不清零也不改历史。".into(),
-                "重置时区决定每月哪一刻翻月:厂商按机房当地零点结算,留空则跟随 agent 上报。".into(),
+                "重置时区决定每月哪一刻翻月:厂商按机房当地零点结算。写 UTC-07:00 这种形式,".into(),
+                "留空则跟随 agent 上报的本机偏移 —— 新机器接入即对齐,不必现在就填。".into(),
                 "它只影响界面上的进度条与告警,不会限制 agent 转发流量。".into(),
                 "确定之后会给出一条填好 token 的接入命令,复制到被控机上跑即可。".into(),
             ]
@@ -633,7 +634,7 @@ mod tests {
 
         // 预填/显示形式与解析必须闭环 —— None 是空串,才能表达「跟随」。
         assert_eq!(nic_offset_label(None), "");
-        assert_eq!(nic_offset_label(Some(-25200)), "-07:00");
+        assert_eq!(nic_offset_label(Some(-25200)), "UTC-07:00");
         assert_eq!(parse_nic_offset(&nic_offset_label(Some(28800))).unwrap(), Some(28800));
     }
 

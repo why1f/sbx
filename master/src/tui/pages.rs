@@ -2278,7 +2278,7 @@ mod tests {
         let reported =
             AgentRow { reported_utc_offset_secs: Some(-25200), ..base.clone() };
         let text = render(&reported);
-        assert!(text.contains("-07:00"), "该写出生效偏移:{text}");
+        assert!(text.contains("UTC-07:00"), "该写出生效偏移:{text}");
         assert!(has_cjk(&text, "agent 上报"), "该标明来源是 agent:{text}");
 
         let manual = AgentRow {
@@ -2287,7 +2287,7 @@ mod tests {
             ..base.clone()
         };
         let text = render(&manual);
-        assert!(text.contains("+00:00"), "手工值该压过上报值:{text}");
+        assert!(text.contains("UTC") && !text.contains("-07:00"), "手工的 UTC 该压过上报的 -07:00:{text}");
         assert!(has_cjk(&text, "手工"), "该标明是人填的:{text}");
 
         let neither = AgentRow { ..base };
