@@ -109,12 +109,37 @@ struct App {
     /// 还没下发完的升级指令条数。TUI 只入队,真正下发在 daemon 那边(隔一拍),
     /// 不显示的话人按完 [u] 会觉得什么都没发生。
     pending_cmds: i64,
+    /// 正在等结果的 `config.check`。
+    ///
+    /// 校验是 **跨进程异步**的:TUI 入队 → daemon 取走 → 发给 agent → 结果写回
+    /// `agent_commands.error`。所以按下 `K` 到看到结论之间隔着一拍,得把「在等」
+    /// 这个状态显式拿着 —— 否则人会以为没反应,连按好几下。
+    check_wait: Option<CheckWait>,
     /// 主循环下一拍要去跑主控自升级。见 `Action::SelfUpgrade`。
     want_self_upgrade: bool,
+    /// 主循环下一拍要拉 `$EDITOR` 去改这台的自定义配置。见 `Action::EditAgentConfig`。
+    ///
+    /// 和自升级走同一个机制而不是在 `perform` 里就地做:要离开 alternate screen
+    /// 得拿到 `Terminal`,而 `perform` 手上只有 `App`。
+    want_edit_custom: Option<(i64, String)>,
     status: Option<String>,
     status_is_error: bool,
     quit: bool,
 }
+
+/// 一次正在跑的 `config.check`。
+#[derive(Debug, Clone)]
+struct CheckWait {
+    cmd_id: i64,
+    agent: String,
+    /// 入队时刻。用来区分「还在跑」和「**daemon 根本没在跑**」——
+    /// 后者会让指令永远蹲在队列里,而人对着一个不动的「校验中」无从下手。
+    at: i64,
+}
+
+/// 等 daemon 取走指令的宽容限。巡检周期是 `report_interval_secs`(默认 30s),
+/// 翻一倍再加一拍 —— 这个阀值宁可宽:误报「daemon 没跑」比多等一会儿要坏。
+const CHECK_TAKEN_GRACE_SECS: i64 = 75;
 
 impl App {
     fn new(pool: SqlitePool, cfg: Config, cfg_path: String) -> Self {
@@ -135,7 +160,9 @@ impl App {
             term_h: 0,
             probed_ip: std::sync::Arc::new(std::sync::Mutex::new(None)),
             pending_cmds: 0,
+            check_wait: None,
             want_self_upgrade: false,
+            want_edit_custom: None,
             status: None,
             status_is_error: false,
             quit: false,
@@ -183,6 +210,40 @@ impl App {
     fn note(&mut self, msg: impl Into<String>) {
         self.status = Some(msg.into());
         self.status_is_error = false;
+    }
+
+    /// 把已经出结果的 `config.check` 变成一条状态行。每次 `refresh` 跑一遍。
+    ///
+    /// 四种落地:完成(成/败)、还在跑、**没人取**、指令没了。
+    /// 第三种必须单独说:它意味着 daemon 没在跑,而不是校验失败 ——
+    /// 两者的下一步完全不同(一个去 `systemctl status sbx`,一个去改配置)。
+    /// 第四种是库被手清过或 agent 被删(级联删指令),不能就这么挂着。
+    async fn poll_config_check(&mut self, now: i64) {
+        let Some(w) = self.check_wait.clone() else {
+            return;
+        };
+        match crate::db::command_repo::outcome(&self.pool, w.cmd_id).await {
+            Ok(Some(o)) if o.done => {
+                self.check_wait = None;
+                match o.error {
+                    None => self.note(format!("{} 的配置通过了 sing-box 校验", w.agent)),
+                    Some(e) => self.fail(format!("{} 的配置没通过:{e}", w.agent)),
+                }
+            }
+            Ok(Some(o)) if !o.taken && now - w.at > CHECK_TAKEN_GRACE_SECS => {
+                self.check_wait = None;
+                self.fail(format!(
+                    "{} 的校验一直没人取走 —— daemon 大概没在跑(systemctl status sbx)",
+                    w.agent
+                ));
+            }
+            Ok(None) => {
+                self.check_wait = None;
+                self.fail(format!("{} 的校验指令不见了(agent 被删了?)", w.agent));
+            }
+            // 还在跑,或者查不动库 —— 都不要改状态行,下一拍再看。
+            _ => {}
+        }
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
@@ -233,7 +294,7 @@ impl App {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
                 Some(a) => vec![format!(
-                    "  选中: {}  token: {}…  节点: {} 个  状态: {}{}  网卡: {}  出站: {}{}",
+                    "  选中: {}  token: {}…  节点: {} 个  状态: {}{}  网卡: {}  出站: {}{}{}",
                     a.name,
                     a.token_prefix,
                     a.node_count,
@@ -245,8 +306,9 @@ impl App {
                     offline_for(a, chrono::Local::now().timestamp()),
                     a.nic_accounting_mode.short(),
                     a.outbound.label(),
+                    custom_note(a),
                     if self.pending_cmds > 0 {
-                        format!("   ⋯ {} 条升级待下发", self.pending_cmds)
+                        format!("   ⋯ {} 条指令待下发", self.pending_cmds)
                     } else {
                         String::new()
                     }
@@ -344,7 +406,7 @@ impl App {
         match self.page {
             Page::Dashboard => "  [←/→]换栏  [↑↓/jk]选择  [Enter]用量明细",
             Page::Agents => {
-                "  [a]新增  [E]编辑  [Enter]网卡明细  [c]查看配置  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
+                "  [a]新增  [E]编辑  [Enter]网卡明细  [c]看配置  [C]改自定义  [K]校验  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
             }
             Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除",
             Page::Users => {
@@ -368,6 +430,7 @@ impl App {
         self.nodes = data::load_nodes(&self.pool).await?;
         self.users = data::load_users(&self.pool).await?;
         self.pending_cmds = crate::db::command_repo::pending_count(&self.pool).await.unwrap_or(0);
+        self.poll_config_check(now).await;
         // 删掉最后一行之后光标会落在表外,下一帧渲染就会读到不存在的下标。
         let lens = [
             0,
@@ -539,6 +602,142 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// 拉 `$EDITOR` 去改一台 agent 的自定义配置,回来后校验并存库。
+///
+/// **为什么用外部编辑器而不是在 TUI 里写一个。** 要改的是一段 JSON,
+/// 而设置页那种「一项一个输入框」的形态放不下它;ratatui 也没有现成的多行
+/// 编辑组件。而人手上那个编辑器有高亮、有撤销、有他用习惯了的键位。
+///
+/// 挂起/接回终端的做法照 `run_self_upgrade` —— 包括那条教训:
+/// **无论成败都要把终端接回来**,半路 return 会把人扒在一个 raw mode 没关的 shell 里。
+///
+/// **不猜编辑器。** `$EDITOR` 没设就报错让人去设 —— 猜一个 `vi` 的风险是
+/// 把不会用 vi 的人扒进一个退不出来的界面里,而那时候 TUI 已经挂起了。
+async fn edit_custom_config<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    pool: &SqlitePool,
+    id: i64,
+    name: &str,
+) -> Result<String> {
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "没设 $EDITOR。先 `export EDITOR=nano`(或 vim / micro)再重进这一页。\n\
+                 或者用 CLI:sbx agent-config-set {id} 片段.json"
+            )
+        })?;
+
+    let existing = crate::db::agent_repo::custom_config(pool, id).await?;
+    let seed = match &existing {
+        Some(raw) => raw.clone(),
+        None => custom_config_template(pool, id, name).await?,
+    };
+
+    let path = std::env::temp_dir().join(format!("sbx-custom-{id}-{}.jsonc", uuid::Uuid::new_v4()));
+    std::fs::write(&path, &seed)?;
+
+    restore_terminal()?;
+    let _ = term.show_cursor();
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} {}", path.display()))
+        .status();
+    // 先把终端接回来,再判断结果。顺序反过来的话,编辑器异常退出时会从这里
+    // return,把人扒在一个 raw mode 没关的 shell 里。
+    enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), EnterAlternateScreen)?;
+    term.clear()?;
+
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => anyhow::bail!("编辑器非零退出(exit {:?}),没改库", s.code()),
+        Err(e) => anyhow::bail!("起不来 {editor}:{e}"),
+    }
+    let edited = edited?;
+
+    // 校验在存库**之前**。存了再验的话,一份写坏的片段会跟着 revision 下发出去,
+    // 而人要从 `agent_events` 里的 config_apply_failed 才能发现。
+    let obj = crate::service::validate_custom(&edited)?;
+    if obj.is_empty() {
+        if existing.is_none() {
+            return Ok(format!("{name} 的自定义配置没变(本来就没有)"));
+        }
+        let rev = crate::db::agent_repo::set_custom_config(pool, id, None).await?;
+        return Ok(format!(
+            "清空了 —— {name} 恢复成默认配置(rev {rev}),下次下发后只剩 direct 出站"
+        ));
+    }
+    if existing.as_deref() == Some(edited.as_str()) {
+        return Ok(format!("{name} 的自定义配置没改动"));
+    }
+    let rev = crate::db::agent_repo::set_custom_config(pool, id, Some(&edited)).await?;
+    Ok(format!(
+        "已存 {name} 的自定义配置:{}(rev {rev})。按 [K] 让它自己的 sing-box 再验一次",
+        obj.keys().cloned().collect::<Vec<_>>().join(" / ")
+    ))
+}
+
+/// 第一次打开编辑器时的初始内容。
+///
+/// **当前生效的配置只作为注释放进去,不作为内容。** 这一条很关键:
+/// 预填成实际内容的话,人「打开看一眼、按保存」就意外接管了
+/// `default_domain_resolver`,于是 `[o]` 静默失效。现在原样保存 = 仍然是空 = 什么都没变。
+///
+/// sing-box 接受 `//`、`#`、`/* */` 和尾随逗号(实测确认过),所以这份带注释的
+/// 模板原样存下去也能过 —— 不需要让人先把注释删干净。
+async fn custom_config_template(pool: &SqlitePool, id: i64, name: &str) -> Result<String> {
+    let effective = crate::service::build_agent_config(pool, id).await?;
+    let mut refs = Vec::new();
+    for key in ["outbounds", "route", "dns"] {
+        if let Some(v) = effective.get(key) {
+            let text =
+                serde_json::to_string_pretty(&serde_json::json!({ key: v })).unwrap_or_default();
+            // 只取大括号中间的那几行,拼成一段可直接拄的参考。
+            for line in text.lines().skip(1).take(text.lines().count().saturating_sub(2)) {
+                refs.push(format!("//   {line}"));
+            }
+        }
+    }
+    let has_resolver = crate::model::outbound::has_custom_resolver(&effective);
+    let resolver_note = if has_resolver {
+        "//   ↑ 上面那个 default_domain_resolver 来自【o】的出站策略。\n\
+         //     你在下面自己写一个就等于接管它,那时【o】会显示「由自定义配置接管」。"
+    } else {
+        "//   (这台的出站策略是「自动」,所以没有 default_domain_resolver。\n\
+         //    你写了一个也不会和【o】打起来。)"
+    };
+    Ok(format!(
+        "// {name} 的自定义 sing-box 片段。只能写这三个顶层字段:
+//   outbounds  —— **追加**到主控那个 direct 后面(tag 不能叫 direct)
+//   route      —— 逐 key 并入,同名字段以这里为准
+//   dns        —— 同上
+//
+// inbounds **不在内**。记账键是 (用户, inbound tag):改了 tag,上报会被当成
+// 「主控没分配过的 (user, tag)」直接丢弃 —— 流量静默停止记账,一句报错都没有。
+// 节点请在「节点」页里加减。
+//
+// 注释(// # /* */)与尾随逗号都行 —— sing-box 自己也接受,而且原文存进库里,
+// 下次打开还在。全部清空存盘 = 恢复默认配置。
+//
+// rule_set 两个坑:远程的要这台 agent 能出网去拉(拉不到会在 config.apply 失败,
+// 而 [K] 的 config.check 验不出来);本地的 path 指的是 **agent 那台机器上**的文件,
+// 而主控没有推文件的机制。
+//
+// 当前生效的等价配置(参考,不用拄):
+{refs}
+{resolver_note}
+{{
+}}
+",
+        refs = if refs.is_empty() { "//   (空)".to_string() } else { refs.join("\n") },
+    ))
+}
+
 async fn event_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     mut app: App,
@@ -597,6 +796,14 @@ async fn event_loop<B: ratatui::backend::Backend>(
                                 match msg {
                                     Ok(m) => app.note(m),
                                     Err(e) => app.fail(format!("升级失败: {e}")),
+                                }
+                            }
+                            // 与自升级同一个做法:要挂起终端的事必须在主循环里做,
+                            // `perform` 里拿不到 `term`。
+                            if let Some((id, name)) = app.want_edit_custom.take() {
+                                match edit_custom_config(term, &app.pool, id, &name).await {
+                                    Ok(m) => app.note(m),
+                                    Err(e) => app.fail(format!("{name} 的自定义配置没存上: {e}")),
                                 }
                             }
                             app.refresh().await?;
@@ -865,6 +1072,25 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                 Some(a) => {
                     let (id, name) = (a.id, a.name.clone());
                     return Some(Action::ShowAgentConfig { id, name });
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
+            // 把同一份配置交给那台机器自己的 sing-box 试建一次。
+            //
+            // `K` 而不是 `k`:小写 `k` 是向上选择。误按 `K` 没代价 ——
+            // 这个动作是只读的,不会碰到正在跑的 box。
+            KeyCode::Char('K') => match app.selected_agent() {
+                Some(a) => {
+                    let (id, name) = (a.id, a.name.clone());
+                    return Some(Action::CheckAgentConfig { id, name });
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
+            // `c` 看、`C` 改 —— 改的是自定义追加段,不是 `[c]` 那份产物全文。
+            KeyCode::Char('C') => match app.selected_agent() {
+                Some(a) => {
+                    let (id, name) = (a.id, a.name.clone());
+                    return Some(Action::EditAgentConfig { id, name });
                 }
                 None => app.fail("没有选中任何被控服务器"),
             },
@@ -1354,6 +1580,31 @@ fn offline_for(a: &data::AgentRow, now: i64) -> String {
     }
 }
 
+/// 摘要行里跟在「出站」后面的那一小段:有没有自定义配置,以及它是不是把
+/// 出站策略接管了。
+///
+/// **接管了就必须说出来。** `[o]` 与自定义配置写的是同一个字段
+/// (`route.default_domain_resolver`)—— `[o]` 本质上就是自定义配置的一个预设。
+/// 自定义写了之后策略让位(见 `outbound::apply`),而界面上还显示着「仅 IPv4」
+/// 就是个谎 —— 那种「界面说一套、实际跑一套」是最难查的不一致。
+///
+/// 只在选中的那一行解一次 JSON,不是每行都解。
+fn custom_note(a: &data::AgentRow) -> String {
+    let Some(raw) = a.custom_json.as_deref().filter(|s| !s.trim().is_empty()) else {
+        return String::new();
+    };
+    // 读不懂也要说「有自定义」—— 存在本身就是人要知道的事,
+    // 而「库里那份读不懂」由组装时那条 warn 负责。
+    let takes_over = crate::service::validate_custom(raw)
+        .map(|o| o.get("route").and_then(|r| r.get("default_domain_resolver")).is_some())
+        .unwrap_or(false);
+    if takes_over {
+        "(由自定义配置接管)".into()
+    } else {
+        "  自定义: 有".into()
+    }
+}
+
 /// 接入命令的信息框:命令自己一行,底下是说明,`y` 复制整条。
 ///
 /// 命令**单独占一行**放在最上面,而不是混在说明里:它是这个框存在的唯一理由,
@@ -1632,6 +1883,38 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 info,
                 body: OverlayBody::Table(rows),
             });
+            Ok(String::new())
+        }
+
+        Action::CheckAgentConfig { id, name } => {
+            // 离线就直接拒,不要入队。入了队的下场是 daemon 取走、发不出去、
+            // 回一句「agent 不在线」—— 绕一大圈才告诉人一件此处当场就能知道的事。
+            let online = app.agents.iter().any(|a| a.id == *id && a.status == "online");
+            if !online {
+                return Ok(format!(
+                    "{name} 不在线 —— 校验要用那台机器自己的 sing-box 试建,必须在线"
+                ));
+            }
+            // 校验的就是**下发给它的那一份**:同一个 `build_agent_config`,
+            // 和 `[c]` 看到的、和 `config.apply` 发出去的是同一份字节。
+            // 抽一份可能不一样的去验等于没验。
+            let cfg = crate::service::build_agent_config(&app.pool, *id).await?;
+            let now = chrono::Local::now().timestamp();
+            let cmd_id = crate::db::command_repo::enqueue(
+                &app.pool,
+                *id,
+                "config_check",
+                &serde_json::json!({ "options": cfg }),
+                now,
+            )
+            .await?;
+            app.check_wait = Some(CheckWait { cmd_id, agent: name.clone(), at: now });
+            Ok(format!("已请 {name} 用自己的 sing-box 试建一次,结果马上回来"))
+        }
+
+        Action::EditAgentConfig { id, name } => {
+            // 真正的编辑在主循环里做(要挂起终端,这里拿不到 `Terminal`)。
+            app.want_edit_custom = Some((*id, name.clone()));
             Ok(String::new())
         }
 
@@ -2449,7 +2732,12 @@ mod tests {
 
         // 从没连上过:状态那一格已经写着「从未连接」,不再重复一遍。
         // 它和「连过又断了」是两回事 —— 前者查 token/防火墙,后者查机器/网络。
-        let never = data::AgentRow { status: "never".into(), last_seen: None, ..stub_agent(1) };
+        let never = data::AgentRow {
+            status: "never".into(),
+            last_seen: None,
+            custom_json: None,
+            ..stub_agent(1)
+        };
         let out = line(never);
         assert!(out.contains("○ 从未连接"), "{out}");
         assert!(!out.contains("天"), "没连过就没有「多久」可说:{out}");
@@ -2870,6 +3158,7 @@ mod tests {
             uptime_secs: None,
             sysinfo_at: None,
             last_seen: None,
+            custom_json: None,
         }
     }
 
@@ -3135,6 +3424,233 @@ mod tests {
     ///      (缺了 server tag,sing-box 起不来);
     ///   3. **凭据是原文** —— 遮掉私钥的配置跑不起来,那这一页就只剩个大概样子。
     ///      这一页只在主控的终端上、按 [c] 才打开,而这些密钥本来就产自主控(§9.1)。
+    /// **`[K]` 校验的必须是下发给它的那一份字节。**
+    ///
+    /// 抽一份可能不一样的去验等于没验。这条把入队的 payload 和 `[c]` 那一页逐字节对上 ——
+    /// 两边都该是 `service::build_agent_config` 的输出。哪天有人给校验路径单独组一份
+    /// 「简化版」配置,这里会挂。
+    #[tokio::test]
+    async fn a_check_validates_exactly_the_bytes_that_get_pushed() {
+        use crate::model::node::{NodeParams, Protocol};
+
+        let path = std::env::temp_dir().join(format!("sbx-chk-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let (node_id, _) = crate::db::node_repo::add_node(
+            &pool,
+            agent_id,
+            "in-1",
+            Protocol::VlessReality,
+            8443,
+            &params,
+        )
+        .await
+        .unwrap();
+        let uid = crate::db::node_repo::add_user(&pool, "alice", 0, 0).await.unwrap();
+        crate::db::node_repo::assign_node(&pool, uid, node_id).await.unwrap();
+
+        let mut app = App::new(pool.clone(), Config::default(), "sbx-test.toml".into());
+        app.refresh().await.unwrap();
+        // 在线才能校验 —— 手动把状态抬成 online(没有真的 WS 连接)。
+        for a in &mut app.agents {
+            a.status = "online".into();
+        }
+
+        perform_inner(&mut app, &Action::CheckAgentConfig { id: agent_id, name: "tokyo".into() })
+            .await
+            .unwrap();
+        let w = app.check_wait.clone().expect("该记下正在等结果");
+
+        let queued: String =
+            sqlx::query_scalar("SELECT payload_json FROM agent_commands WHERE id = ?")
+                .bind(w.cmd_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let queued: serde_json::Value = serde_json::from_str(&queued).unwrap();
+        let want = crate::service::build_agent_config(&pool, agent_id).await.unwrap();
+        assert_eq!(queued["options"], want, "入队的配置与下发的不是同一份");
+
+        let kind: String = sqlx::query_scalar("SELECT kind FROM agent_commands WHERE id = ?")
+            .bind(w.cmd_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kind, "config_check", "daemon 靠 kind 认它");
+    }
+
+    /// 离线的机器**不入队**。
+    ///
+    /// 入了队的下场是 daemon 取走、发不出去、回一句「agent 不在线」——
+    /// 绕一大圈才告诉人一件按键的那一刻就能知道的事。
+    #[tokio::test]
+    async fn checking_an_offline_agent_does_not_queue_anything() {
+        let path = std::env::temp_dir().join(format!("sbx-chkoff-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        let mut app = App::new(pool.clone(), Config::default(), "sbx-test.toml".into());
+        app.refresh().await.unwrap();
+
+        let msg = perform_inner(
+            &mut app,
+            &Action::CheckAgentConfig { id: agent_id, name: "tokyo".into() },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("不在线"), "要当场说清为什么不能验:{msg}");
+        assert!(app.check_wait.is_none(), "不该进等待状态");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_commands")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "一条都不该入队");
+    }
+
+    /// **结果要真的回到状态行。**
+    ///
+    /// 校验是跨进程异步的,没有这一步的话按下 `K` 之后就永远没下文了。
+    /// 错误分支特别要把 **sing-box 的原文**带出来:主控里没有 sing-box,
+    /// 字段名拼错这类错只有它能报。
+    #[tokio::test]
+    async fn a_finished_check_shows_up_in_the_status_line() {
+        let path = std::env::temp_dir().join(format!("sbx-chkres-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        let mut app = App::new(pool.clone(), Config::default(), "sbx-test.toml".into());
+
+        // 成功
+        let id = crate::db::command_repo::enqueue(
+            &pool,
+            agent_id,
+            "config_check",
+            &serde_json::json!({}),
+            0,
+        )
+        .await
+        .unwrap();
+        crate::db::command_repo::finish(&pool, id, None, 1).await.unwrap();
+        app.check_wait = Some(CheckWait { cmd_id: id, agent: "tokyo".into(), at: 0 });
+        app.poll_config_check(2).await;
+        assert!(app.check_wait.is_none(), "出结果了就不该还在等");
+        assert!(!app.status_is_error, "通过不是错误");
+        assert!(app.status.as_deref().unwrap_or_default().contains("通过"), "{:?}", app.status);
+
+        // 失败 —— 原文要在
+        let id2 = crate::db::command_repo::enqueue(
+            &pool,
+            agent_id,
+            "config_check",
+            &serde_json::json!({}),
+            0,
+        )
+        .await
+        .unwrap();
+        crate::db::command_repo::finish(&pool, id2, Some("json: unknown field \"outbonds\""), 1)
+            .await
+            .unwrap();
+        app.check_wait = Some(CheckWait { cmd_id: id2, agent: "tokyo".into(), at: 0 });
+        app.poll_config_check(2).await;
+        let s = app.status.clone().unwrap_or_default();
+        assert!(app.status_is_error, "没通过该标成错误:{s}");
+        assert!(s.contains("outbonds"), "sing-box 的原文丢了:{s}");
+    }
+
+    /// **没人取走要说成「daemon 没在跑」,不能说成校验失败。**
+    ///
+    /// 两者的下一步完全不同:一个去 `systemctl status sbx`,一个去改配置。
+    /// 而在宽容限之内还不能下结论 —— 巡检周期默认 30 秒,提前报错是误报。
+    #[tokio::test]
+    async fn a_command_nobody_takes_blames_the_daemon_not_the_config() {
+        let path = std::env::temp_dir().join(format!("sbx-chknod-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        let mut app = App::new(pool.clone(), Config::default(), "sbx-test.toml".into());
+        let id = crate::db::command_repo::enqueue(
+            &pool,
+            agent_id,
+            "config_check",
+            &serde_json::json!({}),
+            0,
+        )
+        .await
+        .unwrap();
+        app.check_wait = Some(CheckWait { cmd_id: id, agent: "tokyo".into(), at: 0 });
+
+        // 宽容限之内:什么都不说,继续等。
+        app.poll_config_check(CHECK_TAKEN_GRACE_SECS).await;
+        assert!(app.check_wait.is_some(), "还在宽容限内,不该下结论");
+        assert!(app.status.is_none(), "也不该刷状态行:{:?}", app.status);
+
+        // 超了:指向 daemon。
+        app.poll_config_check(CHECK_TAKEN_GRACE_SECS + 1).await;
+        let s = app.status.clone().unwrap_or_default();
+        assert!(app.check_wait.is_none(), "该放弃等了");
+        assert!(s.contains("daemon"), "要指向 daemon 而不是配置:{s}");
+    }
+
+    /// **自定义接管了出站策略时,摘要行必须说出来。**
+    ///
+    /// `[o]` 与自定义配置写的是同一个字段。自定义写了之后策略让位
+    /// (`outbound::apply`),而界面上还显示着「仅 IPv4」就是个谎 ——
+    /// 那种「界面说一套、实际跑一套」是最难查的不一致。
+    #[tokio::test]
+    async fn the_ops_line_says_when_a_custom_config_takes_over_the_strategy() {
+        let line = |custom: Option<&str>| {
+            let mut app = app();
+            app.page = Page::Agents;
+            app.agents =
+                vec![data::AgentRow { custom_json: custom.map(str::to_string), ..stub_agent(1) }];
+            app.ops_lines().join("\n")
+        };
+
+        assert!(!line(None).contains("自定义"), "没自定义就不该提它");
+
+        // 有自定义但没接管 resolver。
+        let out = line(Some(r#"{ "outbounds": [{ "type": "direct", "tag": "warp" }] }"#));
+        assert!(out.contains("自定义: 有"), "{out}");
+        assert!(!out.contains("接管"), "没写 resolver 就不算接管:{out}");
+
+        // 写了 resolver → 接管。
+        let out = line(Some(
+            r#"{ "route": { "default_domain_resolver": { "server": "x", "strategy": "prefer_ipv6" } } }"#,
+        ));
+        assert!(out.contains("由自定义配置接管"), "{out}");
+
+        // 库里那份读不懂时仍然要说「有自定义」—— 存在本身就是人要知道的事。
+        let out = line(Some("{ 这不是 json"));
+        assert!(out.contains("自定义: 有"), "读不懂也该提一句:{out}");
+    }
+
+    /// **模板里当前生效的配置只能是注释。**
+    ///
+    /// 预填成实际内容的话,人「打开看一眼、按保存」就意外接管了
+    /// `default_domain_resolver`,于是 `[o]` 静默失效。原样保存必须等于什么都没变。
+    #[tokio::test]
+    async fn the_editor_template_seeds_nothing_but_comments() {
+        let path = std::env::temp_dir().join(format!("sbx-tpl-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        crate::db::agent_repo::set_outbound_strategy(
+            &pool,
+            id,
+            crate::model::outbound::OutboundStrategy::Ipv4Only,
+        )
+        .await
+        .unwrap();
+
+        let tpl = custom_config_template(&pool, id, "tokyo").await.unwrap();
+        // 参考信息得在 —— 否则人对着空文件不知道现在跑的是什么。
+        assert!(tpl.contains("default_domain_resolver"), "当前生效的配置没写进参考里");
+        assert!(tpl.contains("ipv4_only"));
+        assert!(tpl.contains("inbounds"), "要说清 inbounds 为何不在内");
+
+        // 而它们只能是注释:原样存盘 → 解析出来是空对象。
+        let obj = crate::service::validate_custom(&tpl).expect("模板本身必须能过校验");
+        assert!(obj.is_empty(), "模板不该带实际内容,否则「打开就保存」会意外接管:{obj:?}");
+    }
+
     #[tokio::test]
     async fn the_config_view_is_a_runnable_original() {
         use crate::model::node::{NodeParams, Protocol};

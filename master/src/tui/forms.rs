@@ -740,6 +740,7 @@ mod preview {
             uptime_secs: None,
             sysinfo_at: None,
             last_seen: None,
+            custom_json: None,
         }];
         let node = NodeRow {
             id: 1,

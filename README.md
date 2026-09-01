@@ -104,6 +104,10 @@ sbx --config /etc/sbx/config.toml user-add alice --quota-gb 100
 sbx --config /etc/sbx/config.toml user-assign alice 1
 sbx --config /etc/sbx/config.toml user-sub alice
 
+# 给某台被控加一份自定义 sing-box 片段（出站 / 路由 / DNS），或清掉它
+sbx --config /etc/sbx/config.toml agent-config-set 1 custom.jsonc
+sbx --config /etc/sbx/config.toml agent-config-clear 1
+
 # TUI
 sbx --config /etc/sbx/config.toml tui
 ```
@@ -117,7 +121,7 @@ sbx --config /etc/sbx/config.toml tui
 | 页 | 主要操作 |
 |---|---|
 | 仪表盘 | 集群概况、网速曲线、用户/节点用量排行；`←/→` 换栏，`Enter` 看明细 |
-| 服务管理 | `a` 新增、`E` 编辑（含记账口径与重置时区）、`Enter` 网卡明细、`c` 查看完整 sing-box 配置、`o` 出站策略、`i` 接入命令、`u` 升级 agent、`r` 轮换 token、`d` 删除 |
+| 服务管理 | `a` 新增、`E` 编辑（含记账口径与重置时区）、`Enter` 网卡明细、`c` 查看完整 sing-box 配置、`C` 改自定义片段、`K` 让它自己的 sing-box 校验配置、`o` 出站策略、`i` 接入命令、`u` 升级 agent、`r` 轮换 token、`d` 删除 |
 | 节点 | `a` 新增、`E` 编辑、`Enter` 用户明细、`d` 删除 |
 | 用户 | `a` 新增、`E` 编辑、`n` 分配节点、`b` 绑定网卡用量、`T` token、`r` 重置、`t` 启停、`s` 订阅、`d` 删除 |
 | 设置 | `Enter` 修改配置文件；修改后重启 daemon |
@@ -126,6 +130,14 @@ sbx --config /etc/sbx/config.toml tui
 
 - `[c]` 显示主控现场组装、实际下发的完整配置，**包含原始凭据且不脱敏**；不要截图或外传。
 - `[o]` 按 agent 设置自动、优先 IPv4、优先 IPv6、仅 IPv4、仅 IPv6。
+- `[C]` 拉 `$EDITOR` 改这台的**自定义片段**：只能写 `outbounds` / `route` / `dns` 三个顶层字段。
+  注释（`//` `#` `/* */`）与尾随逗号都行，而且**原文存进库里**，下次打开还在。
+  全部清空存盘 = 恢复默认。
+  **`inbounds` 不在内** —— 记账键是（用户, inbound tag），改了 tag 流量会静默停止记账。
+  自定义里写了 `route.default_domain_resolver` 就等于接管 `[o]`，那时摘要行会标「由自定义配置接管」。
+- `[K]` 把即将下发的那份配置交给**那台机器自己的 sing-box** 试建一次（`config.check`，建完立即关掉，不接管当前实例、不占端口）。
+  字段名拼错、`route` 引用了不存在的 outbound tag 这类错只有它能报 —— 主控里没有 sing-box。
+  验不出**端口占用**（那要到 `Start()`，由 `config.apply` 的 build-first + 回滚那一层守）。
 - `[E]` 里的「网卡记账口径」决定这台机器本周期算多少：入出总计 / 仅出站(TX) / 仅入站(RX) / 入出取大。
   方向站在被控机看：**出站 = 机器发出（服务器→客户端，也就是客户端那边的下载），入站 = 机器收到**。
   原始两个方向始终完整保存，切换口径只重算显示，不清零也不改历史；`Enter` 的网卡明细同时给出两者。
@@ -165,6 +177,9 @@ IPv6 输出规则：
 - `config_revision` 与 `user_state_revision` 独立：前者重建 box，后者只更新内存禁用名单。
 - Reality、自签 TLS、Shadowsocks 等密钥在创建节点时生成一次并持久化，后续下发不得重新生成。
 - agent 必须由能在进程退出后重新拉起它的 supervisor 管理；systemd 的 `Restart=always` 与 OpenRC 的 `supervise-daemon` 都满足。自升级会原子替换二进制后主动退出，没有 supervisor 就会永久离线。
+- 每台 agent 可带一份自定义 sing-box 片段（`agents.custom_json`，只限 `outbounds` / `route` / `dns`）。
+  它存在**主控库里**而不是 agent 上，配置权威不变；组装时先并入自定义，再叠出站策略。
+  `inbounds` 不开放修改 —— 记账键是（用户, inbound tag）。
 - agent 不开放管理端口；管理面只有 agent 主动连接主控的 WebSocket。
 
 ## 构建与测试
@@ -205,7 +220,7 @@ CI 还检查：
 | `agent/` | Go agent，内嵌 sing-box |
 | `shared/` | Rust 协议类型 |
 | `packaging/` | 安装脚本、配置示例、systemd/OpenRC service |
-| `master/testdata/` | 八协议及出站策略 golden 配置，测试必需 |
+| `master/testdata/` | 八协议、出站策略、自定义片段合并后的 golden 配置，测试必需 |
 | `spike/` | 真实 sing-box tracker 回归，CI 必需 |
 | `e2e/` | 跨 agent 记账与断连恢复的端到端验证，`e2e/run.sh` 在 CI 里真跑 |
 

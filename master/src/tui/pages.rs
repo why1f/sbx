@@ -1769,6 +1769,7 @@ mod tests {
             uptime_secs: Some(86_400 * 3 + 3600 * 4),
             sysinfo_at: Some(NOW - 5),
             last_seen: None,
+            custom_json: None,
         }
     }
 

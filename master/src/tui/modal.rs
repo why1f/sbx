@@ -101,6 +101,30 @@ pub enum Action {
         id: i64,
         name: String,
     },
+    /// 把这台机器的配置交给它自己的 sing-box 试建一次(`config.check`)。
+    ///
+    /// **为什么不在主控里验。** 主控里没有 sing-box(§0.3 结论一),它能看出的
+    /// 只有 JSON 语法错。字段名拼错、类型不对、`route` 引用了不存在的 outbound tag ——
+    /// 这些只有真 `box.New()` 才能报,而它就在 agent 那边。
+    ///
+    /// **不接管当前实例、不占端口。** 建完立即 `Close()`,没 `Start()` 过。
+    /// 代价是它**验不出端口占用** —— 那要到 `Start()`,由 `config.apply` 的
+    /// build-first + 回滚那一层守。
+    CheckAgentConfig {
+        id: i64,
+        name: String,
+    },
+    /// 拉 `$EDITOR` 去改这台的自定义 sing-box 片段(出站 / 路由 / DNS)。
+    ///
+    /// 改的不是 `[c]` 那一页的全文 —— **那一页是产物**,每次都从库里重新组装。
+    /// 编辑它的全文再存回去走不通:明天加一个用户,组装会重新生成 `inbounds`,
+    /// 那份文本立刻过期;而 `inbounds` 是从 nodes + user_nodes 推导出来的,
+    /// 编辑它没有地方可以存回去。所以这里改的是**追加段**,
+    /// 而 `[c]` 依然只读、依然显示合并后的最终结果。
+    EditAgentConfig {
+        id: i64,
+        name: String,
+    },
     /// 立刻刷一遍。常规刷新是每秒一次,但改完配置或另一个进程动了库时要马上看到。
     Refresh,
     AddNode(NodeDraft),

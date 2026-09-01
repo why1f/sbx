@@ -55,6 +55,10 @@ pub struct AgentRow {
     /// 表里不给它列 —— 那张表已经在抢列宽了。它进摘要行:「离线」是个红点就够了,
     /// 而「离线多久」才是决定要不要去看那台机器的信息,红点自己说不出来。
     pub last_seen: Option<i64>,
+    /// 这台有没有自定义配置片段(迁移 012)。存原文而不是 `bool`,
+    /// 是因为摘要行还要看它有没有接管 `default_domain_resolver` ——
+    /// 那得解一下。只在**选中的那一行**解,不是每行都解。
+    pub custom_json: Option<String>,
 }
 
 impl AgentRow {
@@ -535,6 +539,7 @@ struct AgentQueryRow {
     uptime_secs: Option<i64>,
     sysinfo_at: Option<i64>,
     last_seen: Option<i64>,
+    custom_json: Option<String>,
     boot_id: Option<String>,
     last_rx: i64,
     last_tx: i64,
@@ -579,6 +584,7 @@ pub async fn load_agents(
                 a.reported_utc_offset_secs, a.nic_reset_offset_secs,
                 a.cpu_pct, a.mem_used, a.mem_total, a.load1, a.uptime_secs, a.sysinfo_at,
                 a.last_seen,
+                a.custom_json,
                 t.boot_id,
                 COALESCE(t.last_rx, 0)    AS last_rx,
                 COALESCE(t.last_tx, 0)    AS last_tx,
@@ -633,6 +639,7 @@ pub async fn load_agents(
                 uptime_secs: r.uptime_secs,
                 sysinfo_at: r.sysinfo_at,
                 last_seen: r.last_seen,
+                custom_json: r.custom_json,
             }
         })
         .collect();
@@ -971,6 +978,7 @@ mod tests {
             uptime_secs: None,
             sysinfo_at: None,
             last_seen: None,
+            custom_json: None,
         };
         assert_eq!(a.quota_ratio(), None, "不限流量时不该有比例(否则会画出 0% 的条)");
         a.nic_quota_bytes = Some(0);
@@ -1032,6 +1040,7 @@ mod tests {
             uptime_secs: None,
             sysinfo_at: None,
             last_seen: None,
+            custom_json: None,
         }
     }
 

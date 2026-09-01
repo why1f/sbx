@@ -139,3 +139,48 @@ func TestOutboundStrategyConfigsAreAccepted(t *testing.T) {
 		t.Fatal("一个 golden 都没读到 —— 先在 master 侧跑 outbound_strategies_match_golden_configs")
 	}
 }
+
+// 自定义配置片段合并后的整份配置(§1.2 / 迁移 012)。
+//
+// 这一组守的是前两组都盖不到的东西:**合并本身**。人写的 `route.rules` 里引用了
+// 一个自定义 outbound tag,而那个 tag 必须真的被追加进 `outbounds` ——
+// 合并写错一行(比如把 `outbounds` 覆盖而不是追加),表现就是 box.New() 报一个
+// 指不到的 tag。而那时候这台机器已经在线上了。
+//
+// golden 由 Rust 侧的 `service::tests::a_merged_custom_config_matches_its_golden` 生成。
+const customGoldenDir = "../../master/testdata/custom"
+
+func TestMergedCustomConfigsAreAccepted(t *testing.T) {
+	entries, err := os.ReadDir(customGoldenDir)
+	if err != nil {
+		t.Skipf("读不到 %s(不在完整仓库里?): %v", customGoldenDir, err)
+	}
+
+	c := New(nil)
+	found := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue // 跳过 .json.actual
+		}
+		found++
+		t.Run(strings.TrimSuffix(name, ".json"), func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join(customGoldenDir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// inbounds 是主控独占的(记账键是「用户, inbound tag」)。自定义片段
+			// 要是能改它,流量会静默停止记账 —— 所以 golden 里那一段必须还是
+			// 主控生成的形状。这里只做一个粗筛:tag 还在。
+			if !strings.Contains(string(raw), `"in-1"`) {
+				t.Fatalf("%s 里的 inbound tag 不见了 —— 自定义片段不该能动 inbounds", name)
+			}
+			if err := c.Check(raw); err != nil {
+				t.Fatalf("sing-box 拒绝了合并后的配置 %s:%v\n%s", name, err, raw)
+			}
+		})
+	}
+	if found == 0 {
+		t.Fatal("一个 golden 都没读到 —— 先在 master 侧跑 a_merged_custom_config_matches_its_golden")
+	}
+}

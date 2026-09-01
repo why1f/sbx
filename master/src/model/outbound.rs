@@ -106,10 +106,18 @@ impl OutboundStrategy {
 ///   2. 写 `route.default_domain_resolver = { server, strategy }`。
 ///
 /// **不碰已有的 `dns.servers`**:那里面可能是别处配好的上游,这里只借一个 tag 用。
+///
+/// **自定义配置已经写了 `default_domain_resolver` 时让位。** 这两个功能写的是
+/// 同一个字段 —— `[o]` 本质上就是自定义配置的一个预设。无条件 `insert` 会静默
+/// 盖掉人手写的那一份,而界面上 `[o]` 还显示着一个看上去生效的值 ——
+/// 那是最难查的一类不一致。现在让位,并由 `has_custom_resolver` 告知界面。
 pub fn apply(cfg: &mut serde_json::Value, strategy: OutboundStrategy) {
     let Some(value) = strategy.as_singbox() else {
         return;
     };
+    if has_custom_resolver(cfg) {
+        return;
+    }
     let tag = ensure_dns_server(cfg);
     if let Some(root) = cfg.as_object_mut() {
         let route = root
@@ -122,6 +130,17 @@ pub fn apply(cfg: &mut serde_json::Value, strategy: OutboundStrategy) {
             );
         }
     }
+}
+
+/// 这份配置里的 `route.default_domain_resolver` 是不是已经有人写过了。
+///
+/// 给两个地方用:`apply` 靠它让位,TUI 靠它把 `[o]` 那一项显示成
+/// 「由自定义配置接管」而不是继续显示一个不生效的值。
+///
+/// **两处必须用同一个判据**。各写一份的话,总会漂成「界面说接管了、
+/// 实际没接管」或反过来。
+pub fn has_custom_resolver(cfg: &serde_json::Value) -> bool {
+    cfg.get("route").and_then(|r| r.get("default_domain_resolver")).is_some()
 }
 
 /// 返回一个可供引用的 DNS server tag,没有就插一个。

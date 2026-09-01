@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/009_agents_autoincrement.sql"),
     include_str!("migrations/010_agent_nic_accounting_mode.sql"),
     include_str!("migrations/011_agent_reset_timezone.sql"),
+    include_str!("migrations/012_agent_custom_config.sql"),
 ];
 
 /// 当前程序期望的 schema 版本(= 迁移脚本数量),供 doctor 比对实际库版本。

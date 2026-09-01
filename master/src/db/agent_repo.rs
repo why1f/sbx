@@ -119,6 +119,49 @@ pub async fn set_outbound_strategy(
     Ok(rev)
 }
 
+/// 存/清一台 agent 的自定义配置片段。`None` = 恢复默认。
+///
+/// 存的是**人写的原文**(注释、尾随逗号原样留着)—— 下次打开编辑器时
+/// 那些注释必须还在,否则「解释这条规则为何存在」的信息每存一次丢一次。
+/// 校验在调用方(`service::validate_custom`),不在这里 —— 这一层只管存。
+///
+/// 和 `set_outbound_strategy` 一样,`config_revision` 的推进与这条 UPDATE 在
+/// **同一个事务**里(service.rs 里那段注释讲了为何不能拆)。
+pub async fn set_custom_config(pool: &SqlitePool, id: i64, raw: Option<&str>) -> Result<i64> {
+    let mut tx = pool.begin().await?;
+    let n = sqlx::query("UPDATE agents SET custom_json = ? WHERE id = ?")
+        .bind(raw)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if n == 0 {
+        anyhow::bail!("没有 id 为 {id} 的被控服务器");
+    }
+    let rev: i64 = sqlx::query_scalar(
+        "UPDATE agents SET config_revision = config_revision + 1
+          WHERE id = ? RETURNING config_revision",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rev)
+}
+
+/// 读回自定义配置原文。`None` = 没有自定义。
+///
+/// 空串也归成 `None`:编辑器里清空存盘就是「恢复默认」,不该在库里
+/// 留下一个既不是 NULL 也没内容的中间态。
+pub async fn custom_config(pool: &SqlitePool, id: i64) -> Result<Option<String>> {
+    let raw: Option<Option<String>> =
+        sqlx::query_scalar("SELECT custom_json FROM agents WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(raw.flatten().filter(|s| !s.trim().is_empty()))
+}
+
 pub async fn update_settings(
     pool: &SqlitePool,
     id: i64,

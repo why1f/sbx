@@ -81,6 +81,34 @@ pub async fn pending_count(pool: &SqlitePool) -> Result<i64> {
         .await?)
 }
 
+/// 一条指令现在跑到哪了。
+///
+/// `upgrade` 不需要这个 —— 它的结果看版本号变没变就行。但 `config_check` 的
+/// **结果本身就是全部产出**:界面上发起一次校验,必须能把结论取回来,
+/// 否则就只是把一条记录扒进了库里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// daemon 已经取走。一直是 `false` 意味着 **daemon 没在跑**——
+    /// 那是一种很容易让人对着转圈发呆的故障,界面得能区分它和「还在跑」。
+    pub taken: bool,
+    pub done: bool,
+    /// `None` + `done` = 成功。
+    pub error: Option<String>,
+}
+
+pub async fn outcome(pool: &SqlitePool, id: i64) -> Result<Option<Outcome>> {
+    let row: Option<(Option<i64>, Option<i64>, Option<String>)> =
+        sqlx::query_as("SELECT taken_at, done_at, error FROM agent_commands WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(taken_at, done_at, error)| Outcome {
+        taken: taken_at.is_some(),
+        done: done_at.is_some(),
+        error,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +166,38 @@ mod tests {
         enqueue(&p, a, "upgrade", &serde_json::json!({}), 0).await.unwrap();
         crate::db::agent_repo::delete(&p, a).await.unwrap();
         assert!(take_pending(&p, 1).await.unwrap().is_empty(), "指令该随 agent 一起没了");
+    }
+
+    /// **`outcome` 要能分清「还没人取」「在跑」「成了」「败了」「没了」。**
+    ///
+    /// `config_check` 靠它把结论送回界面。分不清前两种的后果最隐蔽:
+    /// daemon 没在跑时指令永远躺在队列里,而界面会一直显示「校验中」——
+    /// 人对着一个不动的进度无从下手,而真正该做的是去看 daemon 死没死。
+    #[tokio::test]
+    async fn outcome_tells_the_four_stages_apart() {
+        let p = pool().await;
+        let a = agent(&p, "tokyo").await;
+        let id = enqueue(&p, a, "config_check", &serde_json::json!({}), 0).await.unwrap();
+
+        let o = outcome(&p, id).await.unwrap().expect("刚入队,该查得到");
+        assert!(!o.taken && !o.done, "刚入队:没人取、没做完");
+
+        take_pending(&p, 10).await.unwrap();
+        let o = outcome(&p, id).await.unwrap().unwrap();
+        assert!(o.taken && !o.done, "取走了但还没做完");
+
+        finish(&p, id, None, 20).await.unwrap();
+        let o = outcome(&p, id).await.unwrap().unwrap();
+        assert!(o.done && o.error.is_none(), "成功 = done 且无错误");
+
+        let id2 = enqueue(&p, a, "config_check", &serde_json::json!({}), 0).await.unwrap();
+        take_pending(&p, 10).await.unwrap();
+        finish(&p, id2, Some("json: unknown field \"outbonds\""), 20).await.unwrap();
+        let o = outcome(&p, id2).await.unwrap().unwrap();
+        assert_eq!(o.error.as_deref(), Some("json: unknown field \"outbonds\""), "错误要原样留着");
+
+        // agent 被删 → 指令级联删掉。界面上要能说「指令不见了」而不是永远等着。
+        crate::db::agent_repo::delete(&p, a).await.unwrap();
+        assert!(outcome(&p, id).await.unwrap().is_none(), "指令没了就该是 None");
     }
 }

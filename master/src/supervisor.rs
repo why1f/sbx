@@ -538,6 +538,11 @@ async fn drain_commands(
     for cmd in pending {
         let method = match cmd.kind.as_str() {
             "upgrade" => sbx_shared::method::AGENT_UPGRADE,
+            // 只让 agent 用真 sing-box `box.New()` 试建一次就 `Close()`,**不接管当前实例**
+            // (`boxctl.Check`)。拿到的错误就是 sing-box 自己的原文,包括拼错的字段名
+            // (`json: unknown field "..."`) —— 那是主控自己永远给不出的信息:
+            // 主控里没有 sing-box(§0.3 结论一),它只能看出 JSON 语法错。
+            "config_check" => sbx_shared::method::CONFIG_CHECK,
             other => {
                 // 不认识的指令要**记下来**再丢掉。静默丢弃会让人对着一个
                 // 永远「待办」的队列发懵。
@@ -1364,6 +1369,102 @@ mod tests {
         r.mark_config_sent(id, cfg_rev);
         r.mark_user_sent(id, user_rev);
         (id, Arc::new(Mutex::new(r)), rx)
+    }
+
+    /// **`config_check` 要真的发得出去,结果要真的写回来。**
+    ///
+    /// 这条守的是一整条跨进程通路:TUI 入队 → daemon 取走 → 发给 agent
+    /// → 结果写回 `agent_commands`。中间断一环,界面上的表现都是同一个:
+    /// 一个永远「校验中」的状态行。
+    ///
+    /// 这里直接调 `drain_commands`,而不是像 `push_config` 的测试那样走 `tick`:
+    /// `drain_commands` 的调用点在 `spawn` 出去的主循环体里,不在 `tick` 里。
+    /// 于是「它有没有被接进循环」这一段这两条测试盖不到 ——
+    /// `upgrade` 当初也是同一个状况,不为了可测性把循环体拆了。
+    #[tokio::test]
+    async fn a_config_check_command_reaches_the_agent_and_reports_back() {
+        let p = pool().await;
+        let (id, reg, mut rx) = online_agent(&p, "tokyo").await;
+        let rpc = Arc::new(Rpc::new());
+
+        let cmd = crate::db::command_repo::enqueue(
+            &p,
+            id,
+            "config_check",
+            &serde_json::json!({ "options": { "log": { "level": "warn" } } }),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let rpc2 = rpc.clone();
+        let responder = tokio::spawn(async move {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("5 秒内没等到下发 —— config_check 没接进 drain_commands?")
+                .expect("通道被关了");
+            assert_eq!(env.method, method::CONFIG_CHECK, "该是 config.check");
+            // payload 是入队方拼好的,daemon 只转发 —— 不能在中间重组。
+            assert!(env.payload.get("options").is_some(), "options 丢了:{:?}", env.payload);
+            rpc2.resolve(sbx_shared::Envelope::resp_ok(
+                env.id.clone().unwrap(),
+                method::CONFIG_CHECK,
+                serde_json::json!({}),
+            ))
+            .await;
+        });
+
+        drain_commands(&p, &reg, &rpc, ts(2026, 3, 15)).await.unwrap();
+        responder.await.unwrap();
+
+        let o = crate::db::command_repo::outcome(&p, cmd).await.unwrap().expect("指令该还在");
+        assert!(o.taken, "该被取走了");
+        assert!(o.done, "该做完了");
+        assert_eq!(o.error, None, "成功时不该有错误");
+    }
+
+    /// **agent 报的错要原文落到 `error` 列里。**
+    ///
+    /// 那句原文就是这个功能的全部产出 —— 主控里没有 sing-box(§0.3 结论一),
+    /// 字段名拼错这类错只有 agent 能报。把它换成自己的概括词等于丢掉唯一的线索。
+    #[tokio::test]
+    async fn a_failed_config_check_keeps_the_singbox_error_verbatim() {
+        let p = pool().await;
+        let (id, reg, mut rx) = online_agent(&p, "tokyo").await;
+        let rpc = Arc::new(Rpc::new());
+        let cmd = crate::db::command_repo::enqueue(
+            &p,
+            id,
+            "config_check",
+            &serde_json::json!({ "options": {} }),
+            0,
+        )
+        .await
+        .unwrap();
+
+        let verbatim = r#"解析配置: json: unknown field "outbonds""#;
+        let rpc2 = rpc.clone();
+        let responder = tokio::spawn(async move {
+            let env = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("5 秒内没等到下发")
+                .expect("通道被关了");
+            rpc2.resolve(sbx_shared::Envelope::resp_err(
+                env.id.clone().unwrap(),
+                method::CONFIG_CHECK,
+                verbatim,
+            ))
+            .await;
+        });
+
+        drain_commands(&p, &reg, &rpc, ts(2026, 3, 15)).await.unwrap();
+        responder.await.unwrap();
+
+        let o = crate::db::command_repo::outcome(&p, cmd).await.unwrap().expect("指令该还在");
+        assert!(o.done, "失败也算做完了");
+        let err = o.error.expect("该有错误文本");
+        assert!(err.contains("unknown field"), "sing-box 的原文丢了:{err}");
+        assert!(err.contains("outbonds"), "拼错的字段名必须在 —— 人靠它定位:{err}");
     }
 
     /// **改了配置就要推给在线的机器,不该等它重启。**

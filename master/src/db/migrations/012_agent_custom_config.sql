@@ -1,0 +1,31 @@
+-- 每台 agent 可以带一份自定义 sing-box 配置片段(出站 / 路由 / DNS)。
+--
+-- ## 为什么存在主控库里而不是 agent 上
+--
+-- §1.2:配置权威唯一,且必须在主控。agent 那边只有 `last-applied.json` 快照,
+-- 而且快照**不接受本地编辑**。让人 ssh 上去改 agent 的配置会直接推翻这条决策:
+-- 那份改动主控不知道,下一次 `config.apply` 就把它冲掉,而人会以为是 bug。
+--
+-- ## 为什么可空,而不是给个默认值
+--
+-- **NULL 就是「没有自定义」。** 于是「恢复默认」= `SET custom_json = NULL`,
+-- 不需要另外存一份默认值,也不会出现「恢复出来的和当初的不一样」——
+-- 默认配置是 `build_agent_config` 从节点算出来的,它本来就没有一份可存的副本。
+--
+-- ## 为什么是 TEXT 而不是 JSON,以及为什么存原文
+--
+-- 存的是**人写的原文**,注释和尾随逗号原样留着。理由是 sing-box 的解析器
+-- (`sjson.UnmarshalExtendedContext`)接受 `//`、`#`、`/* */` 和尾随逗号 ——
+-- 实测确认过。既然它接受,人就一定会写注释,而下次打开编辑器时那些注释必须还在,
+-- 否则「解释这条规则为什么存在」的信息每存一次就丢一次。
+--
+-- 代价是主控侧不能直接 `serde_json::from_str`(serde_json 严格按 RFC 8259),
+-- 组装时要先过一遍 `service::strip_jsonc`。
+--
+-- ## 能写什么、不能写什么
+--
+-- 只允许 `outbounds` / `route` / `dns`。**`inbounds` 不允许**,因为记账键是
+-- (用户, inbound tag)(§14):改一个 tag,`ingest_stats` 会把上报当成「主控没给
+-- 这个用户分配过的 (user, tag)」直接丢弃 —— 流量静默停止记账,一句报错都没有。
+-- 这条限制由 `service::validate_custom` 在存入之前挡住,不是靠文档提醒。
+ALTER TABLE agents ADD COLUMN custom_json TEXT;

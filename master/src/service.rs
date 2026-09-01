@@ -59,6 +59,25 @@ pub async fn build_agent_config(pool: &SqlitePool, agent_id: i64) -> Result<serd
         "outbounds": [{ "type": "direct", "tag": "direct" }],
     });
 
+    // 自定义片段先并入,**出站策略最后叠**。顺序不能反:
+    // `outbound::apply` 里的 `ensure_dns_server` 是「已经有带 tag 的 server 就复用」,
+    // 自定义先到位的话它会复用人写的那个,不会插第二个 DNS server。
+    // 反过来就会凭空多一个 `local`。
+    let custom = crate::db::agent_repo::custom_config(pool, agent_id).await?;
+    if let Some(raw) = &custom {
+        // 库里的内容存之前已经校验过。这里**再错也不能把整台机器的组装拘死** ——
+        // 库可能被手改过,而组装失败意味着这台再也收不到任何配置。
+        // 跟 `outbound_strategy` 那一列同一个口径:读不懂就当没有,并留一条 warn。
+        match validate_custom(raw) {
+            Ok(obj) => merge_custom(&mut cfg, obj),
+            Err(e) => tracing::warn!(
+                agent_id,
+                error = %e,
+                "库里的自定义配置读不懂,本次组装当它不存在"
+            ),
+        }
+    }
+
     // 出站地址族策略。写的是 `route.default_domain_resolver` 而**不是**
     // 已被 1.14.0 移除的 `domain_strategy`(见 model/outbound.rs)。
     // 认不出来的取值退回 Auto —— 库里那一列可能被手改过,而让整台机器的
@@ -305,6 +324,210 @@ pub async fn disabled_users(pool: &SqlitePool) -> Result<Vec<String>> {
         .await?)
 }
 
+// ── 自定义配置片段(§1.2 / 迁移 012)─────────────────────────────
+
+/// 自定义片段**只能**碰这三个顶层 key。
+///
+/// `inbounds` 不在这里,而且不是为了「少改点东西」:记账键是 (用户, inbound tag)
+/// (§14)。改一个 tag,`ingest_stats` 会把上报当成「主控没给这个用户分配过的
+/// (user, tag)」**直接丢弃** —— 流量静默停止记账,一句报错都没有。
+/// 那是最坏的一类 bug,所以它得靠代码拦,不靠文档提醒。
+const CUSTOM_ALLOWED_KEYS: &[&str] = &["outbounds", "route", "dns"];
+
+/// 主控自己组的那个出站 tag。自定义里再出一个同名的,sing-box 会报重复 tag,
+/// 而那句错误看不出是自己写的还是主控加的 —— 所以在这里先拦下来。
+const DIRECT_TAG: &str = "direct";
+
+/// 把 JSONC 剥成 serde_json 能吃的 JSON:去注释、去尾随逗号。
+///
+/// **为什么需要它。** sing-box 的解析器接受 `//`、`#`、`/* */` 和尾随逗号
+/// (实测确认过),而主控侧的 serde_json 严格按 RFC 8259 —— 两个不一样的
+/// 接受集。既然 sing-box 接受,人就一定会写注释;而库里存的是原文(迁移 012),
+/// 所以组装时得先过这一道。
+///
+/// **不动字符串里的东西。** 这是全部难处:一个 `path` 里的 `//`、一个域名里的 `#`
+/// 都不是注释。写法照 `db::split_sql` 处理 `''` 转义的那个状态机 ——
+/// 正则在这个问题上是错的,而不是不好看。
+pub fn strip_jsonc(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            // 转义序列整个抬过去。少了这一步,`"a\\"` 会被当成字符串没结束。
+            if c == '\\' {
+                if let Some(&n) = b.get(i + 1) {
+                    out.push(n);
+                    i += 2;
+                    continue;
+                }
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match (c, b.get(i + 1)) {
+            ('"', _) => {
+                in_str = true;
+                out.push(c);
+                i += 1;
+            }
+            // 行注释:`//` 与 `#` 都到行尾。**换行要留着** —— 丢了的话
+            // serde_json 报的行号全错位,而那个行号是人回编辑器里找错的唯一依据。
+            ('/', Some('/')) | ('#', _) => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                i += 2;
+                while i < b.len() {
+                    if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                        i += 2;
+                        break;
+                    }
+                    if b[i] == '\n' {
+                        out.push('\n'); // 同上:保行号
+                    }
+                    i += 1;
+                }
+            }
+            // 单个 `/` 不是注释开头。JSON 里它不合法,但**不在这里吞** ——
+            // 吞了之后 serde_json 报的错误位置就对不上原文了。
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    strip_trailing_commas(&out)
+}
+
+/// 去掉 `}` / `]` 前面的逗号。单独一趟是因为它要**往后**看空白,
+/// 而剥注释那一趟是往前看的。两件事搃在一个循环里只会让两边都难读。
+fn strip_trailing_commas(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            out.push(c);
+            if c == '\\' {
+                if let Some(&n) = b.get(i + 1) {
+                    out.push(n);
+                    i += 2;
+                    continue;
+                }
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+        } else if c == ',' {
+            match b[i + 1..].iter().find(|c| !c.is_whitespace()) {
+                Some('}') | Some(']') => {
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// 校验一份自定义片段能不能存,返回解析好的对象。
+///
+/// 这一层只拦**主控能看出来的**错:JSON 语法、不允许的 key、tag 撞 `direct`。
+/// 字段名拼错、类型不对、`route` 引用了不存在的 outbound tag 这些拦不了 ——
+/// 主控里没有 sing-box(§0.3 结论一)。那一层由 `config.check` 守(TUI 的 `[K]`)。
+pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let stripped = strip_jsonc(raw);
+    if stripped.trim().is_empty() {
+        return Ok(serde_json::Map::new());
+    }
+    let v: serde_json::Value = serde_json::from_str(&stripped)
+        .map_err(|e| anyhow::anyhow!("不是合法 JSON:{e}(注释与尾随逗号是允许的)"))?;
+    let serde_json::Value::Object(obj) = v else {
+        anyhow::bail!("最外层得是一个对象 `{{ … }}`");
+    };
+    for k in obj.keys() {
+        if k == "inbounds" {
+            anyhow::bail!(
+                "不能在这里改 inbounds —— 记账键是 (用户, inbound tag),\
+                 改了 tag 流量会静默停止记账。节点请在「节点」页里加减"
+            );
+        }
+        if !CUSTOM_ALLOWED_KEYS.contains(&k.as_str()) {
+            anyhow::bail!("不允许的顶层字段 `{k}`。只能写:{}", CUSTOM_ALLOWED_KEYS.join(" / "));
+        }
+    }
+    if let Some(arr) = obj.get("outbounds").and_then(|v| v.as_array()) {
+        for o in arr {
+            if o.get("tag").and_then(|t| t.as_str()) == Some(DIRECT_TAG) {
+                anyhow::bail!(
+                    "outbound tag `{DIRECT_TAG}` 已经被主控用掉了,换个名字 —— \
+                     重名时 sing-box 报的错看不出是哪一边加的"
+                );
+            }
+        }
+    }
+    Ok(obj)
+}
+
+/// 把自定义片段并入一份已组好的配置。
+///
+/// 三个 key 三种并法,各有理由:
+///   * `outbounds` —— **追加**。主控那个 `direct` 必须留着:节点默认走直连,
+///     而且 `route` 里没匀到的流量靠它。覆盖式写法会把它弄没,
+///     表现是「部分流量无法出站」而不是报错。
+///   * `route` / `dns` —— **逐 key 并入**,里层同名字段以自定义为准。
+///     整个替换会把后面 `outbound::apply` 要往里面塞的东西一起抹掉。
+fn merge_custom(cfg: &mut serde_json::Value, custom: serde_json::Map<String, serde_json::Value>) {
+    let Some(root) = cfg.as_object_mut() else {
+        return;
+    };
+    for (k, v) in custom {
+        match k.as_str() {
+            "outbounds" => {
+                if let (Some(dst), Some(add)) =
+                    (root.get_mut("outbounds").and_then(|o| o.as_array_mut()), v.as_array())
+                {
+                    dst.extend(add.iter().cloned());
+                }
+            }
+            _ => {
+                let slot = root
+                    .entry(k)
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                match (slot.as_object_mut(), v.as_object()) {
+                    (Some(dst), Some(src)) => {
+                        for (ik, iv) in src {
+                            dst.insert(ik.clone(), iv.clone());
+                        }
+                    }
+                    // 人把 `route` 写成了数组或字符串之类。原样放进去,
+                    // 让 `config.check` 里的真 sing-box 去报 —— 它的错误比这里能给的清楚。
+                    _ => {
+                        *slot = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // 这里曾经有 bump_config_revision / bump_user_state_revision /
 // bump_all_user_state_revisions 三个辅助函数。**删掉了,不要加回来。**
 //
@@ -323,6 +546,227 @@ mod tests {
     async fn pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("sbx-svc-{}.db", uuid::Uuid::new_v4()));
         crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap()
+    }
+
+    /// **字符串里的 `//` 和 `#` 不是注释。**
+    ///
+    /// 这是剥注释唯一真正难的地方,也是用正则一定会错的地方。
+    /// 真实配置里到处是 `https://…`、ws 的 `path`、带 `#` 的域名规则 ——
+    /// 切错一个的后果是一份看起来没问题的配置您默少了一段。
+    #[test]
+    fn stripping_comments_leaves_strings_alone() {
+        let src = r#"{
+            // 真注释
+            "a": "https://example.com/x", # 也是真注释
+            "b": "tag#frag",
+            "c": "/* 不是注释 */",
+            "d": "反斜杠结尾\\",
+            /* 块
+               注释 */
+            "e": 1,
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(src)).expect("该能解析");
+        assert_eq!(v["a"], "https://example.com/x", "URL 里的 // 被当成注释了");
+        assert_eq!(v["b"], "tag#frag", "字符串里的 # 被当成注释了");
+        assert_eq!(v["c"], "/* 不是注释 */");
+        assert_eq!(v["d"], "反斜杠结尾\\", "转义序列没抬对,字符串提前结束了");
+        assert_eq!(v["e"], 1, "尾随逗号没去掉");
+    }
+
+    /// 剥注释**不能改行号**。
+    ///
+    /// 人拿到的报错是 `serde_json` 的 `line N`,而他要回编辑器里找那一行。
+    /// 把注释行整行删掉的话,行号会整体前移,报错指向一个无关的位置。
+    #[test]
+    fn stripping_comments_keeps_line_numbers() {
+        let src = "{\n// a\n// b\n/* c\n   d */\n\"x\": 1\n}";
+        assert_eq!(
+            src.lines().count(),
+            strip_jsonc(src).lines().count(),
+            "行数变了 —— serde_json 报的行号就指不到原文了"
+        );
+    }
+
+    /// **`inbounds` 必须被拒绝,而且要说清理由。**
+    ///
+    /// 记账键是 (用户, inbound tag)(§14)。改了 tag,`ingest_stats` 会把上报当成
+    /// 「主控没分配过的 (user, tag)」直接丢弃 —— 流量静默停止记账。
+    /// 只说「不允许」的话人会以为是个无聊的限制,继而去手改库。
+    #[test]
+    fn custom_config_may_not_touch_inbounds() {
+        let e = validate_custom(r#"{ "inbounds": [] }"#).unwrap_err().to_string();
+        assert!(e.contains("inbounds"), "{e}");
+        assert!(e.contains("记账"), "要说出为什么不允许:{e}");
+    }
+
+    #[test]
+    fn custom_config_only_allows_three_keys() {
+        for ok in [
+            r#"{ "outbounds": [] }"#,
+            r#"{ "route": {} }"#,
+            r#"{ "dns": {} }"#,
+            "",
+            "   \n // 只有注释 \n ",
+        ] {
+            assert!(validate_custom(ok).is_ok(), "该接受:{ok:?}");
+        }
+        for bad in [r#"{ "log": {} }"#, r#"{ "experimental": {} }"#, r#"{ "endpoints": [] }"#] {
+            assert!(validate_custom(bad).is_err(), "该拒绝:{bad}");
+        }
+        // 最外层必须是对象 —— 人很容易直接粘一个 `outbounds` 数组进来。
+        assert!(validate_custom("[]").is_err(), "数组该被拒");
+    }
+
+    /// 自定义里再出一个 `direct` 要当场拦住。
+    ///
+    /// 不拦的后果不是“不能用”而是“错误位置不对”:sing-box 会报重复 tag,
+    /// 而那句话看不出重复的那一个是人写的还是主控加的。
+    #[test]
+    fn custom_config_may_not_shadow_the_direct_outbound() {
+        let e = validate_custom(r#"{ "outbounds": [{ "type": "direct", "tag": "direct" }] }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("direct"), "{e}");
+        // 别的 tag 当然可以。
+        assert!(
+            validate_custom(r#"{ "outbounds": [{ "type": "direct", "tag": "warp" }] }"#).is_ok()
+        );
+    }
+
+    /// **自定义的 outbound 是追加,`direct` 必须还在。**
+    ///
+    /// 节点默认走直连,`route` 里没匀到的流量也靠它。抹掉 `direct` 的表现不是报错,
+    /// 而是「部分流量无法出站」—— 那种故障会被归因到完全无关的地方。
+    #[tokio::test]
+    async fn a_custom_outbound_is_appended_not_replacing_direct() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-reality").await;
+        crate::db::agent_repo::set_custom_config(
+            &p,
+            agent_id,
+            Some(
+                r#"{
+                    // 走 warp
+                    "outbounds": [{ "type": "direct", "tag": "warp" }],
+                    "route": { "rules": [{ "domain_suffix": [".openai.com"], "outbound": "warp" }] },
+                }"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cfg = build_agent_config(&p, agent_id).await.unwrap();
+        let tags: Vec<&str> =
+            cfg["outbounds"].as_array().unwrap().iter().filter_map(|o| o["tag"].as_str()).collect();
+        assert!(tags.contains(&"direct"), "主控的 direct 被抹掉了:{tags:?}");
+        assert!(tags.contains(&"warp"), "自定义的 outbound 没并进去:{tags:?}");
+        assert!(cfg["route"]["rules"].is_array(), "route.rules 没并进去:{cfg}");
+        // inbounds 仍然是主控算出来的那一份。
+        assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 1);
+        assert_eq!(cfg["inbounds"][0]["tag"], "in-1");
+    }
+
+    /// **自定义写了 `default_domain_resolver` 时,`[o]` 的策略让位。**
+    ///
+    /// 两边写的是同一个字段 —— `[o]` 本质上就是自定义配置的一个预设。
+    /// 无条件覆盖会静默盖掉人手写的那份,而界面上 `[o]` 还显示着一个
+    /// 看上去生效的值。让位之后由 `has_custom_resolver` 告知界面。
+    #[tokio::test]
+    async fn a_custom_resolver_wins_over_the_outbound_strategy() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-reality").await;
+        crate::db::agent_repo::set_outbound_strategy(
+            &p,
+            agent_id,
+            crate::model::outbound::OutboundStrategy::Ipv4Only,
+        )
+        .await
+        .unwrap();
+
+        // 先确认没有自定义时策略确实写进去了 —— 否则下面那条断言测了个寂寞。
+        let cfg = build_agent_config(&p, agent_id).await.unwrap();
+        assert_eq!(cfg["route"]["default_domain_resolver"]["strategy"], "ipv4_only");
+
+        crate::db::agent_repo::set_custom_config(
+            &p,
+            agent_id,
+            Some(
+                r#"{ "dns": { "servers": [{ "type": "udp", "tag": "mine", "server": "1.1.1.1" }] },
+                     "route": { "default_domain_resolver": { "server": "mine", "strategy": "prefer_ipv6" } } }"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cfg = build_agent_config(&p, agent_id).await.unwrap();
+        assert_eq!(
+            cfg["route"]["default_domain_resolver"]["strategy"], "prefer_ipv6",
+            "策略把人手写的 resolver 盖掉了:{cfg}"
+        );
+        assert_eq!(cfg["route"]["default_domain_resolver"]["server"], "mine");
+        // 且不能凭空多插一个 `local` DNS server。
+        let dns_tags: Vec<&str> = cfg["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["tag"].as_str())
+            .collect();
+        assert_eq!(dns_tags, vec!["mine"], "多插了 DNS server:{dns_tags:?}");
+    }
+
+    /// 恢复默认 = 存 `None`。库里回到 NULL,组装结果逐字节等于从没设过。
+    #[tokio::test]
+    async fn clearing_the_custom_config_restores_the_default_byte_for_byte() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-reality").await;
+        let before = build_agent_config(&p, agent_id).await.unwrap();
+
+        crate::db::agent_repo::set_custom_config(
+            &p,
+            agent_id,
+            Some(r#"{ "outbounds": [{ "type": "direct", "tag": "warp" }] }"#),
+        )
+        .await
+        .unwrap();
+        assert_ne!(before, build_agent_config(&p, agent_id).await.unwrap(), "该变了");
+
+        crate::db::agent_repo::set_custom_config(&p, agent_id, None).await.unwrap();
+        assert_eq!(before, build_agent_config(&p, agent_id).await.unwrap(), "恢复得不完全");
+        assert!(crate::db::agent_repo::custom_config(&p, agent_id).await.unwrap().is_none());
+    }
+
+    /// 存进去的是**原文**,注释要能原样读回来。
+    ///
+    /// 下次打开编辑器时那些注释必须还在 —— 否则「解释这条规则为何存在」
+    /// 的信息每存一次丢一次,而那恰好是自定义路由里最难重建的部分。
+    #[tokio::test]
+    async fn the_stored_custom_config_keeps_its_comments() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-reality").await;
+        let raw = "{\n  // 这条是 2026-09 为了绕开机房封锁加的\n  \"outbounds\": []\n}";
+        crate::db::agent_repo::set_custom_config(&p, agent_id, Some(raw)).await.unwrap();
+        assert_eq!(
+            crate::db::agent_repo::custom_config(&p, agent_id).await.unwrap().as_deref(),
+            Some(raw),
+            "存回来的不是原文"
+        );
+    }
+
+    /// 修改自定义配置要推进 `config_revision`,否则在线的机器永远不会收到它。
+    #[tokio::test]
+    async fn changing_the_custom_config_bumps_the_revision() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-reality").await;
+        let rev0: i64 = sqlx::query_scalar("SELECT config_revision FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        let rev1 =
+            crate::db::agent_repo::set_custom_config(&p, agent_id, Some("{}")).await.unwrap();
+        assert!(rev1 > rev0, "{rev0} -> {rev1}");
+        let rev2 = crate::db::agent_repo::set_custom_config(&p, agent_id, None).await.unwrap();
+        assert!(rev2 > rev1, "清空也是一次配置变更:{rev1} -> {rev2}");
     }
 
     /// 造一台 agent + 一个 vless-reality 节点,返回 (agent_id, node_id)。
@@ -626,6 +1070,72 @@ mod tests {
     ///
     /// 尤其要盯 1.14.0 移除的 `domain_strategy`:写它的表现不是「不生效」,
     /// 是 `box.New()` 直接失败,而错误只说「配置无效」。
+    /// **自定义片段合并后的结果也要过真 sing-box。**
+    ///
+    /// 这一组 golden 守的是前两组都盖不到的东西:合并**本身**。
+    /// 人写的 `route.rules` 里引用了一个自定义 outbound tag,而那个 tag 必须真的
+    /// 追加进了 `outbounds` —— 合并写错一行(比如把 `outbounds` 覆盖而不是追加),
+    /// 表现就是 `box.New()` 报一个指不到的 tag。而那时候这台机器已经在线上了。
+    ///
+    /// 写的是 `build_agent_config` 的真实输出(含真节点),不是手拼的片段 ——
+    /// 要验的就是那条组装路径。
+    #[tokio::test]
+    async fn a_merged_custom_config_matches_its_golden() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-ws").await;
+        crate::db::agent_repo::set_outbound_strategy(
+            &p,
+            agent_id,
+            crate::model::outbound::OutboundStrategy::PreferIpv4,
+        )
+        .await
+        .unwrap();
+        crate::db::agent_repo::set_custom_config(
+            &p,
+            agent_id,
+            Some(
+                r#"{
+                    "outbounds": [
+                        { "type": "socks", "tag": "upstream", "server": "127.0.0.1", "server_port": 1080 }
+                    ],
+                    "route": {
+                        "rules": [
+                            { "domain_suffix": [".openai.com", ".claude.ai"], "outbound": "upstream" }
+                        ]
+                    },
+                }"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cfg = build_agent_config(&p, agent_id).await.unwrap();
+        let pretty = serde_json::to_string_pretty(&cfg).unwrap() + "\n";
+
+        let dir = testdata_dir().join("custom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("outbound-and-route.json");
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if existing.replace("\r\n", "\n") == pretty => {}
+            Ok(_) => {
+                std::fs::write(path.with_extension("json.actual"), &pretty).unwrap();
+                panic!(
+                    "合并结果与 testdata/custom/ 里的 golden 不一致。\n\
+                     确认改动是有意的之后,用同目录下的 .actual 覆盖 .json 并提交。\n\
+                     agent 侧的 Go 测试会拿它喂真正的 sing-box —— 改完记得跑一遍。"
+                );
+            }
+            Err(_) => std::fs::write(&path, &pretty).unwrap(),
+        }
+
+        // 顺带钉两条不靠 golden 的性质:引用得到的 tag、且 direct 还在。
+        let tags: Vec<&str> =
+            cfg["outbounds"].as_array().unwrap().iter().filter_map(|o| o["tag"].as_str()).collect();
+        assert!(tags.contains(&"direct") && tags.contains(&"upstream"), "{tags:?}");
+        let rule_out = cfg["route"]["rules"][0]["outbound"].as_str().unwrap();
+        assert!(tags.contains(&rule_out), "route 引用的 {rule_out} 不在 outbounds 里");
+    }
+
     #[test]
     fn outbound_strategies_match_golden_configs() {
         use crate::model::outbound::{apply, OutboundStrategy};

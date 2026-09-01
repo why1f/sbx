@@ -1,0 +1,55 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "local"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "::",
+      "listen_port": 8443,
+      "tag": "in-1",
+      "transport": {
+        "early_data_header_name": "Sec-WebSocket-Protocol",
+        "max_early_data": 2048,
+        "path": "/vless",
+        "type": "ws"
+      },
+      "type": "vless",
+      "users": []
+    }
+  ],
+  "log": {
+    "level": "warn"
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    },
+    {
+      "server": "127.0.0.1",
+      "server_port": 1080,
+      "tag": "upstream",
+      "type": "socks"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "local",
+      "strategy": "prefer_ipv4"
+    },
+    "rules": [
+      {
+        "domain_suffix": [
+          ".openai.com",
+          ".claude.ai"
+        ],
+        "outbound": "upstream"
+      }
+    ]
+  }
+}

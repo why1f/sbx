@@ -72,6 +72,23 @@ enum Cmd {
         /// 服务器 id(见 agent-list)。
         id: i64,
     },
+    /// 给某台被控服务器设一份自定义 sing-box 片段(出站 / 路由 / DNS)。
+    ///
+    /// 只能写 `outbounds` / `route` / `dns` 三个顶层字段。**`inbounds` 不在内** ——
+    /// 记账键是 (用户, inbound tag),改了 tag 流量会静默停止记账。
+    ///
+    /// 接受注释与尾随逗号(sing-box 自己也接受),而且**原文存进库里** ——
+    /// 下次看的时候注释还在。
+    ///
+    /// 这里只做主控能做的校验(JSON 语法、字段白名单、tag 撞 direct)。
+    /// 字段名拼错之类要 sing-box 才能报 —— 存完去 TUI 里按 [K] 验一次。
+    AgentConfigSet {
+        id: i64,
+        /// 片段文件路径。`-` = 从 stdin 读。
+        file: String,
+    },
+    /// 去掉某台被控服务器的自定义片段,回到默认配置。
+    AgentConfigClear { id: i64 },
     /// 删除被控服务器(级联删除其节点与分配关系)。
     AgentRemove {
         id: i64,
@@ -243,6 +260,43 @@ async fn main() -> Result<()> {
             println!();
             let host = install::resolve_host(&cfg, install::probe_public_ip().await.as_deref());
             println!("{}", install::command(&cfg, &host, Some(&token)));
+        }
+        Cmd::AgentConfigSet { id, file } => {
+            let raw = if file == "-" {
+                use std::io::Read;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s
+            } else {
+                std::fs::read_to_string(&file).with_context(|| format!("读不到 {file}"))?
+            };
+            // 主控能做的那一层校验。存进去的是**原文**,不是校验时剥过注释的那份。
+            let obj = service::validate_custom(&raw)?;
+            if obj.is_empty() {
+                // 空内容就是「恢复默认」。当成错误报出去会让
+                // `agent-config-set a /dev/null` 这种很自然的用法莫名失败。
+                let rev = db::agent_repo::set_custom_config(&pool, id, None).await?;
+                println!("片段是空的 —— 已清掉 #{id} 的自定义配置(config_revision → {rev})。");
+                return Ok(());
+            }
+            let rev = db::agent_repo::set_custom_config(&pool, id, Some(&raw)).await?;
+            println!(
+                "已给 #{id} 设上自定义配置:{}(config_revision → {rev})。",
+                obj.keys().cloned().collect::<Vec<_>>().join(" / ")
+            );
+            println!();
+            println!("主控只验得出 JSON 语法、字段白名单和 tag 冲突 —— 它里面没有 sing-box。");
+            println!("字段名拼错、路由引用了不存在的 outbound tag 这类错要 agent 才能报:");
+            println!("  进 TUI 的「服务管理」页按 [K] 验一次(要那台在线)。");
+        }
+        Cmd::AgentConfigClear { id } => {
+            if db::agent_repo::custom_config(&pool, id).await?.is_none() {
+                println!("#{id} 本来就没有自定义配置,什么都没做。");
+                return Ok(());
+            }
+            let rev = db::agent_repo::set_custom_config(&pool, id, None).await?;
+            println!("已清掉 #{id} 的自定义配置,回到默认(config_revision → {rev})。");
+            println!("下次下发后这台只剩 direct 出站。");
         }
         Cmd::AgentRemove { id, yes } => {
             let Some(agent) = db::agent_repo::get(&pool, id).await? else {
