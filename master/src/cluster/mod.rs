@@ -20,5 +20,5 @@ pub mod token;
 
 pub use registry::Registry;
 pub use rpc::Rpc;
-pub use server::ServerState;
 pub use server::idle_limit;
+pub use server::ServerState;

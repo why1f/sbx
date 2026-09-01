@@ -156,7 +156,10 @@ mod tests {
             (None, 0, "e1", 0),
             (Some("e1"), 5, "e1", 5),
         ] {
-            assert!(compute(le, last, ne, new).delta >= 0, "delta 不能为负: {le:?} {last} {ne} {new}");
+            assert!(
+                compute(le, last, ne, new).delta >= 0,
+                "delta 不能为负: {le:?} {last} {ne} {new}"
+            );
         }
     }
 

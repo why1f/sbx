@@ -114,7 +114,8 @@ pub async fn start(
     let lease_owner = format!("{}@{mode}", std::process::id());
     let now = Utc::now().timestamp();
     if !repo::try_acquire_lease(&pool, &lease_owner, LEASE_STALE_SECS, now).await? {
-        let holder = repo::lease_holder(&pool).await.ok().flatten().unwrap_or_else(|| "未知进程".into());
+        let holder =
+            repo::lease_holder(&pool).await.ok().flatten().unwrap_or_else(|| "未知进程".into());
         tracing::info!(
             %holder,
             "另一个进程已在运行 Telegram Bot,本进程跳过(同一 bot_token 只能有一个长轮询)"
@@ -231,10 +232,16 @@ async fn poll_loop(ctx: Ctx) {
                         let Ok(_permit) = slots.acquire_owned().await else { return };
                         let id = update.update_id;
                         // 单条 update 卡住不能拖垮整个 bot。
-                        match tokio::time::timeout(Duration::from_secs(60), handle_update(&ctx, update)).await
+                        match tokio::time::timeout(
+                            Duration::from_secs(60),
+                            handle_update(&ctx, update),
+                        )
+                        .await
                         {
                             Ok(Ok(())) => {}
-                            Ok(Err(e)) => tracing::warn!(update_id = id, error = %e, "处理 update 失败"),
+                            Ok(Err(e)) => {
+                                tracing::warn!(update_id = id, error = %e, "处理 update 失败")
+                            }
                             Err(_) => tracing::warn!(update_id = id, "处理 update 超时"),
                         }
                     });
@@ -298,11 +305,7 @@ async fn handle_message(ctx: &Ctx, chat_id: i64, text: &str) -> Result<()> {
         "/usages" => send_all_usages(ctx, chat_id, None).await,
         _ => {
             ctx.api
-                .send_html(
-                    chat_id,
-                    "可用命令:/start  /usage  /sub  /bind &lt;绑定码&gt;",
-                    None,
-                )
+                .send_html(chat_id, "可用命令:/start  /usage  /sub  /bind &lt;绑定码&gt;", None)
                 .await
         }
     }
@@ -335,7 +338,13 @@ async fn handle_pending(ctx: &Ctx, chat_id: i64, text: &str, p: Pending) -> Resu
                 return ctx.api.send_html(chat_id, &ui::unbound_text(), None).await;
             };
             repo::set_notify_settings(
-                &ctx.pool, &u.name, u.notify_80, u.notify_90, u.notify_100, u.schedule_enabled, &json,
+                &ctx.pool,
+                &u.name,
+                u.notify_80,
+                u.notify_90,
+                u.notify_100,
+                u.schedule_enabled,
+                &json,
             )
             .await?;
             send_user_settings(ctx, chat_id, None).await
@@ -345,8 +354,14 @@ async fn handle_pending(ctx: &Ctx, chat_id: i64, text: &str, p: Pending) -> Resu
                 return Ok(());
             }
             let prefs = admin_prefs(ctx, chat_id).await?;
-            repo::set_admin_prefs(&ctx.pool, chat_id, prefs.notify_quota, prefs.schedule_enabled, &json)
-                .await?;
+            repo::set_admin_prefs(
+                &ctx.pool,
+                chat_id,
+                prefs.notify_quota,
+                prefs.schedule_enabled,
+                &json,
+            )
+            .await?;
             send_admin_settings(ctx, chat_id, None).await
         }
     }
@@ -361,15 +376,13 @@ async fn handle_callback(ctx: &Ctx, chat_id: i64, msg_id: i64, data: &str) -> Re
         "u:sub_links" => send_sub_links(ctx, chat_id).await,
         "u:sub_b64" => send_sub_b64(ctx, chat_id).await,
         "u:settings" => send_user_settings(ctx, chat_id, edit).await,
-        "u:t80" | "u:t90" | "u:t100" | "u:sched" => toggle_user_setting(ctx, chat_id, data, edit).await,
+        "u:t80" | "u:t90" | "u:t100" | "u:sched" => {
+            toggle_user_setting(ctx, chat_id, data, edit).await
+        }
         "u:sched_time" => {
             ctx.pending.lock().await.insert(chat_id, Pending::UserSchedule);
             ctx.api
-                .send_html(
-                    chat_id,
-                    "请发送新的播报时间,逗号分隔:\n<code>09:00,21:30</code>",
-                    None,
-                )
+                .send_html(chat_id, "请发送新的播报时间,逗号分隔:\n<code>09:00,21:30</code>", None)
                 .await
         }
 
@@ -416,7 +429,12 @@ async fn send_home(ctx: &Ctx, chat_id: i64, edit: Option<i64>) -> Result<()> {
     match repo::user_by_chat(&ctx.pool, chat_id).await? {
         Some(u) => {
             ctx.api
-                .send_or_edit(chat_id, edit, &ui::user_home_text(&u), Some(ui::user_home_keyboard()))
+                .send_or_edit(
+                    chat_id,
+                    edit,
+                    &ui::user_home_text(&u),
+                    Some(ui::user_home_keyboard()),
+                )
                 .await
         }
         None if ctx.is_admin(chat_id) => send_admin_home(ctx, chat_id, edit).await,
@@ -452,7 +470,9 @@ async fn send_sub(ctx: &Ctx, chat_id: i64, edit: Option<i64>) -> Result<()> {
     );
     if ctx.public_base.trim().is_empty() {
         // 只有路径的话用户没法直接用,得说清为什么。
-        body.push_str("\n\n⚠️ 主控未配置 <code>subscription.public_base</code>,上面只是路径,请自行补全域名。");
+        body.push_str(
+            "\n\n⚠️ 主控未配置 <code>subscription.public_base</code>,上面只是路径,请自行补全域名。",
+        );
     }
     ctx.api.send_or_edit(chat_id, edit, &body, Some(ui::user_sub_keyboard())).await
 }
@@ -478,7 +498,10 @@ async fn user_uuid(pool: &SqlitePool, id: i64) -> Result<String> {
     Ok(sqlx::query_scalar("SELECT uuid FROM users WHERE id = ?").bind(id).fetch_one(pool).await?)
 }
 async fn user_password(pool: &SqlitePool, id: i64) -> Result<String> {
-    Ok(sqlx::query_scalar("SELECT password FROM users WHERE id = ?").bind(id).fetch_one(pool).await?)
+    Ok(sqlx::query_scalar("SELECT password FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await?)
 }
 
 async fn send_sub_links(ctx: &Ctx, chat_id: i64) -> Result<()> {
@@ -534,9 +557,7 @@ async fn toggle_user_setting(ctx: &Ctx, chat_id: i64, data: &str, edit: Option<i
 }
 
 async fn send_admin_home(ctx: &Ctx, chat_id: i64, edit: Option<i64>) -> Result<()> {
-    ctx.api
-        .send_or_edit(chat_id, edit, "🛠 <b>管理员</b>", Some(ui::admin_home_keyboard()))
-        .await
+    ctx.api.send_or_edit(chat_id, edit, "🛠 <b>管理员</b>", Some(ui::admin_home_keyboard())).await
 }
 
 async fn send_all_usages(ctx: &Ctx, chat_id: i64, edit: Option<i64>) -> Result<()> {
@@ -562,7 +583,12 @@ async fn send_admin_settings(ctx: &Ctx, chat_id: i64, edit: Option<i64>) -> Resu
     ctx.api.send_or_edit(chat_id, edit, &body, Some(ui::admin_settings_keyboard(&p))).await
 }
 
-async fn toggle_admin_setting(ctx: &Ctx, chat_id: i64, data: &str, edit: Option<i64>) -> Result<()> {
+async fn toggle_admin_setting(
+    ctx: &Ctx,
+    chat_id: i64,
+    data: &str,
+    edit: Option<i64>,
+) -> Result<()> {
     let p = admin_prefs(ctx, chat_id).await?;
     let (mut q, mut s) = (p.notify_quota, p.schedule_enabled);
     match data {
@@ -576,10 +602,7 @@ async fn toggle_admin_setting(ctx: &Ctx, chat_id: i64, data: &str, edit: Option<
 
 async fn bind(ctx: &Ctx, chat_id: i64, code: &str) -> Result<()> {
     if code.is_empty() {
-        return ctx
-            .api
-            .send_html(chat_id, "用法:<code>/bind 你的绑定码</code>", None)
-            .await;
+        return ctx.api.send_html(chat_id, "用法:<code>/bind 你的绑定码</code>", None).await;
     }
     match repo::bind(&ctx.pool, code, chat_id).await? {
         Some(name) => {
@@ -627,10 +650,8 @@ async fn handle_quota_alert(ctx: &Ctx, username: &str, percent: f64) -> Result<(
         .into_iter()
         .filter(|a| a.notify_quota)
     {
-        if let Err(e) = ctx
-            .api
-            .send_html(admin.chat_id, &ui::admin_quota_alert_text(&u, level), None)
-            .await
+        if let Err(e) =
+            ctx.api.send_html(admin.chat_id, &ui::admin_quota_alert_text(&u, level), None).await
         {
             tracing::warn!(chat_id = admin.chat_id, error = %e, "配额告警推给管理员失败");
         }
@@ -684,7 +705,11 @@ async fn run_due_schedules(ctx: &Ctx) -> Result<()> {
     for u in users.iter().filter(|u| u.is_bound() && u.schedule_enabled) {
         let times = {
             let own = fmt::normalize_schedule(&u.schedule_times());
-            if own.is_empty() { ctx.default_user_times() } else { own }
+            if own.is_empty() {
+                ctx.default_user_times()
+            } else {
+                own
+            }
         };
         let mut dates = u.last_schedule_dates();
         let due = fmt::due_times(&now, &times, &dates);
@@ -693,7 +718,11 @@ async fn run_due_schedules(ctx: &Ctx) -> Result<()> {
         }
         if let Err(e) = ctx
             .api
-            .send_html(u.chat_id, &ui::scheduled_user_text(&stamp, u), Some(ui::user_home_keyboard()))
+            .send_html(
+                u.chat_id,
+                &ui::scheduled_user_text(&stamp, u),
+                Some(ui::user_home_keyboard()),
+            )
             .await
         {
             tracing::warn!(user = %u.name, error = %e, "定时播报失败,跳过该用户");
@@ -716,7 +745,11 @@ async fn run_due_schedules(ctx: &Ctx) -> Result<()> {
     {
         let times = {
             let own = fmt::normalize_schedule(&p.schedule_times());
-            if own.is_empty() { ctx.default_admin_times() } else { own }
+            if own.is_empty() {
+                ctx.default_admin_times()
+            } else {
+                own
+            }
         };
         let mut dates = p.last_schedule_dates();
         let due = fmt::due_times(&now, &times, &dates);
@@ -836,7 +869,8 @@ mod tests {
     async fn levels_fall_back_after_a_reset() {
         let p = pool().await;
         let c = ctx(p.clone());
-        let uid = crate::db::node_repo::add_user(&p, "alice", 100 * 1_073_741_824, 0).await.unwrap();
+        let uid =
+            crate::db::node_repo::add_user(&p, "alice", 100 * 1_073_741_824, 0).await.unwrap();
         repo::set_last_quota_level(&p, "alice", 100).await.unwrap();
 
         // 用量是 0(刚重置),巡检应当把游标降到 0。

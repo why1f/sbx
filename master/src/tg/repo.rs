@@ -156,11 +156,12 @@ pub async fn bind(pool: &SqlitePool, code: &str, chat_id: i64) -> Result<Option<
         return Ok(None);
     }
     let mut tx = pool.begin().await?;
-    let name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM users WHERE tg_bind_token = ? AND tg_bind_token <> ''")
-            .bind(code)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let name: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM users WHERE tg_bind_token = ? AND tg_bind_token <> ''",
+    )
+    .bind(code)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(name) = name else {
         tx.rollback().await?;
         return Ok(None);
@@ -179,10 +180,7 @@ pub async fn bind(pool: &SqlitePool, code: &str, chat_id: i64) -> Result<Option<
 }
 
 pub async fn unbind(pool: &SqlitePool, name: &str) -> Result<()> {
-    sqlx::query("UPDATE users SET tg_chat_id = 0 WHERE name = ?")
-        .bind(name)
-        .execute(pool)
-        .await?;
+    sqlx::query("UPDATE users SET tg_chat_id = 0 WHERE name = ?").bind(name).execute(pool).await?;
     Ok(())
 }
 
@@ -314,7 +312,11 @@ pub async fn set_admin_prefs(
     Ok(())
 }
 
-pub async fn set_admin_last_schedule_dates(pool: &SqlitePool, chat_id: i64, json: &str) -> Result<()> {
+pub async fn set_admin_last_schedule_dates(
+    pool: &SqlitePool,
+    chat_id: i64,
+    json: &str,
+) -> Result<()> {
     sqlx::query("UPDATE tg_admin_prefs SET last_schedule_dates = ? WHERE chat_id = ?")
         .bind(json)
         .bind(chat_id)
@@ -330,7 +332,12 @@ pub async fn set_admin_last_schedule_dates(pool: &SqlitePool, chat_id: i64, json
 /// 用一条 `INSERT … ON CONFLICT … WHERE` 完成「读-判断-写」,而不是先 SELECT
 /// 再 UPDATE:后者在两个进程同时启动时会双双通过判断,于是两边都跑 bot ——
 /// 正是这张表要避免的情况。
-pub async fn try_acquire_lease(pool: &SqlitePool, owner: &str, stale_secs: i64, now: i64) -> Result<bool> {
+pub async fn try_acquire_lease(
+    pool: &SqlitePool,
+    owner: &str,
+    stale_secs: i64,
+    now: i64,
+) -> Result<bool> {
     let affected = sqlx::query(
         "INSERT INTO tg_bot_lease (id, owner, heartbeat) VALUES (1, ?, ?)
          ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, heartbeat = excluded.heartbeat
@@ -453,7 +460,12 @@ mod tests {
         let mut params = crate::model::node::NodeParams::default();
         crate::secrets::fill(crate::model::node::Protocol::VlessReality, &mut params).unwrap();
         let (node_id, _) = crate::db::node_repo::add_node(
-            &p, agent_id, "n", crate::model::node::Protocol::VlessReality, 1, &params,
+            &p,
+            agent_id,
+            "n",
+            crate::model::node::Protocol::VlessReality,
+            1,
+            &params,
         )
         .await
         .unwrap();
@@ -489,10 +501,12 @@ mod tests {
     async fn corrupt_json_columns_degrade_to_empty() {
         let p = pool().await;
         add_user(&p, "alice", 100.0).await;
-        sqlx::query("UPDATE users SET tg_schedule_times = '{oops', tg_last_schedule_dates = 'nope'")
-            .execute(&p)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE users SET tg_schedule_times = '{oops', tg_last_schedule_dates = 'nope'",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
         let u = get_user(&p, "alice").await.unwrap().unwrap();
         assert!(u.schedule_times().is_empty());
         assert!(u.last_schedule_dates().is_empty());

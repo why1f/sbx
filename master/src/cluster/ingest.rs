@@ -37,7 +37,12 @@ pub struct StatsOutcome {
 /// 最后一条是刻意的:agent 上报了一个「主控没给这个用户分配过」的 (user, tag),
 /// 说明主控与 agent 的配置不同步(通常是 `config.apply` 还没到)。
 /// 这时候建账会造出一条主控视角里不该存在的记录,所以宁可丢弃等下次。
-pub async fn ingest_stats(pool: &SqlitePool, agent_id: i64, r: &StatsReport, now: i64) -> Result<StatsOutcome> {
+pub async fn ingest_stats(
+    pool: &SqlitePool,
+    agent_id: i64,
+    r: &StatsReport,
+    now: i64,
+) -> Result<StatsOutcome> {
     let mut out = StatsOutcome::default();
 
     // BEGIN IMMEDIATE 作跨进程写锁(§6.3):daemon 与 TUI 会同时在跑。
@@ -154,11 +159,12 @@ pub async fn ingest_sysinfo(
     let mut tx = pool.begin().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *tx).await.ok();
 
-    let prev: Option<(Option<String>, i64, i64)> =
-        sqlx::query_as("SELECT boot_id, last_rx, last_tx FROM agent_nic_traffic WHERE agent_id = ?")
-            .bind(agent_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+    let prev: Option<(Option<String>, i64, i64)> = sqlx::query_as(
+        "SELECT boot_id, last_rx, last_tx FROM agent_nic_traffic WHERE agent_id = ?",
+    )
+    .bind(agent_id)
+    .fetch_optional(&mut *tx)
+    .await?;
 
     let (last_boot, last_rx, last_tx) = match &prev {
         Some((b, rx, tx_)) => (b.as_deref(), *rx, *tx_),
@@ -291,11 +297,13 @@ mod tests {
     }
 
     async fn traffic(p: &SqlitePool, node_id: i64) -> (i64, i64, i64, i64) {
-        sqlx::query_as("SELECT cycle_up, cycle_down, total_up, total_down FROM user_traffic WHERE node_id = ?")
-            .bind(node_id)
-            .fetch_one(p)
-            .await
-            .unwrap()
+        sqlx::query_as(
+            "SELECT cycle_up, cycle_down, total_up, total_down FROM user_traffic WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .fetch_one(p)
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -346,11 +354,12 @@ mod tests {
         assert_eq!(traffic(&p, 2).await, (7, 9, 7, 9));
 
         // 视图求和应等于两者之和
-        let (cu, cd): (i64, i64) =
-            sqlx::query_as("SELECT cycle_up, cycle_down FROM user_traffic_total WHERE name = 'alice'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let (cu, cd): (i64, i64) = sqlx::query_as(
+            "SELECT cycle_up, cycle_down FROM user_traffic_total WHERE name = 'alice'",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
         assert_eq!((cu, cd), (107, 209));
     }
 
@@ -367,7 +376,7 @@ mod tests {
                 "e1",
                 &[
                     ("alice", "vless-in", 10, 20),
-                    ("ghost", "vless-in", 999, 999),   // 用户不存在(已删号)
+                    ("ghost", "vless-in", 999, 999), // 用户不存在(已删号)
                     ("alice", "deleted-in", 888, 888), // 节点不存在(已删节点)
                 ],
             ),
@@ -379,10 +388,8 @@ mod tests {
         assert_eq!(out.applied, 1);
         assert_eq!(out.unknown, 2, "两条未知条目应被丢弃");
 
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_traffic")
-            .fetch_one(&p)
-            .await
-            .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_traffic").fetch_one(&p).await.unwrap();
         assert_eq!(rows, 1, "未知条目不该建行");
     }
 
@@ -417,16 +424,14 @@ mod tests {
         let (a2, _) = crate::db::agent_repo::create(&p, "b", 0).await.unwrap();
 
         // 用 agent2 的身份上报 agent1 的 tag —— 不该匹配上
-        let out = ingest_stats(&p, a2, &report("e1", &[("alice", "vless-in", 1, 1)]), 10)
-            .await
-            .unwrap();
+        let out =
+            ingest_stats(&p, a2, &report("e1", &[("alice", "vless-in", 1, 1)]), 10).await.unwrap();
         assert_eq!(out.applied, 0, "tag 必须在 agent 内解析");
         assert_eq!(out.unknown, 1);
 
         // agent1 上报同一条是正常的
-        let out = ingest_stats(&p, a1, &report("e1", &[("alice", "vless-in", 1, 1)]), 10)
-            .await
-            .unwrap();
+        let out =
+            ingest_stats(&p, a1, &report("e1", &[("alice", "vless-in", 1, 1)]), 10).await.unwrap();
         assert_eq!(out.applied, 1);
     }
 
@@ -439,18 +444,18 @@ mod tests {
         ingest_stats(&p, a, &report("e1", &[("alice", "vless-in", 500, 600)]), 10).await.unwrap();
 
         // agent 被 kill -9 后重启:新 epoch,计数从小值重新开始
-        let out = ingest_stats(&p, a, &report("e2", &[("alice", "vless-in", 30, 40)]), 20)
-            .await
-            .unwrap();
+        let out =
+            ingest_stats(&p, a, &report("e2", &[("alice", "vless-in", 30, 40)]), 20).await.unwrap();
         assert!(out.epoch_changed, "epoch 变更必须被报告");
 
         // 重启前的 500/600 保住,重启后的 30/40 计一次(§13.3)
         assert_eq!(traffic(&p, 1).await, (530, 640, 530, 640));
 
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE kind = 'counter_reset'")
-            .fetch_one(&p)
-            .await
-            .unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE kind = 'counter_reset'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(n, 1, "epoch 变更应写一条 agent_events(§5.4)");
     }
 
@@ -546,7 +551,8 @@ mod tests {
         assert_eq!(before, (None, None, None));
 
         ingest_sysinfo(&p, a, &sysinfo("boot-1", 1, 1), 1_000).await.unwrap();
-        type Metrics = (Option<f64>, Option<i64>, Option<i64>, Option<f64>, Option<i64>, Option<i64>);
+        type Metrics =
+            (Option<f64>, Option<i64>, Option<i64>, Option<f64>, Option<i64>, Option<i64>);
         let row: Metrics = sqlx::query_as(
             "SELECT cpu_pct, mem_used, mem_total, load1, uptime_secs, sysinfo_at
                FROM agents WHERE id = ?",
@@ -555,7 +561,10 @@ mod tests {
         .fetch_one(&p)
         .await
         .unwrap();
-        assert_eq!(row, (Some(12.5), Some(1 << 30), Some(4 << 30), Some(0.4), Some(3600), Some(1_000)));
+        assert_eq!(
+            row,
+            (Some(12.5), Some(1 << 30), Some(4 << 30), Some(0.4), Some(3600), Some(1_000))
+        );
 
         // 第二次上报覆盖,不是累加 —— 这几个是「现在多少」,不是账。
         let mut r2 = sysinfo("boot-1", 2, 2);
@@ -603,11 +612,12 @@ mod tests {
         assert!(o.epoch_changed, "boot_id 变化必须可见");
         assert_eq!(nic(&p, a).await, (1_424, 2_348), "重启前的量不能丢");
 
-        let n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE kind = 'nic_counter_reset'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE kind = 'nic_counter_reset'",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -621,11 +631,12 @@ mod tests {
         ingest_sysinfo(&p, a, &sysinfo("boot-1", 10, 10), 1_000).await.unwrap();
         ingest_sysinfo(&p, a, &sysinfo("boot-1", 20, 20), 9_999).await.unwrap();
 
-        let start: i64 = sqlx::query_scalar("SELECT cycle_start FROM agent_nic_traffic WHERE agent_id = ?")
-            .bind(a)
-            .fetch_one(&p)
-            .await
-            .unwrap();
+        let start: i64 =
+            sqlx::query_scalar("SELECT cycle_start FROM agent_nic_traffic WHERE agent_id = ?")
+                .bind(a)
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(start, 1_000, "cycle_start 不该被后续上报改写");
     }
 }

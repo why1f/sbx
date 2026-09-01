@@ -168,8 +168,8 @@ pub fn set_value(path: &str, section: &str, key: &str, value: &str) -> anyhow::R
     // 半个配置的表现是 daemon 起不来,而那时人已经不记得刚才改了什么。
     let tmp = format!("{path}.new");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("写 {tmp} 失败(目录不可写?)"))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("写 {tmp} 失败(目录不可写?)"))?;
         f.write_all(updated.as_bytes())?;
         f.sync_all()?;
     }
@@ -204,17 +204,14 @@ pub fn replace_in_toml(text: &str, section: &str, key: &str, value: &str) -> Str
     let found = lines[start + 1..end].iter().position(|l| {
         let t = l.trim_start();
         !t.starts_with('#')
-            && t.strip_prefix(key)
-                .map(|rest| rest.trim_start().starts_with('='))
-                .unwrap_or(false)
+            && t.strip_prefix(key).map(|rest| rest.trim_start().starts_with('=')).unwrap_or(false)
     });
 
     match found {
         Some(i) => {
             let idx = start + 1 + i;
             // 保留原有缩进。
-            let indent: String =
-                lines[idx].chars().take_while(|c| c.is_whitespace()).collect();
+            let indent: String = lines[idx].chars().take_while(|c| c.is_whitespace()).collect();
             lines[idx] = format!("{indent}{key} = {value}");
         }
         None => {
@@ -324,7 +321,10 @@ listen = "127.0.0.1:18081"
     #[test]
     fn a_commented_out_sample_is_not_the_key() {
         let out = replace_in_toml(SAMPLE, "subscription", "public_base", "\"https://x.example\"");
-        assert!(out.contains("# public_base = \"https://sub.example.com\""), "注释行要留着:\n{out}");
+        assert!(
+            out.contains("# public_base = \"https://sub.example.com\""),
+            "注释行要留着:\n{out}"
+        );
         assert!(out.contains("public_base = \"https://x.example\""));
         // 新行要插在这一节里,不能跑到下一节或文件末尾。
         let sub_start = out.find("[subscription]").unwrap();

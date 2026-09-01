@@ -81,10 +81,7 @@ impl Rpc {
 
         // 先登记再发送。反过来写会有一个窄窗口:
         // 回应比登记先到,于是 `resolve` 找不到 pending 就把它丢了,调用方等到超时。
-        self.pending
-            .lock()
-            .await
-            .insert(id.clone(), Pending { agent_id, tx });
+        self.pending.lock().await.insert(id.clone(), Pending { agent_id, tx });
 
         let env = Envelope::req(id.clone(), method, payload);
         let sent = registry.lock().await.send(agent_id, env);
@@ -180,16 +177,19 @@ mod tests {
 
         let rpc2 = rpc.clone();
         let caller = tokio::spawn(async move {
-            rpc2.call_default(&registry, 1, method::BOX_STATUS, serde_json::Value::Null)
-                .await
+            rpc2.call_default(&registry, 1, method::BOX_STATUS, serde_json::Value::Null).await
         });
 
         // 扮演 agent:收请求,回同 id 的 resp
         let req = rx.recv().await.unwrap();
         assert_eq!(req.method, method::BOX_STATUS);
         let id = req.id.clone().unwrap();
-        rpc.resolve(Envelope::resp_ok(id, method::BOX_STATUS, serde_json::json!({"running": true})))
-            .await;
+        rpc.resolve(Envelope::resp_ok(
+            id,
+            method::BOX_STATUS,
+            serde_json::json!({"running": true}),
+        ))
+        .await;
 
         let payload = caller.await.unwrap().unwrap();
         assert_eq!(payload["running"], true);
@@ -215,8 +215,7 @@ mod tests {
 
         let rpc2 = rpc.clone();
         let caller = tokio::spawn(async move {
-            rpc2.call_default(&registry, 1, method::CONFIG_APPLY, serde_json::json!({}))
-                .await
+            rpc2.call_default(&registry, 1, method::CONFIG_APPLY, serde_json::json!({})).await
         });
 
         let id = rx.recv().await.unwrap().id.unwrap();
@@ -253,8 +252,7 @@ mod tests {
 
         let rpc2 = rpc.clone();
         let caller = tokio::spawn(async move {
-            rpc2.call(&registry, 1, method::BOX_STATUS, serde_json::Value::Null, 300)
-                .await
+            rpc2.call(&registry, 1, method::BOX_STATUS, serde_json::Value::Null, 300).await
         });
         rx.recv().await.unwrap(); // 确保请求已发出、pending 已登记
 
@@ -290,8 +288,7 @@ mod tests {
         assert!(matches!(c1.await.unwrap().unwrap_err(), RpcError::Disconnected));
 
         // agent 2 的请求还活着
-        rpc.resolve(Envelope::resp_ok(id2, method::BOX_STATUS, serde_json::json!({"ok": 1})))
-            .await;
+        rpc.resolve(Envelope::resp_ok(id2, method::BOX_STATUS, serde_json::json!({"ok": 1}))).await;
         assert!(c2.await.unwrap().is_ok(), "另一台 agent 的 pending 不该被牵连");
     }
 
@@ -299,9 +296,8 @@ mod tests {
     #[tokio::test]
     async fn late_response_is_dropped_quietly() {
         let rpc = Rpc::new();
-        let accepted = rpc
-            .resolve(Envelope::resp_ok("r999", method::BOX_STATUS, serde_json::json!({})))
-            .await;
+        let accepted =
+            rpc.resolve(Envelope::resp_ok("r999", method::BOX_STATUS, serde_json::json!({}))).await;
         assert!(!accepted, "没有等待者时应返回 false");
     }
 

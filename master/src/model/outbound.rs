@@ -132,9 +132,8 @@ fn ensure_dns_server(cfg: &mut serde_json::Value) -> String {
     let Some(root) = cfg.as_object_mut() else {
         return LOCAL_DNS_TAG.to_string();
     };
-    let dns = root
-        .entry("dns")
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let dns =
+        root.entry("dns").or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let Some(dns) = dns.as_object_mut() else {
         return LOCAL_DNS_TAG.to_string();
     };
@@ -190,10 +189,7 @@ mod tests {
         assert_eq!(r["strategy"], "ipv6_only");
         let tag = r["server"].as_str().unwrap();
         let servers = cfg["dns"]["servers"].as_array().unwrap();
-        assert!(
-            servers.iter().any(|s| s["tag"] == tag),
-            "resolver 指向的 tag 必须真的存在:{cfg}"
-        );
+        assert!(servers.iter().any(|s| s["tag"] == tag), "resolver 指向的 tag 必须真的存在:{cfg}");
         assert_eq!(servers[0]["type"], "local", "要用 1.12+ 的新式写法");
     }
 

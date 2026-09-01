@@ -30,8 +30,10 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # 不再是 continue-on-error 了：根目录的 `rustfmt.toml` 已经把本仓库的风格
+      # 写成配置，整树也已经收敛到那份配置下。以前它永远是红的（853 处 diff），
+      # 一个永远不绿的步骤只会训练人忽略 CI 输出。
       - run: cargo fmt --all -- --check
-        continue-on-error: true
       - run: cargo build --locked
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
@@ -135,17 +137,64 @@ jobs:
       - name: bash
         run: bash packaging/test-install.sh
 
-  e2e-driver:
-    # §13.2 / §13.3 的驱动程序。完整的端到端跑法需要起主控 + 两个 agent
-    # (见 e2e/README.md,已在真实 ARM 机器上跑通),CI 里只保证它**编得过** ——
-    # 编不过的话那份验证下次就没法复跑了。
-    name: e2e 驱动(仅编译)
+  e2e:
+    # §13.2 / §13.3 的端到端验证。**真跑**,不是只编译。
+    #
+    # 以前这一关只有 `go build`。于是下面这条链没有任何自动化守着:
+    #
+    #   主控下发配置 → agent 装配出真能用的 inbound → 真流量 → tracker 记账
+    #                → 上报 → 跨 agent 求和
+    #
+    # 它断掉的症状是最难发现的那种:**单测全绿、clippy 干净、产品不工作**。
+    # `master/testdata/` 的 golden 能证明「下发的 JSON 长这样」,证明不了
+    # 「sing-box 吃了它真起得来」;`spike/` 在一个进程里自己扮两端,
+    # 验的是 tracker 本身而不是这条缝。
+    #
+    # 需要 Rust（建主控）+ Go（建 agent 与驱动）两条工具链 —— 这是全仓库
+    # 唯一一个要同时拿两边产物的 job，但它仍然不违反许可证边界：
+    # 跑的是两个**独立进程**，中间只有 WebSocket，没有任何一步把两边编到一起。
+    name: §13.2/§13.3 e2e（真跑）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-          cache-dependency-path: e2e/go.sum
-      - working-directory: e2e
-        run: go build -tags with_quic,with_utls ./...
+          cache-dependency-path: |
+            agent/go.sum
+            e2e/go.sum
+
+      # 脚本要用 sqlite3 查库、ss 等端口。ubuntu-latest 镜像都自带，
+      # 这一步只是把前提写成显式断言 —— 镜像哪天变了，挂在这里比挂在
+      # 一个看不出所以的 "command not found" 里好查。
+      - name: 前提：sqlite3 / ss
+        run: |
+          command -v sqlite3 >/dev/null || { echo "::error::缺 sqlite3"; exit 1; }
+          command -v ss      >/dev/null || { echo "::error::缺 ss（iproute2）"; exit 1; }
+
+      # 用 `bash e2e/run.sh` 而不是直接 `e2e/run.sh`：不依赖 exec 位（从 Windows
+      # 提交时 exec 位容易丢），也把「它是 bash 而不是 POSIX sh」写在明处 ——
+      # 与 `packaging/install.sh` 相反，那个是真的要跑在 dash 上的。
+      #
+      # timeout 为何是 15 分钟（实测拆解，16 核本地数据，runner 只有 4 vCPU，
+      # 编译时间按 2-3× 估）：
+      #
+      #   cargo build --bin sbx  冷 2m13s / 暖 ~18s   ← 主要开销，327 个 crate
+      #   go build agent          冷   56s / 暖 ~4s    735 个 package
+      #   go build e2e driver     冷    4s             与 agent 共用 build cache
+      #   脚本自身（起进程 + 推流量 + 等上报）  ~30-40s
+      #
+      # 于是冷缓存一轮大约 8-10 分钟，暖缓存 ~3 分钟。脚本里所有 `wait_for`
+      # 的超时上限加起来是 465s，所以即使卡住也是**脚本自己带着诊断信息退出**，
+      # 不靠这个 timeout 兵底；它守的只是构建阶段真挂死的情况。
+      #
+      # 它不会拉长 CI 的总墙钟：五个 job 并行，而 `rust`（build + clippy +
+      # 全量测试）与 `go`（build + vet + 双 arch 交叉 + race）本来就在同一个量级。
+      - name: e2e/run.sh
+        run: bash e2e/run.sh
+        timeout-minutes: 15
+
+      # 驱动自己的编译检查已经被 run.sh 包含（它就是 `go build` 出来的），
+      # 不再单独留一步。

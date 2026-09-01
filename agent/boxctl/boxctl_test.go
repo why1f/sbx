@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourorg/sbx-agent/tracker"
+	"github.com/why1f/sbx/agent/tracker"
 )
 
 // 这组测试跑的是**真的 sing-box 实例**。它守的是 §7.4 的热重载顺序 ——

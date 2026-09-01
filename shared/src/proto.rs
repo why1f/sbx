@@ -35,7 +35,11 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn req(id: impl Into<String>, method: impl Into<String>, payload: serde_json::Value) -> Self {
+    pub fn req(
+        id: impl Into<String>,
+        method: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             v: crate::PROTO_VERSION,
             id: Some(id.into()),
@@ -46,7 +50,11 @@ impl Envelope {
         }
     }
 
-    pub fn resp_ok(id: impl Into<String>, method: impl Into<String>, payload: serde_json::Value) -> Self {
+    pub fn resp_ok(
+        id: impl Into<String>,
+        method: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             v: crate::PROTO_VERSION,
             id: Some(id.into()),
@@ -57,7 +65,11 @@ impl Envelope {
         }
     }
 
-    pub fn resp_err(id: impl Into<String>, method: impl Into<String>, error: impl Into<String>) -> Self {
+    pub fn resp_err(
+        id: impl Into<String>,
+        method: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             v: crate::PROTO_VERSION,
             id: Some(id.into()),

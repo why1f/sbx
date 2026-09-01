@@ -188,7 +188,7 @@ agent 本地**只保留一份 `last-applied.json` 快照**,用途**仅限**:主�
 | `packaging/` | 安装脚本、示例配置、systemd/OpenRC service 与离线测试 |
 | `master/testdata/` | 八协议与出站策略 golden,由真 sing-box 校验 |
 | `spike/` | tracker 的真实 sing-box 流量/拒绝行为回归 |
-| `e2e/` | 跨 agent 求和与断线恢复驱动 |
+| `e2e/` | 跨 agent 求和与断线恢复的端到端验证(`run.sh` 在 CI 里真跑) |
 | `.github/workflows/` | Rust/Go/安装/端到端 CI 与双架构发布 |
 
 二进制名:主控 `sbx`,agent `sbx-agent`。`agent/` 不允许出现 `replace`、`patches/`
@@ -1238,7 +1238,11 @@ Reality 需要 `with_utls`,Hysteria2/TUIC 需要 `with_quic`;编译期哨兵阻�
 
 ### 13.2 端到端
 
-> ✅ **已跑通**(Oracle ARM / Ubuntu 22.04 aarch64,2026-08-01)。可重复执行的驱动在 `e2e/`。
+> ✅ **已自动化**:`e2e/run.sh` 把下面整套跑法(建库、起 daemon、起两个 agent、
+> 推流量、查库断言)包成一条命令,**CI 每次 push 都真跑**(`ci.yml` 的 `e2e` job)。
+> 首次手工跑通于 Oracle ARM / Ubuntu 22.04 aarch64,2026-08-01;下面记的字节数就是
+> 那次的结果,而它们现在同时是 `run.sh` 的断言常量 —— **文档和现实分叉时
+> 红的是 CI,不是用户。**
 
 本机起 master daemon,同机跑**两个 agent 实例**(不同 token、不同 sing-box 监听端口)。
 加一个用户、给它分配两个 agent 各一个节点,用真客户端连上跑流量,
@@ -1283,4 +1287,7 @@ Reality 需要 `with_utls`,Hysteria2/TUIC 需要 `with_quic`;编译期哨兵阻�
 - 改 `agent/tracker` 同步改 `spike/`;改主控配置生成同步改 golden。
 - URI 与结构化订阅的 IPv6 形状不同,不能共享带框后的 host。
 - TUI 中文宽度使用 `theme::cols/pad/truncate`,不得用 `format!("{:<n}")` 对齐。
+- 改记账、下发或握手路径后,`e2e/run.sh` 里的字节常量要与 §13.2/§13.3 同步改 ——
+  它们是同一份数字的两份拷贝,而 CI 会拿它们对现实。
+- Rust 侧格式由根目录 `rustfmt.toml` 定住;`cargo fmt --check` 已是硬门,不再是提醒。
 - 发布前 tag、Cargo 版本、CHANGELOG 标题必须一致,并等待 CI 全绿。

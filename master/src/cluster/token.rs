@@ -75,10 +75,7 @@ mod tests {
     #[test]
     fn hash_is_stable_sha256_hex() {
         // 已知值:sha256("") 的十六进制
-        assert_eq!(
-            hash(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
+        assert_eq!(hash(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         let t = generate();
         assert_eq!(hash(&t), hash(&t), "同一输入必须稳定");
         assert_eq!(hash(&t).len(), 64);

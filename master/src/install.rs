@@ -15,7 +15,8 @@
 use crate::config::Config;
 
 /// 一键安装脚本的地址。与 README / CHANGELOG 里那条是同一个 URL,改了要一起改。
-pub const INSTALL_URL: &str = "https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh";
+pub const INSTALL_URL: &str =
+    "https://raw.githubusercontent.com/why1f/sbx/main/packaging/install.sh";
 
 /// 被控机回连主控用的地址,**自动定**,不再让人手填。
 ///
@@ -90,7 +91,9 @@ fn host_of(base: &str) -> String {
     let hostport = rest.split('/').next().unwrap_or(rest);
     // `[::1]:8080` → `[::1]`;`example.com:8080` → `example.com`。
     match hostport.strip_prefix('[') {
-        Some(r) => r.split_once(']').map(|(h, _)| format!("[{h}]")).unwrap_or_else(|| hostport.into()),
+        Some(r) => {
+            r.split_once(']').map(|(h, _)| format!("[{h}]")).unwrap_or_else(|| hostport.into())
+        }
         None => hostport.split(':').next().unwrap_or(hostport).to_string(),
     }
 }
@@ -176,7 +179,9 @@ pub fn notes(host: &str, has_token: bool) -> Vec<String> {
     } else {
         out.push(String::new());
         out.push(format!("主控地址是自动探到的出口地址({host})。"));
-        out.push("这台机器在 NAT 后面的话它会是内网地址 —— 去「设置」页填订阅对外地址即可覆盖。".into());
+        out.push(
+            "这台机器在 NAT 后面的话它会是内网地址 —— 去「设置」页填订阅对外地址即可覆盖。".into(),
+        );
     }
     if has_token {
         out.push(String::new());

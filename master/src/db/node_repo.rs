@@ -133,10 +133,7 @@ pub async fn delete_node(pool: &SqlitePool, node_id: i64) -> Result<(i64, i64)> 
         .ok_or_else(|| anyhow::anyhow!("没有 id 为 {node_id} 的节点"))?;
 
     // user_nodes / user_traffic 靠外键级联清理(§6.1)。
-    sqlx::query("DELETE FROM nodes WHERE id = ?")
-        .bind(node_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query("DELETE FROM nodes WHERE id = ?").bind(node_id).execute(&mut *tx).await?;
 
     let rev: i64 = sqlx::query_scalar(
         "UPDATE agents SET config_revision = config_revision + 1
@@ -153,9 +150,7 @@ pub async fn delete_node(pool: &SqlitePool, node_id: i64) -> Result<(i64, i64)> 
 // ─────────────────────────── users ───────────────────────────
 
 pub async fn list_users(pool: &SqlitePool) -> Result<Vec<User>> {
-    Ok(sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY name")
-        .fetch_all(pool)
-        .await?)
+    Ok(sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY name").fetch_all(pool).await?)
 }
 
 pub async fn get_user_by_name(pool: &SqlitePool, name: &str) -> Result<Option<User>> {
@@ -324,10 +319,7 @@ pub async fn set_user_nodes(
     .fetch_all(&mut *tx)
     .await?;
 
-    sqlx::query("DELETE FROM user_nodes WHERE user_id = ?")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query("DELETE FROM user_nodes WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
 
     let mut after: Vec<i64> = Vec::new();
     for nid in node_ids {
@@ -662,16 +654,10 @@ mod tests {
     async fn resetting_traffic_keeps_the_cycle_day_and_the_lifetime_total() {
         let p = pool().await;
         let (agent_id, _) = crate::db::agent_repo::create(&p, "tokyo", 0).await.unwrap();
-        let (node_id, _) = add_node(
-            &p,
-            agent_id,
-            "n",
-            Protocol::VlessReality,
-            8443,
-            &NodeParams::default(),
-        )
-        .await
-        .unwrap();
+        let (node_id, _) =
+            add_node(&p, agent_id, "n", Protocol::VlessReality, 8443, &NodeParams::default())
+                .await
+                .unwrap();
         let uid = add_user(&p, "alice", 0, 0).await.unwrap();
         set_user_nodes(&p, uid, &[node_id]).await.unwrap();
         sqlx::query(
@@ -759,9 +745,10 @@ mod tests {
     async fn deleting_a_node_bumps_config_revision() {
         let p = pool().await;
         let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
-        let (nid, _) = add_node(&p, a, "in-1", Protocol::VlessReality, 8443, &NodeParams::default())
-            .await
-            .unwrap();
+        let (nid, _) =
+            add_node(&p, a, "in-1", Protocol::VlessReality, 8443, &NodeParams::default())
+                .await
+                .unwrap();
 
         let (agent, r) = delete_node(&p, nid).await.unwrap();
         assert_eq!(agent, a);
@@ -788,9 +775,7 @@ mod tests {
         let p = pool().await;
         let (a1, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
         let (a2, _) = crate::db::agent_repo::create(&p, "b", 0).await.unwrap();
-        add_node(&p, a1, "in", Protocol::VlessReality, 443, &NodeParams::default())
-            .await
-            .unwrap();
+        add_node(&p, a1, "in", Protocol::VlessReality, 443, &NodeParams::default()).await.unwrap();
         assert!(add_node(&p, a2, "in", Protocol::VlessReality, 443, &NodeParams::default())
             .await
             .is_ok());
@@ -862,10 +847,8 @@ mod tests {
         assign_node(&p, uid, nid).await.unwrap();
         assign_node(&p, uid, nid).await.unwrap(); // 不该报错
 
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_nodes")
-            .fetch_one(&p)
-            .await
-            .unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_nodes").fetch_one(&p).await.unwrap();
         assert_eq!(n, 1, "重复分配不该产生第二行");
     }
 
@@ -1100,7 +1083,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_nodes_round_trips_params_and_protocol() {        let p = pool().await;
+    async fn list_nodes_round_trips_params_and_protocol() {
+        let p = pool().await;
         let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
         let params = NodeParams {
             server_name: Some("www.example.com".into()),

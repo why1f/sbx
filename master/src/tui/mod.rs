@@ -24,7 +24,9 @@ pub mod theme;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::prelude::{CrosstermBackend, Terminal};
 use ratatui::style::Style;
@@ -151,7 +153,11 @@ impl App {
 
     /// 仪表盘当前那一栏有几行。
     fn dash_len(&self) -> usize {
-        if self.dash_on_nodes { self.nodes.len() } else { self.users.len() }
+        if self.dash_on_nodes {
+            self.nodes.len()
+        } else {
+            self.users.len()
+        }
     }
 
     fn sel_mut(&mut self) -> &mut usize {
@@ -269,8 +275,9 @@ impl App {
                     // 这一句丢了就会有人对着节点端口查为什么连不上。
                     let mut second = String::from("  订阅导出:");
                     match pages::relay_label(n) {
-                        Some(l) => second
-                            .push_str(&format!(" 中转 {l}(客户端连这里,不是节点自身端口)")),
+                        Some(l) => {
+                            second.push_str(&format!(" 中转 {l}(客户端连这里,不是节点自身端口)"))
+                        }
                         None => second.push_str(&format!(
                             " {} 的 {}",
                             n.agent_name,
@@ -306,10 +313,7 @@ impl App {
                     };
                     let first = format!(
                         "  选中: {}  节点: {}  倍率: {:.1}x  订阅: {}",
-                        u.name,
-                        nodes,
-                        u.traffic_multiplier,
-                        sub
+                        u.name, nodes, u.traffic_multiplier, sub
                     );
                     // 绑了网卡就必须说 —— 客户端里显示的流量和表里那个数不是一回事。
                     if !u.nic_agent_ids.is_empty() {
@@ -364,8 +368,13 @@ impl App {
         self.users = data::load_users(&self.pool).await?;
         self.pending_cmds = crate::db::command_repo::pending_count(&self.pool).await.unwrap_or(0);
         // 删掉最后一行之后光标会落在表外,下一帧渲染就会读到不存在的下标。
-        let lens =
-            [0, self.agents.len(), self.nodes.len(), self.users.len(), settings::all(&self.cfg).len()];
+        let lens = [
+            0,
+            self.agents.len(),
+            self.nodes.len(),
+            self.users.len(),
+            settings::all(&self.cfg).len(),
+        ];
         for (i, len) in lens.iter().enumerate() {
             if self.sel[i] >= *len {
                 self.sel[i] = len.saturating_sub(1);
@@ -433,7 +442,10 @@ enum OverlayBody {
     Table(Vec<data::BreakdownRow>),
     /// `scroll` 是**首行行号**。存行号而不是像素/百分比:
     /// 终端高度会变,按行号滚动在任何高度下都停在同一行内容上。
-    Text { lines: Vec<String>, scroll: usize },
+    Text {
+        lines: Vec<String>,
+        scroll: usize,
+    },
 }
 
 impl Overlay {
@@ -526,7 +538,10 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-async fn event_loop<B: ratatui::backend::Backend>(term: &mut Terminal<B>, mut app: App) -> Result<()> {
+async fn event_loop<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    mut app: App,
+) -> Result<()> {
     // 输入放在单独的线程里:crossterm 的 poll/read 是阻塞的,直接在 async
     // 循环里调用会把 runtime 的工作线程按住。走 channel 之后,主循环可以用
     // select 同时等按键和刷新计时。
@@ -647,7 +662,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Page::Settings => pages::settings(f, chunks[1], &settings::all(&app.cfg), app.sel[4]),
     }
     if ops_h > 0 {
-        modal::ops_panel(f, chunks[2], &ops, app.ops_keys(), app.status.as_deref(), app.status_is_error);
+        modal::ops_panel(
+            f,
+            chunks[2],
+            &ops,
+            app.ops_keys(),
+            app.status.as_deref(),
+            app.status_is_error,
+        );
     }
     modal::info_bar(f, chunks[3], &app.header_line());
 
@@ -730,7 +752,10 @@ fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             app.modal = Some(Modal::confirm(
                 "升级主控",
                 vec![
-                    format!("当前 v{}。脚本会比对版本,已是最新就什么都不做。", crate::upgrade::target_version()),
+                    format!(
+                        "当前 v{}。脚本会比对版本,已是最新就什么都不做。",
+                        crate::upgrade::target_version()
+                    ),
                     "界面会临时退出去跑脚本,跑完自动回来。".into(),
                     "**新二进制要重进 TUI 才生效** —— 当前这个进程还是老的。".into(),
                     "daemon 由脚本自己 restart(它本来就在跑的话)。".into(),
@@ -974,7 +999,10 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
             // 「当前是启用 → 按一下变停用」是唯一说得通的直觉。
             KeyCode::Char('t') => match app.selected_user() {
                 Some(u) => {
-                    return Some(Action::SetUserEnabled { name: u.name.clone(), enabled: !u.enabled })
+                    return Some(Action::SetUserEnabled {
+                        name: u.name.clone(),
+                        enabled: !u.enabled,
+                    })
                 }
                 None => app.fail("没有选中任何用户"),
             },
@@ -1114,10 +1142,8 @@ async fn upgrade_agents(app: &mut App, only: Option<i64>, name: &str) -> Result<
             continue;
         }
         let Some(a) = arch.as_deref().and_then(crate::upgrade::normalize_arch) else {
-            failed.push(format!(
-                "{aname}(架构 {} 没有发布产物)",
-                arch.as_deref().unwrap_or("未知")
-            ));
+            failed
+                .push(format!("{aname}(架构 {} 没有发布产物)", arch.as_deref().unwrap_or("未知")));
             continue;
         };
         let url = crate::upgrade::agent_asset_url(version, a);
@@ -1309,7 +1335,13 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
 ///
 /// 命令**单独占一行**放在最上面,而不是混在说明里:它是这个框存在的唯一理由,
 /// 而且是那条要被复制走的东西 —— 终端不支持 OSC 52 时人得用鼠标去选它。
-fn install_modal(cfg: &Config, host: &str, title: &str, token: Option<&str>, tail: Vec<String>) -> Modal {
+fn install_modal(
+    cfg: &Config,
+    host: &str,
+    title: &str,
+    token: Option<&str>,
+    tail: Vec<String>,
+) -> Modal {
     let cmd = install::command(cfg, host, token);
     let mut body = vec![cmd.clone(), String::new()];
     body.extend(install::notes(host, token.is_some()));
@@ -1441,7 +1473,8 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             // revision 推进了但**不写进回执**:那是个内部计数器,每改一次加一,
             // 摆给人看只是一串越来越大的噪音。要紧的是「什么时候生效」。
             let (id, _rev) =
-                node_repo::add_node(&app.pool, d.agent_id, &d.tag, d.protocol, d.port, &params).await?;
+                node_repo::add_node(&app.pool, d.agent_id, &d.tag, d.protocol, d.port, &params)
+                    .await?;
             Ok(format!("已新增节点 #{id} {},在线的机器约 1s 后重建 box", d.tag))
         }
 
@@ -1466,7 +1499,8 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             crate::secrets::fill(draft.protocol, &mut params)?;
 
             let tag = node.tag.clone();
-            let (_agent_id, _rev) = node_repo::update_node(&app.pool, *id, draft.port, &params).await?;
+            let (_agent_id, _rev) =
+                node_repo::update_node(&app.pool, *id, draft.port, &params).await?;
             Ok(format!("已保存节点 {tag},已下发生效"))
         }
 
@@ -1731,7 +1765,6 @@ mod tests {
         assert!(a.modal.is_none());
     }
 
-
     /// 接入命令的信息框长什么样,给人看一眼:
     ///
     /// ```sh
@@ -1842,8 +1875,10 @@ mod tests {
     #[test]
     fn subscription_modal_explains_why_the_link_may_not_open() {
         let body = |m: &Modal| match m {
-            Modal::Info { body, .. } => body.join("
-"),
+            Modal::Info { body, .. } => body.join(
+                "
+",
+            ),
             _ => panic!("订阅框应当是只读信息框"),
         };
 
@@ -1852,28 +1887,43 @@ mod tests {
         cfg.subscription.enabled = false;
         cfg.subscription.public_base = "https://sub.example.com".into();
         let t = body(&sub_modal(&cfg, "alice", "tok"));
-        assert!(t.contains("404"), "关着的时候要说清返回 404:
-{t}");
+        assert!(
+            t.contains("404"),
+            "关着的时候要说清返回 404:
+{t}"
+        );
 
         // ② 开着但没配对外地址 —— 要给出**怎么让它能被访问到**,而不只是一条路径。
         let cfg = Config::default();
         assert!(cfg.subscription.enabled);
         assert!(cfg.subscription.public_base.is_empty());
         let t = body(&sub_modal(&cfg, "alice", "tok"));
-        assert!(t.contains("/sub/tok"), "路径要给:
-{t}");
-        assert!(t.contains("127.0.0.1:18081"), "要点出它现在只听本机:
-{t}");
-        assert!(t.contains("nginx"), "要给出反代这条路:
-{t}");
+        assert!(
+            t.contains("/sub/tok"),
+            "路径要给:
+{t}"
+        );
+        assert!(
+            t.contains("127.0.0.1:18081"),
+            "要点出它现在只听本机:
+{t}"
+        );
+        assert!(
+            t.contains("nginx"),
+            "要给出反代这条路:
+{t}"
+        );
 
         // ③ 配好了 —— 给完整地址,并且能一键复制。
         let mut cfg = Config::default();
         cfg.subscription.public_base = "https://sub.example.com/".into();
         let m = sub_modal(&cfg, "alice", "tok");
         let t = body(&m);
-        assert!(t.contains("https://sub.example.com/sub/tok"), "尾部斜杠不该变成双斜杠:
-{t}");
+        assert!(
+            t.contains("https://sub.example.com/sub/tok"),
+            "尾部斜杠不该变成双斜杠:
+{t}"
+        );
         match m {
             // 订阅地址是这个框存在的全部理由,必须能 `y` 复制 ——
             // 一串二十位的随机 token 靠手抄是抄不对的。
@@ -1921,8 +1971,7 @@ mod tests {
         a.cfg.telegram.bot_token = "1234567890:AAHsecret".into();
         a.page = Page::Settings;
         let items = settings::all(&a.cfg);
-        a.sel[Page::Settings as usize] =
-            items.iter().position(|s| s.key == "bot_token").unwrap();
+        a.sel[Page::Settings as usize] = items.iter().position(|s| s.key == "bot_token").unwrap();
 
         on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let Some(Modal::Form(form)) = &a.modal else { panic!("应当开一个表单") };
@@ -2028,8 +2077,12 @@ mod tests {
         assert!(!flat(&keys).contains("退出"), "操作面板不该重复通用键:{keys:?}");
         assert!(flat(&keys).contains("token"), "按键行该在这儿:{keys:?}");
 
-        println!("{}
-{}", info.trim_end(), row2(h as u16 - 3).trim_end());
+        println!(
+            "{}
+{}",
+            info.trim_end(),
+            row2(h as u16 - 3).trim_end()
+        );
     }
 
     /// `[o]` 循环切出站策略,五个取值转一圈回到原点。
@@ -2351,10 +2404,8 @@ mod tests {
         let mut a = app();
         a.page = Page::Nodes;
         let mut n = stub_node(1, "tokyo-reality");
-        n.params.relay = crate::model::node::RelaySetting {
-            host: "198.51.100.9".into(),
-            port: Some(12345),
-        };
+        n.params.relay =
+            crate::model::node::RelaySetting { host: "198.51.100.9".into(), port: Some(12345) };
         a.nodes = vec![n];
         let ops = a.ops_lines().join("\n");
         assert!(ops.contains("198.51.100.9:12345"), "中转落点要显示出来:\n{ops}");
@@ -2453,7 +2504,10 @@ mod tests {
         assert_eq!(a.page, Page::Dashboard, "→ 不该顺手翻页");
 
         let act = on_key(&mut a, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(act, Some(Action::ShowNodeUsers { id: 1, .. })), "焦点在节点栏就开节点明细");
+        assert!(
+            matches!(act, Some(Action::ShowNodeUsers { id: 1, .. })),
+            "焦点在节点栏就开节点明细"
+        );
 
         on_key(&mut a, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert!(!a.dash_on_nodes, "← 该挪回用户栏");
@@ -2654,11 +2708,8 @@ mod tests {
     async fn confirm_only_accepts_y() {
         for (k, want_action) in [('y', true), ('n', false), ('d', false), (' ', false)] {
             let mut a = app();
-            a.modal = Some(Modal::confirm(
-                "删",
-                vec![],
-                Action::DeleteAgent { id: 1, name: "x".into() },
-            ));
+            a.modal =
+                Some(Modal::confirm("删", vec![], Action::DeleteAgent { id: 1, name: "x".into() }));
             let act = on_key(&mut a, key(k));
             assert_eq!(act.is_some(), want_action, "按 {k:?} 时的行为不对");
             assert!(a.modal.is_none());
@@ -2727,8 +2778,8 @@ mod tests {
             nic_quota_bytes: None,
             nic_reset_day: None,
             nic_accounting_mode: Default::default(),
-        reported_utc_offset_secs: None,
-        nic_reset_offset_secs: None,
+            reported_utc_offset_secs: None,
+            nic_reset_offset_secs: None,
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,
@@ -2809,17 +2860,30 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        crate::db::agent_repo::log_event(&pool, Some(agent_id), "counter_reset", "计数器重置", 1000)
-            .await
-            .unwrap();
+        crate::db::agent_repo::log_event(
+            &pool,
+            Some(agent_id),
+            "counter_reset",
+            "计数器重置",
+            1000,
+        )
+        .await
+        .unwrap();
 
         let mut params = NodeParams::default();
         crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
-        let (node_id, _) =
-            crate::db::node_repo::add_node(&pool, agent_id, "tokyo-reality", Protocol::VlessReality, 8443, &params)
-                .await
-                .unwrap();
-        let uid = crate::db::node_repo::add_user(&pool, "alice", 100 * 1_073_741_824, 0).await.unwrap();
+        let (node_id, _) = crate::db::node_repo::add_node(
+            &pool,
+            agent_id,
+            "tokyo-reality",
+            Protocol::VlessReality,
+            8443,
+            &params,
+        )
+        .await
+        .unwrap();
+        let uid =
+            crate::db::node_repo::add_user(&pool, "alice", 100 * 1_073_741_824, 0).await.unwrap();
         crate::db::node_repo::assign_node(&pool, uid, node_id).await.unwrap();
 
         let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
@@ -2943,10 +3007,16 @@ mod tests {
         let (agent_id, _) = crate::db::agent_repo::create(&pool, "a", 0).await.unwrap();
         let mut params = NodeParams::default();
         crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
-        let (node_id, _) =
-            crate::db::node_repo::add_node(&pool, agent_id, "in", Protocol::VlessReality, 443, &params)
-                .await
-                .unwrap();
+        let (node_id, _) = crate::db::node_repo::add_node(
+            &pool,
+            agent_id,
+            "in",
+            Protocol::VlessReality,
+            443,
+            &params,
+        )
+        .await
+        .unwrap();
 
         let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
         app.refresh().await.unwrap();
@@ -3017,12 +3087,9 @@ mod tests {
 
         let mut app = App::new(pool, Config::default(), "sbx-test.toml".into());
         app.refresh().await.unwrap();
-        perform_inner(
-            &mut app,
-            &Action::ShowAgentConfig { id: agent_id, name: "tokyo".into() },
-        )
-        .await
-        .unwrap();
+        perform_inner(&mut app, &Action::ShowAgentConfig { id: agent_id, name: "tokyo".into() })
+            .await
+            .unwrap();
 
         let text = match &app.overlay.as_ref().expect("该打开配置页").body {
             OverlayBody::Text { lines, .. } => lines.join("\n"),

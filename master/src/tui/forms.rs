@@ -155,7 +155,9 @@ pub fn node_add(agents: &[AgentRow], preselect: usize) -> Modal {
             Ok(Action::AddNode(draft))
         }),
     )
-    .visible_when(Box::new(|fields, f| field_applies(Protocol::parse(&val(fields, "proto")), f.key)))
+    .visible_when(Box::new(|fields, f| {
+        field_applies(Protocol::parse(&val(fields, "proto")), f.key)
+    }))
     .with_note(Box::new(|fields| {
         let mut v = vec![TAG_NOTE.to_string()];
         v.push(protocol_note(Protocol::parse(&val(fields, "proto"))).into());
@@ -167,9 +169,11 @@ pub fn node_add(agents: &[AgentRow], preselect: usize) -> Modal {
 }
 
 /// Tag 的含义装不进标签的括号里,但它是这张表单里最容易随手填错的一项。
-const TAG_NOTE: &str = "Tag:同一台机器内唯一,建好之后不能改 —— 它是 (用户, tag) 记账口径的一半(§7.1)。";
+const TAG_NOTE: &str =
+    "Tag:同一台机器内唯一,建好之后不能改 —— 它是 (用户, tag) 记账口径的一半(§7.1)。";
 /// 中转的语义同理 —— 三种取值组合各是什么意思,一行括号写不下。
-const RELAY_NOTE: &str = "中转:地址留空 = 不启用;只填地址则沿用监听端口。只改订阅导出的落点,不动 inbound。";
+const RELAY_NOTE: &str =
+    "中转:地址留空 = 不启用;只填地址则沿用监听端口。只改订阅导出的落点,不动 inbound。";
 
 /// 编辑节点。
 ///
@@ -206,7 +210,9 @@ pub fn node_edit(n: &NodeRow) -> Modal {
     .with_note(Box::new(move |_| {
         let mut v = vec![protocol_note(proto).to_string()];
         if uses_sni(proto) && needs_cert(proto) {
-            v.push("改 server_name 不会重签证书:CN 是建节点时定的,客户端本来就走 insecure。".into());
+            v.push(
+                "改 server_name 不会重签证书:CN 是建节点时定的,客户端本来就走 insecure。".into(),
+            );
         }
         v.push(RELAY_NOTE.into());
         v
@@ -335,7 +341,11 @@ pub fn user_edit(u: &UserRow) -> Modal {
             "编辑用户",
             vec![
                 Field::text("quota", "配额 GB (0 = 不限)", &quota_gb),
-                Field::text("mult", "计费倍率 (2.0 双向 / 1.0 单向)", &format!("{:.1}", u.traffic_multiplier)),
+                Field::text(
+                    "mult",
+                    "计费倍率 (2.0 双向 / 1.0 单向)",
+                    &format!("{:.1}", u.traffic_multiplier),
+                ),
                 Field::text("expire", "到期 (YYYY-MM-DD,留空 = 永久)", &expire),
                 Field::text("reset", "重置日 (1-31,留空 = 不重置)", &reset),
             ],
@@ -451,12 +461,7 @@ pub fn setting_edit(item: crate::tui::settings::Setting) -> Modal {
             vec![Field::text("v", &item.label, &prefill)],
             Box::new(move |f| {
                 let value = item.to_toml(&val(f, "v"))?;
-                Ok(Action::SetConfig {
-                    section,
-                    key,
-                    value,
-                    label: label.clone(),
-                })
+                Ok(Action::SetConfig { section, key, value, label: label.clone() })
             }),
         )
         .head(format!("{section}.{key}"))
@@ -721,8 +726,8 @@ mod preview {
             nic_quota_bytes: None,
             nic_reset_day: None,
             nic_accounting_mode: Default::default(),
-        reported_utc_offset_secs: None,
-        nic_reset_offset_secs: None,
+            reported_utc_offset_secs: None,
+            nic_reset_offset_secs: None,
             cycle_rx: 0,
             cycle_tx: 0,
             up_per_sec: None,

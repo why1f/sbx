@@ -49,10 +49,7 @@ pub fn user_back_keyboard() -> Value {
 
 pub fn user_sub_keyboard() -> Value {
     keyboard(vec![
-        row(vec![
-            ("📋 全部链接", "u:sub_links".into()),
-            ("🧩 base64", "u:sub_b64".into()),
-        ]),
+        row(vec![("📋 全部链接", "u:sub_links".into()), ("🧩 base64", "u:sub_b64".into())]),
         row(vec![("⬅️ 返回", "u:home".into())]),
     ])
 }

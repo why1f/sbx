@@ -67,10 +67,7 @@ impl Registry {
         let epoch = self.next_epoch;
         let evicted_previous = self
             .conns
-            .insert(
-                agent_id,
-                AgentConn { tx, epoch, sent_config_rev: None, sent_user_rev: None },
-            )
+            .insert(agent_id, AgentConn { tx, epoch, sent_config_rev: None, sent_user_rev: None })
             .is_some();
         Registered { epoch, evicted_previous }
     }

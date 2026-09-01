@@ -23,11 +23,21 @@
 
 核心路径已有单元、真实 socket、真实 sing-box、跨语言 golden 和跨机流量测试：
 
-- master：509 个测试
-- shared：6 个测试
-- agent：57 个顶层测试函数；Linux CI 额外运行 `go test -race`
-- `spike/`：真实 sing-box 流量与拒绝行为
-- `e2e/`：两台 agent 的跨机求和、断线重连与 epoch/delta
+| 层 | 覆盖的东西 |
+|---|---|
+| `master/`、`shared/` | 单元 + 真实 SQLite + 真实 socket + 无头 TUI 渲染快照；测试行数约占 Rust 代码的四成 |
+| `agent/` | 单元 + 真实 sing-box 装配；Linux CI 额外跑 `go test -race` |
+| `master/testdata/` | 八协议与出站策略的跨语言 golden 配置 |
+| `spike/` | 真实 sing-box 的流量与拒绝行为回归 |
+| `e2e/` | 两台 agent 的跨机求和、断线重连与 epoch/delta；`e2e/run.sh` 在 CI 里真跑 |
+
+**这里不写测试数量。** 手写的计数一定会漂移成谎，而这一段里别的论断读者没法当场核对，
+唯一能核对的就是那几个数字——数字错了，整段话的可信度一起打折。要数量就自己跑：
+
+```sh
+cargo test --all 2>&1 | grep '^test result'
+cd agent && go test -tags with_quic,with_utls ./... -v 2>&1 | grep -c '^=== RUN'
+```
 
 ## 安装与升级
 
@@ -197,7 +207,7 @@ CI 还检查：
 | `packaging/` | 安装脚本、配置示例、systemd/OpenRC service |
 | `master/testdata/` | 八协议及出站策略 golden 配置，测试必需 |
 | `spike/` | 真实 sing-box tracker 回归，CI 必需 |
-| `e2e/` | 跨 agent 记账与断连恢复驱动，CI 编译检查 |
+| `e2e/` | 跨 agent 记账与断连恢复的端到端验证，`e2e/run.sh` 在 CI 里真跑 |
 
 这些目录均被构建、测试、CI 或发布流程使用，不是可删除的样例文件。
 

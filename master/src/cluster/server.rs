@@ -140,8 +140,14 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
     // 所以这里 spawn 一个任务,让它与 recv_loop 并行。
     let catchup_state = state.clone();
     let catchup = tokio::spawn(async move {
-        catch_up(agent_id, &catchup_state, hello.config_revision, hello.user_state_revision, db_state)
-            .await;
+        catch_up(
+            agent_id,
+            &catchup_state,
+            hello.config_revision,
+            hello.user_state_revision,
+            db_state,
+        )
+        .await;
     });
 
     // ── 收发循环 ──
@@ -198,7 +204,13 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
 ///
 /// **失败不重试。** 下次握手会再比一次 revision,自然重来(§4.2:
 /// 失败时主控保留旧 revision,不标记为成功)。
-async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, agent_user_rev: i64, master: Revisions) {
+async fn catch_up(
+    agent_id: i64,
+    state: &ServerState,
+    agent_config_rev: i64,
+    agent_user_rev: i64,
+    master: Revisions,
+) {
     if agent_config_rev == master.config_revision {
         // 版本已经一致,不用发。但要把这个事实记在连接上 ——
         // 巡检拿 `sent_config_rev` 和库里的值比,留着 `None` 会被当成
@@ -230,7 +242,11 @@ async fn catch_up(agent_id: i64, state: &ServerState, agent_config_rev: i64, age
                             .lock()
                             .await
                             .mark_config_sent(agent_id, master.config_revision);
-                        tracing::info!(agent_id, rev = master.config_revision, "config.apply 已生效");
+                        tracing::info!(
+                            agent_id,
+                            rev = master.config_revision,
+                            "config.apply 已生效"
+                        );
                     }
                     Err(e) => {
                         // agent 回的 error 里带着 box.New 的失败原文(§4.2),值得留痕:
@@ -331,14 +347,12 @@ async fn handshake(
     state: &ServerState,
 ) -> Result<Authenticated, HandshakeError> {
     // 第一帧必须在 10 秒内到达(§4.1)。没有这个超时,半开连接会一直占着一个任务。
-    let first = tokio::time::timeout(
-        std::time::Duration::from_secs(HELLO_TIMEOUT_SECS),
-        stream.next(),
-    )
-    .await
-    .map_err(|_| HandshakeError::Rejected("握手超时"))?
-    .ok_or(HandshakeError::Rejected("连接在握手前关闭"))?
-    .map_err(|e| HandshakeError::Fatal(e.into()))?;
+    let first =
+        tokio::time::timeout(std::time::Duration::from_secs(HELLO_TIMEOUT_SECS), stream.next())
+            .await
+            .map_err(|_| HandshakeError::Rejected("握手超时"))?
+            .ok_or(HandshakeError::Rejected("连接在握手前关闭"))?
+            .map_err(|e| HandshakeError::Fatal(e.into()))?;
 
     let Message::Text(text) = first else {
         return Err(HandshakeError::Rejected("第一帧必须是 text"));
@@ -414,10 +428,7 @@ async fn recv_loop(
             Ok(Some(msg)) => msg,
             // 对端正常关闭:走正常退出,不是错误。
             Ok(None) => return Ok(()),
-            Err(_) => anyhow::bail!(
-                "{}s 没收到任何帧(心跳都停了),判定为半开连接",
-                idle.as_secs()
-            ),
+            Err(_) => anyhow::bail!("{}s 没收到任何帧(心跳都停了),判定为半开连接", idle.as_secs()),
         };
         let Message::Text(text) = msg? else {
             // 二进制/ping/pong 帧忽略。协议是 text frame JSON(§4)。
@@ -499,7 +510,14 @@ async fn dispatch(env: Envelope, agent_id: i64, state: &ServerState) {
             let message = env.payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let msg = format!("box {state_str}: {message}");
             tracing::info!(agent_id, "{msg}");
-            let _ = crate::db::agent_repo::log_event(&state.pool, Some(agent_id), "box_event", &msg, now).await;
+            let _ = crate::db::agent_repo::log_event(
+                &state.pool,
+                Some(agent_id),
+                "box_event",
+                &msg,
+                now,
+            )
+            .await;
         }
         method::LOG => {
             // agent 侧已节流(仅 warn 以上,§4.3)。不落库——日志量不可控,
@@ -540,7 +558,12 @@ async fn ingest_stats(agent_id: i64, state: &ServerState, r: &sbx_shared::StatsR
     }
 }
 
-async fn ingest_sysinfo(agent_id: i64, state: &ServerState, r: &sbx_shared::SysinfoReport, now: i64) {
+async fn ingest_sysinfo(
+    agent_id: i64,
+    state: &ServerState,
+    r: &sbx_shared::SysinfoReport,
+    now: i64,
+) {
     match crate::cluster::ingest::ingest_sysinfo(&state.pool, agent_id, r, now).await {
         Ok(out) => {
             if out.epoch_changed {
@@ -558,7 +581,12 @@ async fn ingest_sysinfo(agent_id: i64, state: &ServerState, r: &sbx_shared::Sysi
 /// 用相邻两次上报的增量 ÷ 时间间隔算网速,只存内存(§8.2)。
 ///
 /// 得到的是**上报周期的平均值**(默认 30s),不是瞬时速率。
-async fn update_speed(agent_id: i64, state: &ServerState, out: &crate::cluster::ingest::SysinfoOutcome, now: i64) {
+async fn update_speed(
+    agent_id: i64,
+    state: &ServerState,
+    out: &crate::cluster::ingest::SysinfoOutcome,
+    now: i64,
+) {
     let mut map = state.speed.lock().await;
     let elapsed = match map.get(&agent_id) {
         Some(prev) => now - prev.at,
@@ -992,9 +1020,7 @@ mod tests {
         h: &AgentHello,
     ) -> Envelope {
         let req = Envelope::req("h1", method::AGENT_HELLO, serde_json::to_value(h).unwrap());
-        ws.send(tungstenite::Message::Text(serde_json::to_string(&req).unwrap()))
-            .await
-            .unwrap();
+        ws.send(tungstenite::Message::Text(serde_json::to_string(&req).unwrap())).await.unwrap();
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
             .await
             .expect("等回应超时")
@@ -1044,10 +1070,11 @@ mod tests {
         assert!(!err.contains("token"), "错误信息不该提到 token: {err}");
 
         // 认证失败要留痕(§8.1)
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE kind = 'auth_failed'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE kind = 'auth_failed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(n, 1, "认证失败应记一条 agent_events");
     }
 
@@ -1061,10 +1088,11 @@ mod tests {
         let mut ws = connect(&url).await;
         let _ = do_hello(&mut ws, &hello(secret)).await;
 
-        let msg: String = sqlx::query_scalar("SELECT message FROM agent_events WHERE kind = 'auth_failed'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let msg: String =
+            sqlx::query_scalar("SELECT message FROM agent_events WHERE kind = 'auth_failed'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(!msg.contains(secret), "审计记录泄露了 token 明文: {msg}");
         // 只该有前 8 位用于排查
         assert!(msg.contains("SuperSec"), "应保留 prefix 便于排查: {msg}");
@@ -1090,9 +1118,7 @@ mod tests {
         let mut ws = connect(&url).await;
 
         let req = Envelope::req("x", method::BOX_STATUS, serde_json::Value::Null);
-        ws.send(tungstenite::Message::Text(serde_json::to_string(&req).unwrap()))
-            .await
-            .unwrap();
+        ws.send(tungstenite::Message::Text(serde_json::to_string(&req).unwrap())).await.unwrap();
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
             .await
@@ -1198,9 +1224,7 @@ mod tests {
 
             // 扮演 agent 回 ok
             let ok = Envelope::resp_ok(id, env.method.as_str(), serde_json::json!({}));
-            ws.send(tungstenite::Message::Text(serde_json::to_string(&ok).unwrap()))
-                .await
-                .unwrap();
+            ws.send(tungstenite::Message::Text(serde_json::to_string(&ok).unwrap())).await.unwrap();
 
             got.push((env.method, env.payload));
         }
@@ -1298,10 +1322,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(
-            detail.contains("无法识别"),
-            "审计详情该说清是协议读不懂,实际:{detail}"
-        );
+        assert!(detail.contains("无法识别"), "审计详情该说清是协议读不懂,实际:{detail}");
 
         // 连接仍然可用:agent 还是 online
         let a = crate::db::agent_repo::get(&pool, agent_id).await.unwrap().unwrap();

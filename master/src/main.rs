@@ -186,7 +186,11 @@ async fn main() -> Result<()> {
                 println!("cluster.tls = false(明文模式),没有证书指纹。");
                 println!("agent 侧应配 insecure = true,并把 TLS 终止交给前面的 nginx。");
             } else {
-                let fp = tls::ensure_cert(&cfg.cluster.cert_path, &cfg.cluster.key_path, &cfg.cluster.listen)?;
+                let fp = tls::ensure_cert(
+                    &cfg.cluster.cert_path,
+                    &cfg.cluster.key_path,
+                    &cfg.cluster.listen,
+                )?;
                 println!("{fp}");
             }
         }
@@ -285,7 +289,8 @@ async fn main() -> Result<()> {
             // 密钥材料在这里生成一次,存进 params_json。**不在下发时生成** ——
             // 那会让每次 config.apply 都换一套密钥,客户端静默全部失联(§9.1)。
             secrets::fill(proto, &mut params)?;
-            let (id, rev) = db::node_repo::add_node(&pool, agent_id, &tag, proto, port, &params).await?;
+            let (id, rev) =
+                db::node_repo::add_node(&pool, agent_id, &tag, proto, port, &params).await?;
             println!("已在 agent #{agent_id} 上新增节点 #{id} {tag}({proto} :{port})");
             // reality 的 public_key / short_id 是**客户端**要的,订阅里也会带。
             // 私钥、证书私钥、ss 服务端密钥一律不打印(§11.3)。
@@ -353,7 +358,9 @@ async fn main() -> Result<()> {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("没有名为 {name} 的用户"))?;
             let (agent_id, rev) = db::node_repo::assign_node(&pool, u.id, node_id).await?;
-            println!("已把节点 #{node_id} 分配给 {name}(agent #{agent_id} 的 config_revision → {rev})");
+            println!(
+                "已把节点 #{node_id} 分配给 {name}(agent #{agent_id} 的 config_revision → {rev})"
+            );
         }
         Cmd::UserUnassign { name, node_id } => {
             let u = db::node_repo::get_user_by_name(&pool, &name)
@@ -364,7 +371,9 @@ async fn main() -> Result<()> {
         }
         Cmd::UserEnable { name } => {
             db::node_repo::set_user_enabled(&pool, &name, true).await?;
-            println!("已启用 {name}。各 agent 的 user_state_revision 已推进,在线的会收到 user.state。");
+            println!(
+                "已启用 {name}。各 agent 的 user_state_revision 已推进,在线的会收到 user.state。"
+            );
         }
         Cmd::UserDisable { name } => {
             db::node_repo::set_user_enabled(&pool, &name, false).await?;
@@ -403,11 +412,15 @@ async fn main() -> Result<()> {
                 public_base: &cfg.subscription.public_base,
                 request_host: None,
             };
-            let generated = sub::generate_links(&sub::SubUser {
-                name: u.name.clone(),
-                uuid: u.uuid.clone(),
-                password: u.password.clone(),
-            }, &nodes, &opts);
+            let generated = sub::generate_links(
+                &sub::SubUser {
+                    name: u.name.clone(),
+                    uuid: u.uuid.clone(),
+                    password: u.password.clone(),
+                },
+                &nodes,
+                &opts,
+            );
 
             println!("节点:{} 个已分配,{} 个可导出", nodes.len(), generated.len());
             if generated.len() < nodes.len() {
@@ -449,7 +462,6 @@ async fn main() -> Result<()> {
 async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::Mutex;
-
 
     // 启动时把上次残留的 online 状态清掉:进程刚起来,谁都还没连上。
     // 不做这一步,TUI 会显示一批实际不在线的 agent 为 online。
@@ -511,11 +523,10 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
     }
 
     let router = cluster::server::router(state);
-    let addr: std::net::SocketAddr = cfg
-        .cluster
-        .listen
-        .parse()
-        .with_context(|| format!("cluster.listen = {} 不是合法的监听地址", cfg.cluster.listen))?;
+    let addr: std::net::SocketAddr =
+        cfg.cluster.listen.parse().with_context(|| {
+            format!("cluster.listen = {} 不是合法的监听地址", cfg.cluster.listen)
+        })?;
 
     if cfg.cluster.tls {
         // rustls 0.23 起,进程级的 CryptoProvider 必须显式装一次。
@@ -527,9 +538,12 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // §1.3:证书不存在时自己生成一张自签的。
-        let fp = tls::ensure_cert(&cfg.cluster.cert_path, &cfg.cluster.key_path, &cfg.cluster.listen)?;
+        let fp =
+            tls::ensure_cert(&cfg.cluster.cert_path, &cfg.cluster.key_path, &cfg.cluster.listen)?;
         tracing::info!(listen = %addr, fingerprint = %fp, "主控已启动(wss),等待 agent 连接");
-        tracing::info!("agent 侧需要配置这个指纹(TOFU pinning);也可用 `sbx fingerprint` 再打印一次");
+        tracing::info!(
+            "agent 侧需要配置这个指纹(TOFU pinning);也可用 `sbx fingerprint` 再打印一次"
+        );
 
         let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(
             &cfg.cluster.cert_path,
@@ -583,7 +597,8 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         {
             sig.recv().await;
         }

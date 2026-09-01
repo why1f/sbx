@@ -99,10 +99,7 @@ pub fn reality_keypair() -> (String, String) {
 
     let secret = x25519_dalek::StaticSecret::from(bytes);
     let public = x25519_dalek::PublicKey::from(&secret);
-    (
-        URL_SAFE_NO_PAD.encode(secret.to_bytes()),
-        URL_SAFE_NO_PAD.encode(public.to_bytes()),
-    )
+    (URL_SAFE_NO_PAD.encode(secret.to_bytes()), URL_SAFE_NO_PAD.encode(public.to_bytes()))
 }
 
 /// reality 的 short_id:8 个十六进制字符(4 字节)。

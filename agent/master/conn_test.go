@@ -14,11 +14,11 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/sagernet/sing-box/adapter"
 
-	"github.com/yourorg/sbx-agent/boxctl"
-	"github.com/yourorg/sbx-agent/config"
-	"github.com/yourorg/sbx-agent/state"
-	"github.com/yourorg/sbx-agent/sysinfo"
-	"github.com/yourorg/sbx-agent/tracker"
+	"github.com/why1f/sbx/agent/boxctl"
+	"github.com/why1f/sbx/agent/config"
+	"github.com/why1f/sbx/agent/state"
+	"github.com/why1f/sbx/agent/sysinfo"
+	"github.com/why1f/sbx/agent/tracker"
 )
 
 // 这组测试用一个**假主控**跑真实的 Conn。它守的是 conn.go 里三条最容易悄悄坏掉的约定:

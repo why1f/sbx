@@ -1,0 +1,25 @@
+# 这份配置的作用不只是「让 CI 绿」,主要是**告诉每个人的编辑器本仓库的风格是什么**。
+#
+# 没有这个文件时,任何开着 format-on-save 的人一保存就会按 rustfmt 默认值改掉
+# 853 处 —— 那种 diff 会把 review 淹掉,而且改的全是别人刻意写成那样的地方。
+#
+# 两个选项是实测选出来的(拿现有代码试各种组合、数 `cargo fmt --check` 的 diff 处数):
+#
+#   默认(max_width=100, 小启发式=Default)          853 处
+#   max_width=100 + use_small_heuristics="Max"     296 处   ← 最少
+#   max_width=110 + Max                            371 处
+#   max_width=120 + Max                            514 处
+#   max_width=95  + Max                            408 处
+#
+# `use_small_heuristics = "Max"` 是关键的那一个:它把 struct 字面量、函数调用等
+# 一堆宽度阈值统一放宽到 max_width。默认值里 `struct_lit_width` 只有 18,
+# 于是 `Delta { delta: new - last, epoch_changed: false }` 这种一眼能读完的
+# 字面量会被拆成四行 —— 本仓库通篇是这种紧凑写法,拆开纯属噪声。
+# (`struct_lit_width` / `fn_call_width` 本身只在 nightly 可配,所以走 Max 这个稳定开关。)
+#
+# 余下那 296 处已经用 `cargo fmt --all` 收敛掉了,所以 CI 的 `cargo fmt --check`
+# **不再是 continue-on-error** —— 它现在是条真会挂的检查。那次收敛动了 34 个文件、
+# 1343 增 847 删,而**一行既有注释都没碰**(rustfmt 默认不重排注释,
+# `wrap_comments` 是关着的 nightly 选项)。本仓库的注释是资产,这一点必须保持。
+max_width            = 100
+use_small_heuristics = "Max"

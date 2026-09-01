@@ -129,12 +129,8 @@ pub fn expire_label(expire_at: Option<i64>) -> String {
 
 /// 解析用户输入的时间表(`09:00, 21:30`)。
 pub fn parse_schedule_input(text: &str) -> Result<Vec<String>> {
-    let list: Vec<String> = text
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    let list: Vec<String> =
+        text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
     let out = normalize_schedule(&list);
     if out.is_empty() {
         return Err(anyhow!("未解析出有效时间"));
@@ -276,10 +272,7 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
     if chars.len() <= max_chars || max_chars == 0 {
         return vec![text.to_string()];
     }
-    chars
-        .chunks(max_chars)
-        .map(|c| c.iter().collect::<String>())
-        .collect()
+    chars.chunks(max_chars).map(|c| c.iter().collect::<String>()).collect()
 }
 
 #[cfg(test)]

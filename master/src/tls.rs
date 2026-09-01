@@ -49,8 +49,7 @@ fn generate(cert_path: &str, key_path: &str, listen: &str) -> Result<()> {
         }
     }
 
-    let key = rcgen::generate_simple_self_signed(sans_for(listen))
-        .context("生成自签证书失败")?;
+    let key = rcgen::generate_simple_self_signed(sans_for(listen)).context("生成自签证书失败")?;
 
     std::fs::write(cert_path, key.cert.pem())
         .with_context(|| format!("写证书 {cert_path} 失败"))?;
@@ -98,9 +97,7 @@ pub fn fingerprint(cert_path: &str) -> Result<String> {
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("解析证书 {cert_path} 失败"))?;
 
-    let leaf = certs
-        .first()
-        .with_context(|| format!("{cert_path} 里没有 CERTIFICATE 块"))?;
+    let leaf = certs.first().with_context(|| format!("{cert_path} 里没有 CERTIFICATE 块"))?;
 
     let digest = Sha256::digest(leaf.as_ref());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -191,10 +188,7 @@ mod tests {
         assert_eq!(sans_for("0.0.0.0:18443"), vec!["localhost"]);
         assert_eq!(sans_for("[::]:18443"), vec!["localhost"]);
         // 具体地址/域名应带上
-        assert_eq!(
-            sans_for("master.example.com:18443"),
-            vec!["localhost", "master.example.com"]
-        );
+        assert_eq!(sans_for("master.example.com:18443"), vec!["localhost", "master.example.com"]);
         assert_eq!(sans_for("203.0.113.7:18443"), vec!["localhost", "203.0.113.7"]);
         // localhost 不该重复
         assert_eq!(sans_for("localhost:18443"), vec!["localhost"]);

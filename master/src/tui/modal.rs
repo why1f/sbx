@@ -55,30 +55,63 @@ pub enum Action {
         nic_accounting_mode: crate::model::agent::NicAccountingMode,
         nic_reset_offset_secs: Option<i64>,
     },
-    RotateToken { id: i64, name: String },
-    DeleteAgent { id: i64, name: String },
+    RotateToken {
+        id: i64,
+        name: String,
+    },
+    DeleteAgent {
+        id: i64,
+        name: String,
+    },
     /// 重新打印接入命令。**token 位置是占位符** —— 明文早就没了(§8.1),
     /// 这条只用来提醒「命令长什么样、缺的那段要去哪儿拿」。
-    ShowInstall { id: i64, name: String },
+    ShowInstall {
+        id: i64,
+        name: String,
+    },
     /// 改一个配置项。`value` 已经是 TOML 字面量(字符串带引号)。
-    SetConfig { section: &'static str, key: &'static str, value: String, label: String },
+    SetConfig {
+        section: &'static str,
+        key: &'static str,
+        value: String,
+        label: String,
+    },
     /// 打开「这个节点上各用户用了多少」。
-    ShowNodeUsers { id: i64, tag: String, agent: String },
+    ShowNodeUsers {
+        id: i64,
+        tag: String,
+        agent: String,
+    },
     /// 打开「这个用户在各节点上用了多少」。
-    ShowUserNodes { id: i64, name: String },
+    ShowUserNodes {
+        id: i64,
+        name: String,
+    },
     /// 打开「这台机器的网卡明细」:整机网卡用量 + 配额 + 各节点跑了多少。
-    ShowAgentNics { id: i64, name: String },
+    ShowAgentNics {
+        id: i64,
+        name: String,
+    },
     /// 打开「这台机器上 sing-box 跑的是什么配置」。
     ///
     /// 配置由主控**现场组装**(`service::build_agent_config`),不向 agent 要 ——
     /// 下发给它的就是这份字节,所以两边必然一致;而且离线的机器也能看,
     /// 那恰恰是最需要看的时候(「为什么这台一直连不上/没生效」)。
-    ShowAgentConfig { id: i64, name: String },
+    ShowAgentConfig {
+        id: i64,
+        name: String,
+    },
     /// 立刻刷一遍。常规刷新是每秒一次,但改完配置或另一个进程动了库时要马上看到。
     Refresh,
     AddNode(NodeDraft),
-    EditNode { id: i64, draft: NodeDraft },
-    DeleteNode { id: i64, tag: String },
+    EditNode {
+        id: i64,
+        draft: NodeDraft,
+    },
+    DeleteNode {
+        id: i64,
+        tag: String,
+    },
     AddUser {
         name: String,
         quota_gb: String,
@@ -94,24 +127,53 @@ pub enum Action {
         expire: String,
         reset_day: String,
     },
-    SetUserEnabled { name: String, enabled: bool },
-    DeleteUser { name: String },
-    SetUserNodes { user_id: i64, user: String, node_ids: Vec<i64> },
+    SetUserEnabled {
+        name: String,
+        enabled: bool,
+    },
+    DeleteUser {
+        name: String,
+    },
+    SetUserNodes {
+        user_id: i64,
+        user: String,
+        node_ids: Vec<i64>,
+    },
     /// 把用户订阅响应头里的流量换成这几台机器的网卡用量之和(§10.3)。
     /// 空列表 = 解绑,改回按用户自己的用量报。
-    SetUserNics { user_id: i64, user: String, agent_ids: Vec<i64> },
+    SetUserNics {
+        user_id: i64,
+        user: String,
+        agent_ids: Vec<i64>,
+    },
     /// 重新生成订阅 token。老 URL 立即失效。
-    RegenSubToken { user_id: i64, user: String },
+    RegenSubToken {
+        user_id: i64,
+        user: String,
+    },
     /// 撤销订阅 token。订阅地址返回 404,`[g]` 可恢复。
-    RevokeSubToken { user_id: i64, user: String },
+    RevokeSubToken {
+        user_id: i64,
+        user: String,
+    },
     /// 手动清零本周期流量。**不动**月重置日期。
-    ResetUserTraffic { user_id: i64, user: String },
+    ResetUserTraffic {
+        user_id: i64,
+        user: String,
+    },
     /// 升级一台 agent(`None` = 在线的全部升)。
-    UpgradeAgents { only: Option<i64>, name: String },
+    UpgradeAgents {
+        only: Option<i64>,
+        name: String,
+    },
     /// 升级**主控自己**。要挂起 TUI 去跑安装脚本,所以由主循环处理。
     SelfUpgrade,
     /// 改这台 agent 的出站地址族策略。进 sing-box 配置,会推进 config_revision。
-    SetOutbound { id: i64, name: String, strategy: crate::model::outbound::OutboundStrategy },
+    SetOutbound {
+        id: i64,
+        name: String,
+        strategy: crate::model::outbound::OutboundStrategy,
+    },
 }
 
 /// 节点表单填出来的东西。密钥材料**不在这里** —— 新增时由 `secrets::fill` 生成,
@@ -132,10 +194,17 @@ pub struct NodeDraft {
 // ─────────────────────────── 字段 ───────────────────────────
 
 pub enum FieldKind {
-    Text { value: String },
+    Text {
+        value: String,
+    },
     /// 取值来自一个有限集合,←/→ 循环。协议、所属 agent 走这条。
-    Select { options: Vec<String>, idx: usize },
-    Toggle { on: bool },
+    Select {
+        options: Vec<String>,
+        idx: usize,
+    },
+    Toggle {
+        on: bool,
+    },
 }
 
 pub struct Field {
@@ -251,9 +320,7 @@ impl Form {
     }
 
     fn shown(&self) -> Vec<usize> {
-        (0..self.fields.len())
-            .filter(|i| (self.visible)(&self.fields, &self.fields[*i]))
-            .collect()
+        (0..self.fields.len()).filter(|i| (self.visible)(&self.fields, &self.fields[*i])).collect()
     }
 
     /// 焦点必须始终落在**可见**字段上。协议一换,`server_name` 可能就地消失,
@@ -313,7 +380,12 @@ pub struct Picker {
 }
 
 impl Picker {
-    pub fn new(title: &str, head: impl Into<String>, items: Vec<PickItem>, build: PickBuild) -> Self {
+    pub fn new(
+        title: &str,
+        head: impl Into<String>,
+        items: Vec<PickItem>,
+        build: PickBuild,
+    ) -> Self {
         Self { title: title.into(), head: head.into(), items, cursor: 0, build }
     }
 }
@@ -323,7 +395,11 @@ impl Picker {
 pub enum Modal {
     Form(Form),
     Picker(Picker),
-    Confirm { title: String, body: Vec<String>, action: Action },
+    Confirm {
+        title: String,
+        body: Vec<String>,
+        action: Action,
+    },
     Info {
         title: String,
         body: Vec<String>,
@@ -429,10 +505,9 @@ impl Modal {
             // token 管理。两个动作都是**不可撤销**的,所以只认那两个字母,
             // 别的键一律关掉 —— 与 Confirm 同一个道理:不该有手滑的可能。
             Modal::Token { user_id, name, active } => match k.code {
-                KeyCode::Char('g') | KeyCode::Char('G') => Outcome::Run(Action::RegenSubToken {
-                    user_id: *user_id,
-                    user: name.clone(),
-                }),
+                KeyCode::Char('g') | KeyCode::Char('G') => {
+                    Outcome::Run(Action::RegenSubToken { user_id: *user_id, user: name.clone() })
+                }
                 KeyCode::Char('v') | KeyCode::Char('V') if *active => {
                     Outcome::Run(Action::RevokeSubToken { user_id: *user_id, user: name.clone() })
                 }
@@ -475,7 +550,10 @@ impl Modal {
                     (FieldKind::Select { options, idx }, KeyCode::Right) if !options.is_empty() => {
                         *idx = (*idx + 1) % options.len();
                     }
-                    (FieldKind::Toggle { on }, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) => {
+                    (
+                        FieldKind::Toggle { on },
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' '),
+                    ) => {
                         *on = !*on;
                     }
                     (FieldKind::Text { value }, KeyCode::Backspace) => {
@@ -597,7 +675,11 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                if copy.is_some() { "  [y]复制到剪贴板  [任意键]关闭" } else { "  [任意键]关闭" },
+                if copy.is_some() {
+                    "  [y]复制到剪贴板  [任意键]关闭"
+                } else {
+                    "  [任意键]关闭"
+                },
                 Style::default().fg(theme::DIM),
             )));
             f.render_widget(
@@ -660,11 +742,8 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
             let rect = centered(area, 0, 0, w, h);
             f.render_widget(Clear, rect);
 
-            let (dot, state) = if *active {
-                ("●", "订阅已开启")
-            } else {
-                ("○", "订阅已撤销")
-            };
+            let (dot, state) =
+                if *active { ("●", "订阅已开启") } else { ("○", "订阅已撤销") };
             let mut lines = vec![
                 Line::from(""),
                 Line::from(vec![
@@ -716,12 +795,8 @@ fn render_form(f: &mut Frame, area: Rect, form: &Form) {
 
     // 标签列按**最长的可见标签**对齐,所有取值就落在同一竖线上。
     // 夹上下限:太窄挤在一起,太宽会把取值推到屏幕右边。
-    let label_w = shown
-        .iter()
-        .map(|i| theme::cols(&form.fields[*i].label))
-        .max()
-        .unwrap_or(16)
-        .clamp(14, 34);
+    let label_w =
+        shown.iter().map(|i| theme::cols(&form.fields[*i].label)).max().unwrap_or(16).clamp(14, 34);
 
     let raw_notes = (form.note)(&form.fields);
     // 宽度按**内容**给,不按百分比:百分比在宽屏上会拉出一个空荡荡的大框,
@@ -737,10 +812,8 @@ fn render_form(f: &mut Frame, area: Rect, form: &Form) {
     // 算不进下面的高度,底下几条会被静默裁掉(theme::wrap 的文档里有原委)。
     let inner = (w as usize).saturating_sub(6);
 
-    let head: Vec<String> =
-        form.head.as_deref().map(|h| theme::wrap(h, inner)).unwrap_or_default();
-    let notes: Vec<Vec<String>> =
-        raw_notes.iter().map(|n| theme::wrap(n.trim(), inner)).collect();
+    let head: Vec<String> = form.head.as_deref().map(|h| theme::wrap(h, inner)).unwrap_or_default();
+    let notes: Vec<Vec<String>> = raw_notes.iter().map(|n| theme::wrap(n.trim(), inner)).collect();
     let note_lines: usize = notes.iter().map(|n| n.len()).sum();
 
     // 每个字段**两行**:标签 + 取值一行,再空一行。
@@ -828,10 +901,7 @@ fn render_form(f: &mut Frame, area: Rect, form: &Form) {
     if let Some(e) = &form.error {
         lines.push(Line::from(Span::styled(format!("  ! {e}"), Style::default().fg(Color::Red))));
     }
-    lines.push(Line::from(Span::styled(
-        format!("  {FORM_HINT}"),
-        Style::default().fg(theme::DIM),
-    )));
+    lines.push(Line::from(Span::styled(format!("  {FORM_HINT}"), Style::default().fg(theme::DIM))));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -889,11 +959,7 @@ fn render_picker(f: &mut Frame, area: Rect, p: &Picker) {
                 // `面包云` 是 3 个 Rust 字符但占 6 列,会把右侧 note 推出去
                 // 3 列 —— 正是「在 面」只剩半截的来源。`theme::pad` 按显示列宽补。
                 theme::pad(&it.label, 24),
-                if sel {
-                    Style::default().add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                },
+                if sel { Style::default().add_modifier(Modifier::BOLD) } else { Style::default() },
             ),
             Span::styled(
                 theme::truncate(&it.note, (w as usize).saturating_sub(2 + 3 + 4 + 24)),
@@ -991,7 +1057,11 @@ pub fn tabs(f: &mut Frame, area: Rect, titles: &[&str], selected: usize) {
         Tabs::new(items)
             .select(selected)
             .divider("│")
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::TRACK)))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(theme::TRACK)),
+            )
             .highlight_style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
             .style(Style::default().fg(theme::DIM)),
         area,
@@ -1013,8 +1083,10 @@ mod render_preview {
                 (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>()
             })
             .collect::<Vec<_>>()
-            .join("
-")
+            .join(
+                "
+",
+            )
     }
 
     /// 中文标签要按**显示列宽**补齐,不能按 Rust 字符数补。
@@ -1047,9 +1119,12 @@ mod render_preview {
         for active in [true, false] {
             let m = Modal::Token { user_id: 1, name: "alice".into(), active };
             let out = draw(80, 12, &m);
-            println!("── active={active} ──
+            println!(
+                "── active={active} ──
 {}
-", out.trim_end());
+",
+                out.trim_end()
+            );
             // 状态那一行必须说清现在是开是关 —— 两个动作的后果取决于它。
             let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
             if active {

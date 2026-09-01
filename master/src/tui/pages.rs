@@ -54,7 +54,12 @@ fn row_style(selected: bool) -> Style {
 ///
 /// `drop_order` 用完了还塞不下(终端被拖到只剩几十列)就从尾巴上继续砍,
 /// 直到只剩两列。那个宽度下界面已经没什么用了,但至少不该是一团被压扁的乱码。
-fn pick<T: Copy + PartialEq>(total: u16, all: &[T], width: fn(T) -> u16, drop_order: &[T]) -> Vec<T> {
+fn pick<T: Copy + PartialEq>(
+    total: u16,
+    all: &[T],
+    width: fn(T) -> u16,
+    drop_order: &[T],
+) -> Vec<T> {
     let mut cols = all.to_vec();
     let fits = |cols: &Vec<T>| {
         let sum: u16 = cols.iter().map(|c| width(*c)).sum();
@@ -169,10 +174,16 @@ fn summary(f: &mut Frame, area: Rect, agents: &[AgentRow], nodes: &[NodeRow], us
         Span::styled(format!("启用 {enabled}   "), Style::default().fg(theme::ONLINE)),
     ];
     if auto_off > 0 {
-        line2.push(Span::styled(format!("自动停用 {auto_off}   "), Style::default().fg(theme::NEVER)));
+        line2.push(Span::styled(
+            format!("自动停用 {auto_off}   "),
+            Style::default().fg(theme::NEVER),
+        ));
     }
     if manual_off > 0 {
-        line2.push(Span::styled(format!("手动停用 {manual_off}"), Style::default().fg(theme::INACTIVE)));
+        line2.push(Span::styled(
+            format!("手动停用 {manual_off}"),
+            Style::default().fg(theme::INACTIVE),
+        ));
     }
 
     let mut speed_line = vec![Span::raw("  当前网速    ")];
@@ -219,7 +230,8 @@ fn net_charts(f: &mut Frame, area: Rect, history: &VecDeque<(f64, f64)>) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    let up: Vec<(f64, f64)> = history.iter().enumerate().map(|(i, (u, _))| (i as f64, *u)).collect();
+    let up: Vec<(f64, f64)> =
+        history.iter().enumerate().map(|(i, (u, _))| (i as f64, *u)).collect();
     let down: Vec<(f64, f64)> =
         history.iter().enumerate().map(|(i, (_, d))| (i as f64, *d)).collect();
     let cur_up = history.back().map(|(u, _)| *u).unwrap_or(0.0);
@@ -227,9 +239,7 @@ fn net_charts(f: &mut Frame, area: Rect, history: &VecDeque<(f64, f64)>) {
 
     // 峰值写进标题。它原来在 y 轴 labels 里,而设 labels 会让 ratatui
     // 腾出一列并画一条竖线 —— 那条线看起来像图里多出来的一组数据。
-    let peak = |pick: fn(&(f64, f64)) -> f64| {
-        history.iter().map(pick).fold(0.0_f64, f64::max)
-    };
+    let peak = |pick: fn(&(f64, f64)) -> f64| history.iter().map(pick).fold(0.0_f64, f64::max);
     net_chart(
         f,
         cc[0],
@@ -449,13 +459,7 @@ const HOST_METRICS_STALE_AFTER: i64 = 90;
 /// 条形画的是**占全部节点总量的份额**,不是配额比例 —— 节点没有配额,
 /// 这里回答的问题是「量都堆在哪个节点上」。tag 后面必须跟机器名:
 /// tag 在不同机器上可以重名,只有 tag 的两行会长得一模一样。
-fn top_nodes(
-    f: &mut Frame,
-    area: Rect,
-    nodes: &[NodeRow],
-    has_agents: bool,
-    sel: Option<usize>,
-) {
+fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool, sel: Option<usize>) {
     let order = dashboard_node_order(nodes);
     let top: Vec<&NodeRow> = order.iter().map(|&i| &nodes[i]).collect();
     let rows = area.height.saturating_sub(2) as usize;
@@ -493,13 +497,11 @@ fn top_nodes(
         let picked = sel == Some(i);
         let used = n.cycle_up.saturating_add(n.cycle_down);
         let share = if total > 0 { used as f64 / total as f64 } else { 0.0 };
-        let mut spans = vec![
-            Span::raw(format!(
-                "{}{}",
-                if picked { "▸ " } else { "  " },
-                theme::pad(&format!("{}@{}", n.tag, n.agent_name), label_w)
-            )),
-        ];
+        let mut spans = vec![Span::raw(format!(
+            "{}{}",
+            if picked { "▸ " } else { "  " },
+            theme::pad(&format!("{}@{}", n.tag, n.agent_name), label_w)
+        ))];
         spans.extend(traffic_pair(n.cycle_up, n.cycle_down));
         if show_pct {
             // 份额用中性色。跟着比例变红会把「这个节点承载得多」染成告警,
@@ -545,7 +547,10 @@ pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
         // 平时代理流量两个方向都有,看不出来;只有 agent 自升级这种纯下载的
         // 时刻才露馅(涨的是 ↑)。
         Span::styled(format!("↑ {:<10}", theme::bytes(a.cycle_tx)), Style::default().fg(theme::UP)),
-        Span::styled(format!("↓ {:<10}", theme::bytes(a.cycle_rx)), Style::default().fg(theme::DOWN)),
+        Span::styled(
+            format!("↓ {:<10}", theme::bytes(a.cycle_rx)),
+            Style::default().fg(theme::DOWN),
+        ),
         Span::styled(
             format!("计入({}) ", a.nic_accounting_mode.short()),
             Style::default().fg(theme::DIM),
@@ -596,7 +601,11 @@ pub fn nic_info(a: &AgentRow, now: i64) -> Vec<Line<'static>> {
             30 - today + d
         };
         cycle.push(Span::styled(
-            if days == 0 { "  (就是今天)".to_string() } else { format!("  (约 {days} 天后)") },
+            if days == 0 {
+                "  (就是今天)".to_string()
+            } else {
+                format!("  (约 {days} 天后)")
+            },
             Style::default().fg(theme::DIM),
         ));
     }
@@ -675,9 +684,6 @@ fn uptime_label(secs: i64) -> String {
         format!("{m} 分")
     }
 }
-
-
-
 
 fn state_color(u: &UserRow) -> Color {
     match (u.enabled, u.auto_disabled) {
@@ -859,7 +865,10 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
                     Span::raw(theme::truncate(&a.name, name_w)),
                 ]),
                 Line::from(Span::styled(
-                    format!("  {}", theme::truncate(a.agent_version.as_deref().unwrap_or(state_text), name_w)),
+                    format!(
+                        "  {}",
+                        theme::truncate(a.agent_version.as_deref().unwrap_or(state_text), name_w)
+                    ),
                     Style::default().fg(theme::DIM),
                 )),
             ]));
@@ -988,16 +997,19 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
             let outbound_cell = Cell::from(Text::from(vec![
                 Line::from(Span::styled(
                     a.outbound.short(),
-                    Style::default().fg(if a.outbound == crate::model::outbound::OutboundStrategy::Auto {
-                        theme::DIM
-                    } else {
-                        theme::ACCENT
-                    }),
+                    Style::default().fg(
+                        if a.outbound == crate::model::outbound::OutboundStrategy::Auto {
+                            theme::DIM
+                        } else {
+                            theme::ACCENT
+                        },
+                    ),
                 )),
                 Line::from(Span::styled("[o] 改", Style::default().fg(theme::DIM))),
             ]));
 
-            let mut cells = vec![name_cell, ip_cell, speed_cell, Cell::from(Text::from(vec![line1, line2]))];
+            let mut cells =
+                vec![name_cell, ip_cell, speed_cell, Cell::from(Text::from(vec![line1, line2]))];
             if c.reset > 0 {
                 cells.push(reset_cell);
             }
@@ -1220,7 +1232,8 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
         .map(|w| Constraint::Length(*w))
         .chain(std::iter::once(Constraint::Min(0)))
         .collect();
-    let titles: Vec<&str> = cols.iter().map(|c| ncol_title(*c)).chain(std::iter::once("")).collect();
+    let titles: Vec<&str> =
+        cols.iter().map(|c| ncol_title(*c)).chain(std::iter::once("")).collect();
 
     f.render_widget(
         Table::new(table_rows, constraints)
@@ -1335,7 +1348,14 @@ const UCOL_ALL: [UCol; 11] = [
 const UCOL_DROP: [UCol; 7] =
     [UCol::Mult, UCol::Reset, UCol::Up, UCol::Down, UCol::Bar, UCol::Nic, UCol::Expire];
 
-pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_base: &str, now: i64) {
+pub fn users(
+    f: &mut Frame,
+    area: Rect,
+    rows: &[UserRow],
+    selected: usize,
+    sub_base: &str,
+    now: i64,
+) {
     // 与节点页同理:没有单独的「详情」面板了 —— 它和「操作」面板的第一行
     // (选中谁、分了几个节点、订阅地址)重复。绑网卡那句说明也搬去了那里。
     let _ = sub_base;
@@ -1426,7 +1446,8 @@ pub fn users(f: &mut Frame, area: Rect, rows: &[UserRow], selected: usize, sub_b
         .map(|c| Constraint::Length(ucol_width(*c)))
         .chain(std::iter::once(Constraint::Min(0)))
         .collect();
-    let titles: Vec<&str> = cols.iter().map(|c| ucol_title(*c)).chain(std::iter::once("")).collect();
+    let titles: Vec<&str> =
+        cols.iter().map(|c| ucol_title(*c)).chain(std::iter::once("")).collect();
 
     f.render_widget(
         Table::new(table_rows, constraints)
@@ -1470,7 +1491,10 @@ pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], s
                 "systemctl restart sbx",
                 Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("    (改的是配置文件本身,注释与排版都保留)", Style::default().fg(theme::DIM)),
+            Span::styled(
+                "    (改的是配置文件本身,注释与排版都保留)",
+                Style::default().fg(theme::DIM),
+            ),
         ]))
         .block(Block::default().borders(Borders::ALL).title(" 设置 ")),
         c[0],
@@ -1486,7 +1510,8 @@ pub fn settings(f: &mut Frame, area: Rect, items: &[super::settings::Setting], s
                 super::settings::Kind::Secret => Style::default().fg(theme::NEVER),
                 _ => Style::default().fg(theme::ACCENT),
             };
-            let shown = if s.shown.trim().is_empty() { "(未设置)".to_string() } else { s.shown.clone() };
+            let shown =
+                if s.shown.trim().is_empty() { "(未设置)".to_string() } else { s.shown.clone() };
             Row::new(vec![
                 Cell::from(theme::truncate(&s.label, 25)),
                 Cell::from(Span::styled(theme::truncate(&shown, 29), value_style)),
@@ -1564,10 +1589,7 @@ pub fn config_text(
                 let indent = &l[..l.len() - trimmed.len()];
                 return Line::from(vec![
                     Span::raw(indent.to_string()),
-                    Span::styled(
-                        format!("\"{}\":", rest.0),
-                        Style::default().fg(theme::ACCENT),
-                    ),
+                    Span::styled(format!("\"{}\":", rest.0), Style::default().fg(theme::ACCENT)),
                     Span::raw(rest.1.to_string()),
                 ]);
             }
@@ -1585,12 +1607,7 @@ pub fn config_text(
     // 标题里带滚动位置。没有它,在一份两百行的配置中间完全不知道自己在哪 ——
     // 也分不出「到底了」和「卡住了」。
     let pos = if lines.len() > view_h {
-        format!(
-            " {title} [{}-{}/{}] ",
-            scroll + 1,
-            (scroll + view_h).min(lines.len()),
-            lines.len()
-        )
+        format!(" {title} [{}-{}/{}] ", scroll + 1, (scroll + view_h).min(lines.len()), lines.len())
     } else {
         format!(" {title} ")
     };
@@ -1734,8 +1751,8 @@ mod tests {
             nic_quota_bytes: quota,
             nic_reset_day: day,
             nic_accounting_mode: Default::default(),
-        reported_utc_offset_secs: None,
-        nic_reset_offset_secs: None,
+            reported_utc_offset_secs: None,
+            nic_reset_offset_secs: None,
             cycle_rx: 34 * 1_073_741_824,
             cycle_tx: 0,
             up_per_sec: Some(8_600.0),
@@ -1870,10 +1887,8 @@ mod tests {
     #[test]
     fn a_relay_target_keeps_its_port_on_a_wide_terminal() {
         let mut n = node();
-        n.params.relay = crate::model::node::RelaySetting {
-            host: "64.186.234.7".into(),
-            port: Some(40000),
-        };
+        n.params.relay =
+            crate::model::node::RelaySetting { host: "64.186.234.7".into(), port: Some(40000) };
         for w in [140, 160, 200] {
             let out = draw_to_string(w, 10, |f| nodes(f, f.area(), &[n.clone()], 0));
             assert!(
@@ -1894,10 +1909,8 @@ mod tests {
         assert_eq!(none_w, 5, "没有中转时只留得下标题和破折号即可");
 
         let mut v4 = node();
-        v4.params.relay = crate::model::node::RelaySetting {
-            host: "64.186.234.7".into(),
-            port: Some(40000),
-        };
+        v4.params.relay =
+            crate::model::node::RelaySetting { host: "64.186.234.7".into(), port: Some(40000) };
         let v4 = vec![v4];
         let v4_w = super::ncol_widths(&cols, 200, super::relay_need(&v4), PARAM_MAX)[relay_i];
 
@@ -1910,8 +1923,11 @@ mod tests {
         let v6_w = super::ncol_widths(&cols, 200, super::relay_need(&v6), PARAM_MAX)[relay_i];
 
         assert!(none_w < v4_w && v4_w < v6_w, "该随内容增长:none={none_w},v4={v4_w},v6={v6_w}");
-        assert_eq!(super::relay_label(&v6[0]).as_deref(), Some("[2600:1700:3a90:c620:be24:11ff:febb:5ad5]:40000"),
-            "IPv6 与端口拼接必须加方括号");
+        assert_eq!(
+            super::relay_label(&v6[0]).as_deref(),
+            Some("[2600:1700:3a90:c620:be24:11ff:febb:5ad5]:40000"),
+            "IPv6 与端口拼接必须加方括号"
+        );
     }
 
     /// 补宽度**不能把总宽撑过边框**。撑过去 ratatui 会静默压缩各列,
@@ -2042,10 +2058,26 @@ mod tests {
             draw_to_string(w, h, |f| users(f, f.area(), &[user()], 0, "https://x.example", NOW));
             let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
             draw_to_string(w, h, |f| {
-                dashboard(f, f.area(), &Dash { agents: &[agent(None, None)], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
+                dashboard(
+                    f,
+                    f.area(),
+                    &Dash {
+                        agents: &[agent(None, None)],
+                        nodes: &[node()],
+                        users: &[user()],
+                        history: &hist,
+                        now: NOW,
+                        focus: None,
+                    },
+                )
             });
             draw_to_string(w, h, |f| {
-                settings(f, f.area(), &crate::tui::settings::all(&crate::config::Config::default()), 0)
+                settings(
+                    f,
+                    f.area(),
+                    &crate::tui::settings::all(&crate::config::Config::default()),
+                    0,
+                )
             });
             draw_to_string(w, h, |f| breakdown(f, f.area(), "t", "h", &[], &[]));
             // 配置页在 1×1 上也不能炸:它要减掉边框/标题算可视行数,
@@ -2205,10 +2237,15 @@ mod tests {
             // 间隔(列数 - 1,末尾那根吃余量的空列也占一个位)和左右边框。
             // 只核对四个基础列的话,「变宽了反而更挤」那类溢出根本抓不到:
             // 主机列在 121 列凭空出现时,总���一次撑过边框 8 格。
-            let cols = 4 + u16::from(c.host > 0) + u16::from(c.outbound > 0)
-                + u16::from(c.reset > 0)
-                + 1;
-            let total = c.name + c.ip + c.speed + c.traffic + c.host + c.outbound + c.reset
+            let cols =
+                4 + u16::from(c.host > 0) + u16::from(c.outbound > 0) + u16::from(c.reset > 0) + 1;
+            let total = c.name
+                + c.ip
+                + c.speed
+                + c.traffic
+                + c.host
+                + c.outbound
+                + c.reset
                 + (cols - 1)
                 + 2;
             assert!(total <= w.max(1), "宽度 {w}:列合计 {total} 超了");
@@ -2275,8 +2312,7 @@ mod tests {
                 .collect()
         };
 
-        let reported =
-            AgentRow { reported_utc_offset_secs: Some(-25200), ..base.clone() };
+        let reported = AgentRow { reported_utc_offset_secs: Some(-25200), ..base.clone() };
         let text = render(&reported);
         assert!(text.contains("UTC-07:00"), "该写出生效偏移:{text}");
         assert!(has_cjk(&text, "agent 上报"), "该标明来源是 agent:{text}");
@@ -2287,7 +2323,10 @@ mod tests {
             ..base.clone()
         };
         let text = render(&manual);
-        assert!(text.contains("UTC") && !text.contains("-07:00"), "手工的 UTC 该压过上报的 -07:00:{text}");
+        assert!(
+            text.contains("UTC") && !text.contains("-07:00"),
+            "手工的 UTC 该压过上报的 -07:00:{text}"
+        );
         assert!(has_cjk(&text, "手工"), "该标明是人填的:{text}");
 
         let neither = AgentRow { ..base };
@@ -2350,8 +2389,7 @@ mod tests {
     #[test]
     fn a_missing_ipv6_renders_as_a_dash() {
         let a = AgentRow { ipv6: None, ..agent(Some(500 * 1_073_741_824), Some(22)) };
-        let out =
-            draw_to_string(140, 6, |f| agents(f, f.area(), std::slice::from_ref(&a), 0, NOW));
+        let out = draw_to_string(140, 6, |f| agents(f, f.area(), std::slice::from_ref(&a), 0, NOW));
         assert!(out.contains('—'), "缺 IPv6 该占位:\n{out}");
     }
 
@@ -2577,9 +2615,24 @@ mod tests {
         // 倍率 2.0,原始 20 GiB↑ / 55 GiB↓ → 计费 40 GiB↑ / 110 GiB↓ / 150 GiB 总计。
         let u = UserRow { traffic_multiplier: 2.0, ..user() };
         // 网卡数字给一个**极其显眼**的值:它要是漏在页面上,一眼就能看见。
-        let a = AgentRow { cycle_rx: 777 * 1_073_741_824, cycle_tx: 888 * 1_073_741_824, ..agent(None, None) };
+        let a = AgentRow {
+            cycle_rx: 777 * 1_073_741_824,
+            cycle_tx: 888 * 1_073_741_824,
+            ..agent(None, None)
+        };
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[a], nodes: &[node()], users: &[u], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[a],
+                    nodes: &[node()],
+                    users: &[u],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
 
         assert!(has_cjk(&out, "本周期用量"), "{out}");
@@ -2587,7 +2640,10 @@ mod tests {
         assert!(out.contains("↓ 110.00 GB"), "下行该是 55 GiB × 2:\n{out}");
         assert!(has_cjk(&out, "总计") && out.contains("150.00 GB"), "总计该是两者之和:\n{out}");
         // 网卡的数字和「网卡」这个词都不该再出现在概况里。
-        assert!(!out.contains("777.00 GB") && !out.contains("888.00 GB"), "网卡流量该整块去掉:\n{out}");
+        assert!(
+            !out.contains("777.00 GB") && !out.contains("888.00 GB"),
+            "网卡流量该整块去掉:\n{out}"
+        );
         assert!(!has_cjk(&out, "网卡 = 整机进出"), "那句注释跟着一起去掉:\n{out}");
     }
 
@@ -2612,7 +2668,18 @@ mod tests {
             })
             .collect();
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[], nodes: &[], users: &users, history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[],
+                    nodes: &[],
+                    users: &users,
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
         // 499 + 202 + 55 = 756 上行;1165 + 404 + 7 = 1576 下行;合计 2332。
         assert!(out.contains("756 B"), "上行:\n{out}");
@@ -2636,7 +2703,18 @@ mod tests {
             ..user()
         };
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[], nodes: &[node()], users: &[double, single], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[],
+                    nodes: &[node()],
+                    users: &[double, single],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
         // **按原样断言,不走 `flat`。** `flat` 把空白全删掉,于是
         // `alice     [2.0x]`(标记被推到箭头旁边)和 `alice [2.0x]` 一样能过 ——
@@ -2659,7 +2737,18 @@ mod tests {
         let short = UserRow { id: 1, name: "ad".into(), traffic_multiplier: 2.0, ..user() };
         let long = UserRow { id: 2, name: "a-long-name".into(), traffic_multiplier: 1.0, ..user() };
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[], nodes: &[], users: &[short, long], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[],
+                    nodes: &[],
+                    users: &[short, long],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
 
         let rows: Vec<&str> =
@@ -2692,10 +2781,27 @@ mod tests {
         let rows = vec![
             // 1_062_185_533 B = 1012.98 MB —— 正好 10 列,9 列的格子装不下。
             NodeRow { cycle_up: 2_759_000, cycle_down: 1_062_185_533, ..node() },
-            NodeRow { id: 2, tag: "osaka".into(), cycle_up: 3 << 30, cycle_down: 1 << 30, ..node() },
+            NodeRow {
+                id: 2,
+                tag: "osaka".into(),
+                cycle_up: 3 << 30,
+                cycle_down: 1 << 30,
+                ..node()
+            },
         ];
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[], nodes: &rows, users: &[], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[],
+                    nodes: &rows,
+                    users: &[],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
         for line in out.lines().filter(|l| l.contains('↑') && !l.contains("上行")) {
             for arrow in ['↑', '↓'] {
@@ -2720,21 +2826,36 @@ mod tests {
 
     /// 概览页要能一眼看出有机器掉线、有人快超额。
     #[test]
-    fn dashboard_summarises_the_cluster() {        let mut offline = agent(None, None);
+    fn dashboard_summarises_the_cluster() {
+        let mut offline = agent(None, None);
         offline.id = 2;
         offline.name = "osaka-2".into();
         offline.status = "offline".into();
         let hist: VecDeque<(f64, f64)> =
             (0..40).map(|i| (1000.0 * (i % 7) as f64, 800.0 * (i % 5) as f64)).collect();
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[agent(Some(1000), Some(1)), offline], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[agent(Some(1000), Some(1)), offline],
+                    nodes: &[node()],
+                    users: &[user()],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
         assert!(has_cjk(&out, "在线 1"), "{out}");
         assert!(has_cjk(&out, "离线 1"), "{out}");
         assert!(out.contains("alice"), "用量 Top 里要有用户:\n{out}");
         assert!(has_cjk(&out, "上行") && has_cjk(&out, "下行"), "要有上下行两张图:\n{out}");
         // 盲文点阵:曲线画出来的字符落在 U+2800 区段。
-        assert!(out.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)), "折线没画出来:\n{out}");
+        assert!(
+            out.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+            "折线没画出来:\n{out}"
+        );
     }
 
     /// 点数不够时不画空图,直接说「在攒数据」——
@@ -2743,7 +2864,18 @@ mod tests {
     fn a_chart_with_one_point_says_it_is_collecting() {
         let hist: VecDeque<(f64, f64)> = VecDeque::from(vec![(1.0, 2.0)]);
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[agent(None, None)], nodes: &[], users: &[], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[agent(None, None)],
+                    nodes: &[],
+                    users: &[],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
         assert!(has_cjk(&out, "还在攒数据"), "{out}");
     }
@@ -2753,7 +2885,18 @@ mod tests {
     fn a_short_terminal_drops_the_chart_not_the_numbers() {
         let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
         let out = draw_to_string(120, 18, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[agent(None, None)], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[agent(None, None)],
+                    nodes: &[node()],
+                    users: &[user()],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
         assert!(!has_cjk(&out, "上行  "), "矮屏不该画折线图:\n{out}");
         assert!(out.contains("alice"), "但明细必须留着:\n{out}");
@@ -2767,17 +2910,40 @@ mod tests {
     fn dashboard_bottom_row_is_users_and_nodes() {
         let hist: VecDeque<(f64, f64)> = (0..40).map(|i| (i as f64, i as f64)).collect();
         let out = draw_to_string(120, 30, |f| {
-            dashboard(f, f.area(), &Dash { agents: &[agent(Some(1 << 40), Some(22))], nodes: &[node()], users: &[user()], history: &hist, now: NOW, focus: None })
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[agent(Some(1 << 40), Some(22))],
+                    nodes: &[node()],
+                    users: &[user()],
+                    history: &hist,
+                    now: NOW,
+                    focus: None,
+                },
+            )
         });
-        assert!(has_cjk(&out, "用量 Top"), "用户视图要在:
-{out}");
-        assert!(has_cjk(&out, "节点用量"), "节点视图要在:
-{out}");
-        assert!(has_cjk(&out, "tokyo-reality@tokyo-1"), "节点行要带机器名:
-{out}");
+        assert!(
+            has_cjk(&out, "用量 Top"),
+            "用户视图要在:
+{out}"
+        );
+        assert!(
+            has_cjk(&out, "节点用量"),
+            "节点视图要在:
+{out}"
+        );
+        assert!(
+            has_cjk(&out, "tokyo-reality@tokyo-1"),
+            "节点行要带机器名:
+{out}"
+        );
         // 「被控服务器」那个面板整块搬走了。留着它等于同一屏上摆两个口径的数字。
-        assert!(!flat(&out).contains(&flat("┌ 被控服务器")), "网卡面板不该还在仪表盘上:
-{out}");
+        assert!(
+            !flat(&out).contains(&flat("┌ 被控服务器")),
+            "网卡面板不该还在仪表盘上:
+{out}"
+        );
     }
 
     /// 节点视图的百分比不能被切掉。
@@ -2794,8 +2960,11 @@ mod tests {
                 let a = f.area();
                 super::top_nodes(f, a, &rows, true, None)
             });
-            assert!(out.contains("100%"), "{w} 列下百分比被切了:
-{out}");
+            assert!(
+                out.contains("100%"),
+                "{w} 列下百分比被切了:
+{out}"
+            );
         }
     }
 
@@ -2807,10 +2976,13 @@ mod tests {
                 .into_iter()
                 .collect();
         println!("── 只有 4 个点(刚开界面两分钟)──");
-        println!("{}", draw_to_string(120, 9, |f| {
-            let a = f.area();
-            super::net_charts(f, a, &sparse);
-        }));
+        println!(
+            "{}",
+            draw_to_string(120, 9, |f| {
+                let a = f.area();
+                super::net_charts(f, a, &sparse);
+            })
+        );
 
         // 攒满整窗,带真实波动。
         let full: VecDeque<(f64, f64)> = (0..crate::tui::data::HISTORY_LEN)
@@ -2821,12 +2993,17 @@ mod tests {
                 (up.max(0.0), down.max(0.0))
             })
             .collect();
-        println!("
-── 攒满 60 点(1 秒上报 = 一分钟)──");
-        println!("{}", draw_to_string(120, 9, |f| {
-            let a = f.area();
-            super::net_charts(f, a, &full);
-        }));
+        println!(
+            "
+── 攒满 60 点(1 秒上报 = 一分钟)──"
+        );
+        println!(
+            "{}",
+            draw_to_string(120, 9, |f| {
+                let a = f.area();
+                super::net_charts(f, a, &full);
+            })
+        );
     }
 
     /// 网速图:不该有轴线竖线,而且**从第一帧起就铺满整幅图宽**。
@@ -2897,10 +3074,16 @@ mod tests {
 {out}"
             );
             // 份额本身要留着,并且标题得说清那个 % 是什么。
-            assert!(out.contains('%'), "{w} 列下份额百分比没了:
-{out}");
-            assert!(has_cjk(&out, "占全网份额"), "{w} 列下标题没写明口径:
-{out}");
+            assert!(
+                out.contains('%'),
+                "{w} 列下份额百分比没了:
+{out}"
+            );
+            assert!(
+                has_cjk(&out, "占全网份额"),
+                "{w} 列下标题没写明口径:
+{out}"
+            );
         }
     }
 
@@ -2932,12 +3115,21 @@ mod tests {
             let area = f.area();
             breakdown(f, area, "t", "h", &nic_info(&a, NOW), &[])
         });
-        assert!(has_cjk(&out, "不限流量"), "无配额要写不限:
-{out}");
-        assert!(out.contains("--"), "没读数要写 --:
-{out}");
-        assert!(!out.contains("0 B/s"), "不该把没读数显示成 0:
-{out}");
+        assert!(
+            has_cjk(&out, "不限流量"),
+            "无配额要写不限:
+{out}"
+        );
+        assert!(
+            out.contains("--"),
+            "没读数要写 --:
+{out}"
+        );
+        assert!(
+            !out.contains("0 B/s"),
+            "不该把没读数显示成 0:
+{out}"
+        );
     }
 
     /// 网卡明细同屏摆着两个口径的数字,标题里必须说清哪个是厂商计费的那个。
@@ -2947,20 +3139,46 @@ mod tests {
         let a = agent(Some(500 * 1_073_741_824), Some(22));
         let out = draw_to_string(110, 12, |f| {
             let area = f.area();
-            breakdown(f, area, "tokyo-1 的网卡明细", "tokyo-1 · 网卡按厂商口径计费", &nic_info(&a, NOW), &[])
+            breakdown(
+                f,
+                area,
+                "tokyo-1 的网卡明细",
+                "tokyo-1 · 网卡按厂商口径计费",
+                &nic_info(&a, NOW),
+                &[],
+            )
         });
         assert!(has_cjk(&out, "网卡本周期"), "{out}");
-        assert!(has_cjk(&out, "剩"), "剩余量要写出来,只有百分比不够用:
-{out}");
-        assert!(has_cjk(&out, "每月 22 日"), "重置日要在:
-{out}");
+        assert!(
+            has_cjk(&out, "剩"),
+            "剩余量要写出来,只有百分比不够用:
+{out}"
+        );
+        assert!(
+            has_cjk(&out, "每月 22 日"),
+            "重置日要在:
+{out}"
+        );
     }
 
     /// 空库时仪表盘要给出「下一步按什么」,而不是几个空框。
     #[test]
     fn empty_dashboard_tells_you_what_to_do_next() {
         let empty: VecDeque<(f64, f64)> = VecDeque::new();
-        let out = draw_to_string(120, 30, |f| dashboard(f, f.area(), &Dash { agents: &[], nodes: &[], users: &[], history: &empty, now: NOW, focus: None }));
+        let out = draw_to_string(120, 30, |f| {
+            dashboard(
+                f,
+                f.area(),
+                &Dash {
+                    agents: &[],
+                    nodes: &[],
+                    users: &[],
+                    history: &empty,
+                    now: NOW,
+                    focus: None,
+                },
+            )
+        });
         assert!(has_cjk(&out, "按 [2] 去服务管理页"), "{out}");
         assert!(has_cjk(&out, "按 [4] 去用户页"), "{out}");
     }
@@ -3158,7 +3376,10 @@ mod tests {
                 &nic_rows
             ))
         );
-        println!("── 服务管理 ──\n{}\n", draw_to_string(120, 12, |f| agents(f, f.area(), &agents_rows, 1, NOW)));
+        println!(
+            "── 服务管理 ──\n{}\n",
+            draw_to_string(120, 12, |f| agents(f, f.area(), &agents_rows, 1, NOW))
+        );
         // 宽一点才画得下「主机」列(CPU / 内存)。
         println!(
             "── 服务管理(140 列,多一个主机列)──\n{}\n",
@@ -3172,11 +3393,25 @@ mod tests {
         println!("── 节点 ──\n{}\n", draw_to_string(120, 9, |f| nodes(f, f.area(), &node_rows, 1)));
         println!(
             "── 用户 ──\n{}\n",
-            draw_to_string(120, 9, |f| users(f, f.area(), &user_rows, 0, "https://sub.example.com", NOW))
+            draw_to_string(120, 9, |f| users(
+                f,
+                f.area(),
+                &user_rows,
+                0,
+                "https://sub.example.com",
+                NOW
+            ))
         );
         println!(
             "── 用户(80 列)──\n{}\n",
-            draw_to_string(80, 9, |f| users(f, f.area(), &user_rows, 0, "https://sub.example.com", NOW))
+            draw_to_string(80, 9, |f| users(
+                f,
+                f.area(),
+                &user_rows,
+                0,
+                "https://sub.example.com",
+                NOW
+            ))
         );
     }
 }

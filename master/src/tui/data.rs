@@ -60,10 +60,7 @@ impl AgentRow {
     ///
     /// 包一层是为了让**优先级只有一个定义处** —— 界面和 supervisor 各自推一遍的话,
     /// 迟早会出现「弹窗说按 -07:00 翻月,实际按主控时区翻」这种自相矛盾。
-    pub fn nic_offset(
-        &self,
-        now: i64,
-    ) -> (chrono::FixedOffset, crate::model::agent::OffsetSource) {
+    pub fn nic_offset(&self, now: i64) -> (chrono::FixedOffset, crate::model::agent::OffsetSource) {
         crate::model::agent::reset_offset(
             self.nic_reset_offset_secs,
             self.reported_utc_offset_secs,
@@ -467,7 +464,7 @@ impl SpeedTracker {
         let prev = self.last.insert(agent_id, s.clone());
 
         let fresh = match prev {
-            None => None,                                 // 没有基准
+            None => None, // 没有基准
             Some(p) if p.boot_id != s.boot_id => {
                 // 机器重启,计数器归零。旧读数一并作废,否则会一直显示重启前的速率。
                 self.rates.remove(&agent_id);
@@ -918,7 +915,8 @@ mod tests {
     fn a_frame_with_no_readings_records_nothing() {
         let mut t = SpeedTracker::default();
         // 第一帧:只有一台 agent,它上报过一次,但 TUI 还没有第二个采样点可比。
-        let (up, down) = t.feed(1, NicSample { rx: 1000, tx: 2000, at: 100, boot_id: Some("b".into()) }, 100);
+        let (up, down) =
+            t.feed(1, NicSample { rx: 1000, tx: 2000, at: 100, boot_id: Some("b".into()) }, 100);
         assert_eq!((up, down), (None, None), "第一次见到就该是 None");
         // load_agents 把所有有读数的 agent 的速率加起来,没有读数的不参与:
         // 0 个有读数 => sum 还是 0.0,但那不是「有 0.0 速率的读数」,是「没有任何读数」。
@@ -926,10 +924,8 @@ mod tests {
         assert!(t.history().is_empty(), "没有任何读数的那一帧不该记点");
     }
 
-
     #[test]
     fn history_is_bounded() {
-
         let mut t = SpeedTracker::default();
         for i in 0..(HISTORY_LEN as i64 * 3) {
             t.observe(i + 1, i as f64, 0.0, 1);
@@ -1259,11 +1255,7 @@ mod tests {
     fn the_staleness_rule_never_lights_a_lamp_up() {
         const NOW: i64 = 1_700_000_000;
         assert_eq!(derive_status("offline", Some(NOW), NOW, 90), "offline", "新鲜也不该点亮");
-        assert_eq!(
-            derive_status("offline", None, NOW, 90),
-            "offline",
-            "从没连上过的保持原样"
-        );
+        assert_eq!(derive_status("offline", None, NOW, 90), "offline", "从没连上过的保持原样");
         // last_seen 为 NULL 且写着 online:不改写 —— 「从没连过」与「连过又断了」
         // 是两回事,这里没有依据去判,交给 daemon(它重启时会统一重置)。
         assert_eq!(derive_status("online", None, NOW, 90), "online");

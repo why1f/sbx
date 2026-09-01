@@ -8,9 +8,7 @@ use sqlx::SqlitePool;
 
 /// 取全部 agent,按名字排序(TUI 列表用,需要稳定顺序)。
 pub async fn list(pool: &SqlitePool) -> Result<Vec<Agent>> {
-    Ok(sqlx::query_as::<_, Agent>("SELECT * FROM agents ORDER BY name")
-        .fetch_all(pool)
-        .await?)
+    Ok(sqlx::query_as::<_, Agent>("SELECT * FROM agents ORDER BY name").fetch_all(pool).await?)
 }
 
 pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Agent>> {
@@ -37,9 +35,7 @@ pub async fn find_by_token(pool: &SqlitePool, token: &str) -> Result<Option<Agen
 
     // 逐个恒定时间比较。候选通常只有 1 条(prefix 是 8 字节 base64url,碰撞概率极低),
     // 但**不能因此写成「取第一条再比」**——那样 prefix 碰撞时会误判为认证失败。
-    Ok(candidates
-        .into_iter()
-        .find(|a| crate::cluster::token::verify(&want, &a.token_hash)))
+    Ok(candidates.into_iter().find(|a| crate::cluster::token::verify(&want, &a.token_hash)))
 }
 
 /// 新增 agent。返回 `(agent_id, token 明文)` —— **明文只在这里出现一次**,
@@ -76,10 +72,7 @@ pub async fn rotate_token(pool: &SqlitePool, id: i64) -> Result<String> {
 ///
 /// **调用前应提示会影响的用户数**(§8.1),那是 UI 的职责,不在这里。
 pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM agents WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query("DELETE FROM agents WHERE id = ?").bind(id).execute(pool).await?;
     Ok(())
 }
 
@@ -173,7 +166,13 @@ pub async fn affected_user_count(pool: &SqlitePool, id: i64) -> Result<i64> {
 }
 
 /// 记一条审计事件(§5.4 的 epoch 变更、§8.1 的认证失败都走这里)。
-pub async fn log_event(pool: &SqlitePool, agent_id: Option<i64>, kind: &str, message: &str, at: i64) -> Result<()> {
+pub async fn log_event(
+    pool: &SqlitePool,
+    agent_id: Option<i64>,
+    kind: &str,
+    message: &str,
+    at: i64,
+) -> Result<()> {
     sqlx::query("INSERT INTO agent_events (agent_id, kind, message, at) VALUES (?, ?, ?, ?)")
         .bind(agent_id)
         .bind(kind)
@@ -229,11 +228,12 @@ mod tests {
         use crate::model::outbound::OutboundStrategy;
         let p = pool().await;
         let (id, _) = create(&p, "tokyo", 0).await.unwrap();
-        let stored: String = sqlx::query_scalar("SELECT outbound_strategy FROM agents WHERE id = ?")
-            .bind(id)
-            .fetch_one(&p)
-            .await
-            .unwrap();
+        let stored: String =
+            sqlx::query_scalar("SELECT outbound_strategy FROM agents WHERE id = ?")
+                .bind(id)
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(OutboundStrategy::parse(&stored), OutboundStrategy::Auto);
     }
 
@@ -395,25 +395,26 @@ mod tests {
             None,
             crate::model::agent::NicAccountingMode::Sum,
             None,
-        ).await.unwrap_err().to_string();
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains('b'), "错误里要指出冲突的名字: {err}");
     }
 
     #[tokio::test]
     async fn update_settings_on_a_missing_agent_errors() {
         let p = pool().await;
-        assert!(
-            update_settings(
-                &p,
-                999,
-                "x",
-                None,
-                None,
-                crate::model::agent::NicAccountingMode::Sum,
-                None,
-            )
-            .await
-            .is_err()
-        );
+        assert!(update_settings(
+            &p,
+            999,
+            "x",
+            None,
+            None,
+            crate::model::agent::NicAccountingMode::Sum,
+            None,
+        )
+        .await
+        .is_err());
     }
 }

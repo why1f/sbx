@@ -63,12 +63,11 @@ pub async fn build_agent_config(pool: &SqlitePool, agent_id: i64) -> Result<serd
     // 已被 1.14.0 移除的 `domain_strategy`(见 model/outbound.rs)。
     // 认不出来的取值退回 Auto —— 库里那一列可能被手改过,而让整台机器的
     // 配置组装失败远比退回默认行为要糟。
-    let strategy: String =
-        sqlx::query_scalar("SELECT outbound_strategy FROM agents WHERE id = ?")
-            .bind(agent_id)
-            .fetch_optional(pool)
-            .await?
-            .unwrap_or_default();
+    let strategy: String = sqlx::query_scalar("SELECT outbound_strategy FROM agents WHERE id = ?")
+        .bind(agent_id)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or_default();
     crate::model::outbound::apply(
         &mut cfg,
         crate::model::outbound::OutboundStrategy::parse(&strategy),
@@ -157,7 +156,11 @@ fn build_inbound(
         Protocol::Shadowsocks => {
             let method = {
                 let m = p("ss_method");
-                if m.is_empty() { secrets::SS_DEFAULT_METHOD } else { m }
+                if m.is_empty() {
+                    secrets::SS_DEFAULT_METHOD
+                } else {
+                    m
+                }
             };
             Ok(serde_json::json!({
                 "type": "shadowsocks",
@@ -248,10 +251,7 @@ fn vless_users(users: &[(String, String, String)], reality: bool) -> Vec<serde_j
 
 /// trojan / hysteria2 / anytls 共用的用户项:名字 + 密码。
 fn password_users(users: &[(String, String, String)]) -> Vec<serde_json::Value> {
-    users
-        .iter()
-        .map(|(name, _, pw)| serde_json::json!({ "name": name, "password": pw }))
-        .collect()
+    users.iter().map(|(name, _, pw)| serde_json::json!({ "name": name, "password": pw })).collect()
 }
 
 fn ws_transport(path: &str, default_path: &str) -> serde_json::Value {
@@ -392,10 +392,7 @@ mod tests {
         assert_eq!(cfg["route"]["default_domain_resolver"]["strategy"], "prefer_ipv6");
         // resolver 指向的 tag 必须真的存在,否则 sing-box 起不来。
         let tag = cfg["route"]["default_domain_resolver"]["server"].as_str().unwrap();
-        assert!(
-            cfg["dns"]["servers"].as_array().unwrap().iter().any(|s| s["tag"] == tag),
-            "{cfg}"
-        );
+        assert!(cfg["dns"]["servers"].as_array().unwrap().iter().any(|s| s["tag"] == tag), "{cfg}");
         // 1.14.0 已移除的那个字段,一个字都不能出现。
         assert!(!cfg.to_string().contains("domain_strategy"), "{cfg}");
     }
@@ -540,7 +537,9 @@ mod tests {
         let dir = testdata_dir();
         let cert_path = dir.join("fixture-cert.pem");
         let key_path = dir.join("fixture-key.pem");
-        if let (Ok(c), Ok(k)) = (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path)) {
+        if let (Ok(c), Ok(k)) =
+            (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path))
+        {
             return (c, k);
         }
         std::fs::create_dir_all(&dir).unwrap();
@@ -673,7 +672,8 @@ mod tests {
         let pub_key = p.public_key.clone().unwrap();
         let params = serde_json::to_value(&p).unwrap();
 
-        let inbound = build_inbound("n", Protocol::VlessReality, 443, &params, &golden_users()).unwrap();
+        let inbound =
+            build_inbound("n", Protocol::VlessReality, 443, &params, &golden_users()).unwrap();
         let text = inbound.to_string();
         assert!(!text.contains(&pub_key), "public_key 泄进了 inbound: {text}");
         assert!(inbound["tls"]["reality"]["public_key"].is_null());
@@ -723,10 +723,7 @@ mod tests {
         for entry in u {
             let pw = entry["password"].as_str().unwrap();
             use base64::Engine as _;
-            assert_eq!(
-                base64::engine::general_purpose::STANDARD.decode(pw).unwrap().len(),
-                16
-            );
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(pw).unwrap().len(), 16);
         }
     }
 
@@ -735,7 +732,8 @@ mod tests {
     #[test]
     fn tls_protocols_inline_the_certificate_instead_of_a_path() {
         for proto in [Protocol::Trojan, Protocol::Tuic, Protocol::Anytls, Protocol::Hysteria2] {
-            let ib = build_inbound("n", proto, 443, &fixture_params(proto), &golden_users()).unwrap();
+            let ib =
+                build_inbound("n", proto, 443, &fixture_params(proto), &golden_users()).unwrap();
             let tls = &ib["tls"];
             assert!(
                 tls["certificate"].as_str().unwrap_or_default().contains("BEGIN CERTIFICATE"),

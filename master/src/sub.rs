@@ -218,10 +218,7 @@ pub fn endpoint(node: &ExportNode, opts: &ExportOptions<'_>) -> Option<(String, 
 /// 这里没有旧项目那条 "acme / 用户自备证书" 分支 —— sbx 不支持那两种,
 /// 加一个永远为假的判断只会让人以为它存在。
 fn skip_cert_verify(proto: Protocol) -> bool {
-    matches!(
-        proto,
-        Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic | Protocol::Anytls
-    )
+    matches!(proto, Protocol::Trojan | Protocol::Hysteria2 | Protocol::Tuic | Protocol::Anytls)
 }
 
 fn enc(value: &str) -> String {
@@ -236,7 +233,11 @@ fn param(params: &NodeParams, f: impl Fn(&NodeParams) -> Option<&String>) -> Opt
 ///
 /// 缺地址或缺密钥材料的节点**跳过**,不报错 —— 订阅是给终端用户看的,
 /// 一个坏节点不该让他整份订阅拿不到。运维侧的可见性由 `sbx node-list` 负责。
-pub fn generate_links(user: &SubUser, nodes: &[ExportNode], opts: &ExportOptions<'_>) -> Vec<ShareLink> {
+pub fn generate_links(
+    user: &SubUser,
+    nodes: &[ExportNode],
+    opts: &ExportOptions<'_>,
+) -> Vec<ShareLink> {
     let mut links = Vec::with_capacity(nodes.len());
     for node in nodes {
         let Some((server, port)) = endpoint(node, opts) else {
@@ -329,14 +330,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
             // `+` `/` `=` 这些非 URL-safe 字符。部分客户端宽容接受,但它不符合
             // AEAD-2022 的 SIP002 规则。
             let pw = format!("{}:{}", psk, crate::secrets::ss_user_password(&u.uuid));
-            Some(format!(
-                "ss://{}:{}@{}:{}#{}",
-                enc(&method),
-                enc(&pw),
-                authority,
-                port,
-                tag
-            ))
+            Some(format!("ss://{}:{}@{}:{}#{}", enc(&method), enc(&pw), authority, port, tag))
         }
 
         Protocol::Trojan => Some(format!(
@@ -399,12 +393,7 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
 /// 手写拼接很容易漏掉分隔符,拼出 `?&insecure=1` 这种东西
 /// —— 那正是这个函数被提出来的原因(测试 `sni_is_omitted_…` 抓到过一次)。
 fn query(parts: &[Option<String>]) -> String {
-    parts
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join("&")
+    parts.iter().flatten().map(String::as_str).collect::<Vec<_>>().join("&")
 }
 
 /// `sni=<域名>`,节点没配 server_name 时返回 `None`。
@@ -418,13 +407,7 @@ fn sni_param(p: &NodeParams) -> Option<String> {
 
 /// base64 的订阅正文:每行一条链接,整体 base64。
 pub fn subscription_b64(links: &[ShareLink]) -> String {
-    STANDARD.encode(
-        links
-            .iter()
-            .map(|l| l.link.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+    STANDARD.encode(links.iter().map(|l| l.link.as_str()).collect::<Vec<_>>().join("\n"))
 }
 
 /// 简易 YAML 标量。
@@ -438,7 +421,9 @@ pub fn subscription_b64(links: &[ShareLink]) -> String {
 fn yaml_str(s: &str) -> String {
     let needs_quote = s.is_empty()
         || s.chars().any(|c| matches!(c, ':' | '#' | '\'' | '"' | '\n' | '\t'))
-        || s.starts_with(['-', '?', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '%', '@', '`', ' '])
+        || s.starts_with([
+            '-', '?', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '%', '@', '`', ' ',
+        ])
         || s.ends_with(' ');
     if needs_quote {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -448,7 +433,11 @@ fn yaml_str(s: &str) -> String {
 }
 
 /// Clash / Mihomo 的 YAML 订阅。
-pub fn generate_clash_yaml(user: &SubUser, nodes: &[ExportNode], opts: &ExportOptions<'_>) -> String {
+pub fn generate_clash_yaml(
+    user: &SubUser,
+    nodes: &[ExportNode],
+    opts: &ExportOptions<'_>,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# mihomo / clash-meta subscription for {}", user.name);
     let _ = writeln!(out, "mixed-port: 7890");
@@ -515,10 +504,9 @@ fn clash_proxy(out: &mut String, u: &SubUser, n: &ExportNode, s: &str, port: u16
 
     match n.protocol {
         Protocol::VlessReality => {
-            let (Some(server_name), Some(pbk)) = (
-                param(p, |x| x.server_name.as_ref()),
-                param(p, |x| x.public_key.as_ref()),
-            ) else {
+            let (Some(server_name), Some(pbk)) =
+                (param(p, |x| x.server_name.as_ref()), param(p, |x| x.public_key.as_ref()))
+            else {
                 return false;
             };
             let sid = param(p, |x| x.short_id.as_ref()).unwrap_or_default();
@@ -804,9 +792,23 @@ mod tests {
         let links = generate_links(&user(), &nodes, &opts());
         assert_eq!(links.len(), 8, "八个协议都该导出:{links:?}");
 
-        let schemes = ["vless://", "vless://", "vmess://", "ss://", "trojan://", "tuic://", "anytls://", "hysteria2://"];
+        let schemes = [
+            "vless://",
+            "vless://",
+            "vmess://",
+            "ss://",
+            "trojan://",
+            "tuic://",
+            "anytls://",
+            "hysteria2://",
+        ];
         for (link, want) in links.iter().zip(schemes) {
-            assert!(link.link.starts_with(want), "{} 应以 {want} 开头: {}", link.protocol, link.link);
+            assert!(
+                link.link.starts_with(want),
+                "{} 应以 {want} 开头: {}",
+                link.protocol,
+                link.link
+            );
         }
     }
 
@@ -914,7 +916,8 @@ mod tests {
     fn subscription_body_is_base64_of_newline_separated_links() {
         let nodes: Vec<_> = Protocol::all().iter().map(|p| node(*p)).collect();
         let links = generate_links(&user(), &nodes, &opts());
-        let decoded = String::from_utf8(STANDARD.decode(subscription_b64(&links)).unwrap()).unwrap();
+        let decoded =
+            String::from_utf8(STANDARD.decode(subscription_b64(&links)).unwrap()).unwrap();
         assert_eq!(decoded.lines().count(), 8);
     }
 
@@ -1127,9 +1130,16 @@ mod tests {
         let (agent_id, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
         let mut params = NodeParams::default();
         crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
-        let (mine, _) = crate::db::node_repo::add_node(&p, agent_id, "mine", Protocol::VlessReality, 1, &params)
-            .await
-            .unwrap();
+        let (mine, _) = crate::db::node_repo::add_node(
+            &p,
+            agent_id,
+            "mine",
+            Protocol::VlessReality,
+            1,
+            &params,
+        )
+        .await
+        .unwrap();
         crate::db::node_repo::add_node(&p, agent_id, "theirs", Protocol::VlessReality, 2, &params)
             .await
             .unwrap();

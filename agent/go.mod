@@ -1,4 +1,4 @@
-module github.com/yourorg/sbx-agent
+module github.com/why1f/sbx/agent
 
 go 1.24.7
 

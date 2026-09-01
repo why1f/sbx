@@ -31,7 +31,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	sjson "github.com/sagernet/sing/common/json"
 
-	"github.com/yourorg/sbx-agent/tracker"
+	"github.com/why1f/sbx/agent/tracker"
 )
 
 type Controller struct {

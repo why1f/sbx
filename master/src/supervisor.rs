@@ -109,10 +109,7 @@ fn date_in(ts: i64, off: chrono::FixedOffset) -> Option<chrono::NaiveDate> {
 }
 
 fn local_date(ts: i64) -> Option<chrono::NaiveDate> {
-    chrono::Local
-        .timestamp_opt(ts, 0)
-        .single()
-        .map(|dt| dt.date_naive())
+    chrono::Local.timestamp_opt(ts, 0).single().map(|dt| dt.date_naive())
 }
 
 /// 本月最后一天(28..=31)。
@@ -188,12 +185,14 @@ async fn reset_user_cycles(
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)")
-            .bind("user_cycle_reset")
-            .bind(format!("用户 {name} 的流量周期已重置({ym})"))
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)",
+        )
+        .bind("user_cycle_reset")
+        .bind(format!("用户 {name} 的流量周期已重置({ym})"))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
 
@@ -323,24 +322,28 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)")
-            .bind("user_auto_disabled")
-            .bind(format!("用户 {name} 已自动停用:{why}"))
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)",
+        )
+        .bind("user_auto_disabled")
+        .bind(format!("用户 {name} 已自动停用:{why}"))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     }
     for (id, name) in &to_enable {
         sqlx::query("UPDATE users SET enabled = 1, auto_disabled = 0 WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)")
-            .bind("user_auto_enabled")
-            .bind(format!("用户 {name} 已自动恢复"))
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)",
+        )
+        .bind("user_auto_enabled")
+        .bind(format!("用户 {name} 已自动恢复"))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
 
@@ -493,7 +496,12 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
         match rpc.call_default(registry, agent_id, method::USER_STATE, payload).await {
             Ok(_) => {
                 registry.lock().await.mark_user_sent(agent_id, master_rev);
-                tracing::info!(agent_id, rev = master_rev, count = disabled.len(), "user.state 已下发");
+                tracing::info!(
+                    agent_id,
+                    rev = master_rev,
+                    count = disabled.len(),
+                    "user.state 已下发"
+                );
             }
             Err(e) => tracing::warn!(agent_id, error = %e, "user.state 下发失败(下一轮重试)"),
         }
@@ -535,8 +543,7 @@ async fn drain_commands(
                 // 永远「待办」的队列发懵。
                 let msg = format!("不认识的指令类型:{other}");
                 tracing::warn!(id = cmd.id, kind = other, "丢弃不认识的指令");
-                let _ =
-                    crate::db::command_repo::finish(pool, cmd.id, Some(&msg), now).await;
+                let _ = crate::db::command_repo::finish(pool, cmd.id, Some(&msg), now).await;
                 continue;
             }
         };
@@ -584,7 +591,8 @@ pub fn spawn(
     tg: Option<tokio::sync::mpsc::Sender<crate::tg::Event>>,
 ) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
         // 默认的 Burst 行为会在卡顿后连补几拍,对巡检没意义(它是幂等的,补拍只是浪费)。
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -682,10 +690,7 @@ async fn report_usage(
     for (name, quota, mult, up, down) in rows {
         let used = ((up + down).max(0) as f64 * mult.max(0.0)) as i64;
         let percent = used as f64 / quota as f64 * 100.0;
-        if tx
-            .try_send(crate::tg::Event::QuotaAlert { username: name, percent })
-            .is_err()
-        {
+        if tx.try_send(crate::tg::Event::QuotaAlert { username: name, percent }).is_err() {
             tracing::debug!("Telegram 事件通道已满,本轮用量推送丢弃");
             break;
         }
@@ -710,11 +715,7 @@ mod tests {
 
     /// 2026-03-15 12:00 本地时间的时间戳。
     fn ts(y: i32, m: u32, d: u32) -> i64 {
-        chrono::Local
-            .with_ymd_and_hms(y, m, d, 12, 0, 0)
-            .single()
-            .unwrap()
-            .timestamp()
+        chrono::Local.with_ymd_and_hms(y, m, d, 12, 0, 0).single().unwrap().timestamp()
     }
 
     /// 一个**确定的 UTC 时刻**。
@@ -760,11 +761,13 @@ mod tests {
 
     /// 这台机器本周期用量与闸门月份。
     async fn nic_state(p: &SqlitePool, id: i64) -> (i64, i64, String) {
-        sqlx::query_as("SELECT cycle_rx, cycle_tx, last_reset_ym FROM agent_nic_traffic WHERE agent_id = ?")
-            .bind(id)
-            .fetch_one(p)
-            .await
-            .unwrap()
+        sqlx::query_as(
+            "SELECT cycle_rx, cycle_tx, last_reset_ym FROM agent_nic_traffic WHERE agent_id = ?",
+        )
+        .bind(id)
+        .fetch_one(p)
+        .await
+        .unwrap()
     }
 
     /// 造一个用户,可选地给它一个节点和一份用量。
@@ -1175,7 +1178,11 @@ mod tests {
         let p = pool().await;
         // agent 报自己在 UTC-7,但人手工钉成 UTC。
         let id = nic_agent(&p, "a", 22, Some(0), Some(-7 * 3600)).await;
-        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(), 1, "该按手工的 UTC 翻");
+        assert_eq!(
+            reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(),
+            1,
+            "该按手工的 UTC 翻"
+        );
         assert_eq!(nic_state(&p, id).await, (0, 0, "2026-08".into()));
     }
 
@@ -1184,7 +1191,11 @@ mod tests {
     async fn the_reported_offset_is_used_when_nobody_overrode_it() {
         let p = pool().await;
         let id = nic_agent(&p, "a", 22, None, Some(-7 * 3600)).await;
-        assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(), 0, "当地还是 21 号");
+        assert_eq!(
+            reset_nic_cycles(&p, utc_ts(2026, 8, 22, 0)).await.unwrap(),
+            0,
+            "当地还是 21 号"
+        );
         assert_eq!(reset_nic_cycles(&p, utc_ts(2026, 8, 22, 8)).await.unwrap(), 1);
         assert_eq!(nic_state(&p, id).await.2, "2026-08");
     }
@@ -1251,10 +1262,7 @@ mod tests {
         user_with_usage(&p, "alice", 0, GB, GB).await; // reset_day 默认 NULL
 
         for day in [1, 15, 28] {
-            assert_eq!(
-                tick(&p, &reg, &rpc, ts(2026, 3, day)).await.unwrap().users_reset,
-                0
-            );
+            assert_eq!(tick(&p, &reg, &rpc, ts(2026, 3, day)).await.unwrap().users_reset, 0);
         }
     }
 
@@ -1347,13 +1355,12 @@ mod tests {
         r.register(id, tx);
         // **两个 revision 都要对齐。** 只标其中一个的话,另一条路会被
         // 「`None` = catch_up 还没跑完」那条规则跳过,测试就测了个寂寞。
-        let (cfg_rev, user_rev): (i64, i64) = sqlx::query_as(
-            "SELECT config_revision, user_state_revision FROM agents WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(p)
-        .await
-        .unwrap();
+        let (cfg_rev, user_rev): (i64, i64) =
+            sqlx::query_as("SELECT config_revision, user_state_revision FROM agents WHERE id = ?")
+                .bind(id)
+                .fetch_one(p)
+                .await
+                .unwrap();
         r.mark_config_sent(id, cfg_rev);
         r.mark_user_sent(id, user_rev);
         (id, Arc::new(Mutex::new(r)), rx)

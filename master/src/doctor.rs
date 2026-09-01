@@ -144,11 +144,14 @@ fn check_binary() -> Check {
             let path = p.display().to_string();
             // 装在别处不是错(开发时就是从 target/ 跑的),但要说出来 ——
             // 「我明明升级了怎么还是老版本」十有八九是 systemd 拉的是另一个文件。
-            let note = if path.contains("target") { "(不是安装路径,开发构建?)" } else { "" };
+            let note =
+                if path.contains("target") { "(不是安装路径,开发构建?)" } else { "" };
             Check::new("sbx 二进制", Level::Ok, format!("{path} (v{ver}) {note}").trim_end())
         }
         // 真拿不到路径也不影响诊断别的项,降级成 WARN 继续往下走。
-        Err(e) => Check::new("sbx 二进制", Level::Warn, format!("取不到自身路径: {e}(版本 v{ver})")),
+        Err(e) => {
+            Check::new("sbx 二进制", Level::Warn, format!("取不到自身路径: {e}(版本 v{ver})"))
+        }
     }
 }
 
@@ -173,10 +176,9 @@ fn check_config(path: &str) -> (Check, Config) {
             Config::default(),
         ),
         // 读不了通常是权限:/etc/sbx 是 0750,非 root 跑就会撞上。
-        Err(e) => (
-            Check::new("配置文件", Level::Err, format!("读 {path} 失败: {e}")),
-            Config::default(),
-        ),
+        Err(e) => {
+            (Check::new("配置文件", Level::Err, format!("读 {path} 失败: {e}")), Config::default())
+        }
     }
 }
 
@@ -186,7 +188,9 @@ fn check_data_dir(cfg: &Config) -> Check {
     let dir = Path::new(&cfg.db.path).parent().unwrap_or(Path::new("."));
     let shown = dir.display().to_string();
     match std::fs::metadata(dir) {
-        Ok(m) if m.is_dir() => Check::new("数据目录", Level::Ok, format!("{shown}{}", mode_note(&m))),
+        Ok(m) if m.is_dir() => {
+            Check::new("数据目录", Level::Ok, format!("{shown}{}", mode_note(&m)))
+        }
         Ok(_) => Check::new("数据目录", Level::Err, format!("{shown} 存在但不是目录")),
         Err(e) => Check::new("数据目录", Level::Err, format!("{shown} 不可用: {e}")),
     }
@@ -254,10 +258,7 @@ async fn check_database(cfg: &Config) -> (Check, bool) {
     let url = format!("sqlite://{path}?mode=ro");
     let ver: Option<i64> = match sqlx::SqlitePool::connect(&url).await {
         Ok(pool) => {
-            let v = sqlx::query_scalar::<_, i64>("PRAGMA user_version")
-                .fetch_one(&pool)
-                .await
-                .ok();
+            let v = sqlx::query_scalar::<_, i64>("PRAGMA user_version").fetch_one(&pool).await.ok();
             pool.close().await;
             v
         }
@@ -282,10 +283,7 @@ async fn check_database(cfg: &Config) -> (Check, bool) {
     };
     let level = if writable { level } else { Level::Err.min_of(level) };
 
-    (
-        Check::new("数据库", level, format!("{rw} {path} ({size_txt}{wal_txt}, {schema})")),
-        true,
-    )
+    (Check::new("数据库", level, format!("{rw} {path} ({size_txt}{wal_txt}, {schema})")), true)
 }
 
 impl Level {
@@ -318,7 +316,9 @@ async fn check_db_contents(cfg: &Config, db_ok: bool) -> Check {
     };
     let count = |t: &'static str| {
         let p = pool.clone();
-        async move { sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {t}")).fetch_one(&p).await }
+        async move {
+            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {t}")).fetch_one(&p).await
+        }
     };
     let agents = count("agents").await;
     let nodes = count("nodes").await;
@@ -330,7 +330,8 @@ async fn check_db_contents(cfg: &Config, db_ok: bool) -> Check {
             let detail = format!("{a} 台被控 / {n} 个节点 / {u} 个用户");
             // 一台被控都没有 = 装完了但还没接机器,多半是没走完部署。
             let level = if a == 0 { Level::Warn } else { Level::Ok };
-            let hint = if a == 0 { "(还没添加被控服务器:sbx agent-add <名称>)" } else { "" };
+            let hint =
+                if a == 0 { "(还没添加被控服务器:sbx agent-add <名称>)" } else { "" };
             Check::new("库内容", level, format!("{detail} {hint}").trim_end())
         }
         // 表都读不出来说明迁移没跑完,而不是「库是空的」。
@@ -431,11 +432,9 @@ async fn check_cluster_listen(cfg: &Config) -> Check {
         Ok(Ok(_)) => Check::new("集群监听", Level::Ok, format!("{listen} 已在监听")),
         // 连不上 = daemon 没跑。是 WARN 不是 ERR:装完还没启动是正常中间态,
         // 而 doctor 本身经常就是在「还没起来」的时候跑的。
-        Ok(Err(e)) => Check::new(
-            "集群监听",
-            Level::Warn,
-            format!("{listen} 连不上({e})—— daemon 没在跑?"),
-        ),
+        Ok(Err(e)) => {
+            Check::new("集群监听", Level::Warn, format!("{listen} 连不上({e})—— daemon 没在跑?"))
+        }
         // 超时和拒绝对使用者是同一件事(「没人在听」),所以给同一句提示。
         // 分开只在于:超时那条还可能是本机防火墙把 SYN 丢了。
         Err(_) => Check::new(
@@ -677,8 +676,11 @@ mod tests {
             "要写出 schema 版本:{}",
             dbc.detail
         );
-        assert!(dbc.detail.contains("KB") || dbc.detail.contains("MB") || dbc.detail.contains("B"),
-            "要写出文件大小:{}", dbc.detail);
+        assert!(
+            dbc.detail.contains("KB") || dbc.detail.contains("MB") || dbc.detail.contains("B"),
+            "要写出文件大小:{}",
+            dbc.detail
+        );
 
         // 空库:被控数为 0,该提示还没接机器。
         let contents = checks.iter().find(|c| c.name == "库内容").unwrap();

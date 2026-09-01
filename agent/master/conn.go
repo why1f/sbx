@@ -40,11 +40,11 @@ import (
 	"github.com/gorilla/websocket"
 	C "github.com/sagernet/sing-box/constant"
 
-	"github.com/yourorg/sbx-agent/boxctl"
-	"github.com/yourorg/sbx-agent/config"
-	"github.com/yourorg/sbx-agent/state"
-	"github.com/yourorg/sbx-agent/sysinfo"
-	"github.com/yourorg/sbx-agent/tracker"
+	"github.com/why1f/sbx/agent/boxctl"
+	"github.com/why1f/sbx/agent/config"
+	"github.com/why1f/sbx/agent/state"
+	"github.com/why1f/sbx/agent/sysinfo"
+	"github.com/why1f/sbx/agent/tracker"
 )
 
 // AgentVersion 出现在握手里,进而出现在主控的节点列表上。

@@ -4,8 +4,8 @@
 //!   1. 迁移必须**在建池之前**用一条独立连接跑完;
 //!   2. 每个版本的所有语句在**一个事务**里跑,不会停在「加了一半列」的中间态。
 
-pub mod command_repo;
 pub mod agent_repo;
+pub mod command_repo;
 pub mod node_repo;
 
 use anyhow::{Context, Result};
@@ -44,9 +44,7 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool> {
     // 迁移在**建池之前**、用一条独立连接跑完。
     // 若放在池上跑,先建好的连接可能缓存了 ALTER TABLE 之前的表结构,
     // 后续 `SELECT *` 会拿到列数与新结构不符的行(表现为解码时下标越界)。
-    migrate(&url)
-        .await
-        .with_context(|| format!("迁移数据库 {} 失败", db_path))?;
+    migrate(&url).await.with_context(|| format!("迁移数据库 {} 失败", db_path))?;
 
     // 连接级 pragma **必须挂在 ConnectOptions 上**,不能建完池再
     // `execute(&pool)` 发一遍 —— 那样只会作用在池随手给出的**那一条**连接上,
@@ -94,18 +92,34 @@ async fn migrate(url: &str) -> Result<()> {
         .disable_statement_logging()
         .connect()
         .await?;
-    sqlx::query("PRAGMA journal_mode=WAL")
-        .execute(&mut conn)
-        .await?;
-    sqlx::query("PRAGMA busy_timeout=5000")
-        .execute(&mut conn)
-        .await?;
+    sqlx::query("PRAGMA journal_mode=WAL").execute(&mut conn).await?;
+    sqlx::query("PRAGMA busy_timeout=5000").execute(&mut conn).await?;
 
-    let current: i64 = sqlx::query("PRAGMA user_version")
-        .fetch_one(&mut conn)
-        .await?
-        .try_get(0)
-        .unwrap_or(0);
+    let current: i64 =
+        sqlx::query("PRAGMA user_version").fetch_one(&mut conn).await?.try_get(0).unwrap_or(0);
+
+    // **库比程序新 = 二进制被降级了,拒绝启动。**
+    //
+    // 迁移只往前走,所以下面的循环对这种库是个空转 —— 不报错、照常起,
+    // 然后拿一份自己不认识的 schema 去跑。危险的不是崩,是**不崩**:
+    // 六处 `SELECT *` 走的是 sqlx 的 `FromRow`(按列名取值),多出来的列被
+    // 静默忽略。所以纯 `ADD COLUMN` 的迁移降级回去看着一切正常;而一旦某版
+    // 迁移改名、删列或重写语义(`009` 就是建新表、搬数据、丢旧表、改名那种),
+    // 旧二进制读到的就是**错数据而不是错误** —— 取不到就落默认值,账悄悄算歪。
+    //
+    // 这个仓库确实会整体回退发布(v0.4.23 回到 v0.4.22),所以不是假想场景。
+    // 宁可在这里拦住:用一次启动失败,换掉一次静默算错账。
+    //
+    // 拦在 `migrate()` 里而不是 `init_pool()` 里:CLI、daemon、TUI、`init-db`
+    // 都从这一条路进库,谁都绕不过。`doctor` 例外 —— 它用 `mode=ro` 单独连、
+    // 只报告不迁移,那正是「降级了该怎么查」的工具,不能自己先挂掉。
+    let want = schema_version();
+    if current > want {
+        anyhow::bail!(
+            "数据库 schema 是 v{current},本程序只认到 v{want} —— 二进制被降级了。\n\
+             换回原来的新版本,或先备份数据库再降级(降级本身不会改库)。"
+        );
+    }
 
     for (idx, script) in MIGRATIONS.iter().enumerate() {
         let target = idx as i64 + 1;
@@ -118,13 +132,13 @@ async fn migrate(url: &str) -> Result<()> {
                 if is_duplicate_column(&e) {
                     continue;
                 }
-                return Err(anyhow::Error::new(e).context(format!("迁移 v{} 失败: {}", target, stmt)));
+                return Err(
+                    anyhow::Error::new(e).context(format!("迁移 v{} 失败: {}", target, stmt))
+                );
             }
         }
         // PRAGMA user_version 不接受绑定参数,target 来自枚举下标,非外部输入。
-        sqlx::query(&format!("PRAGMA user_version = {}", target))
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!("PRAGMA user_version = {}", target)).execute(&mut *tx).await?;
         tx.commit().await?;
     }
     // 迁移本身已提交,关闭连接失败无关紧要(连接 drop 时也会释放),
@@ -248,17 +262,49 @@ mod tests {
         assert!(stmts[0].contains("'it''s; fine'"));
     }
 
+    /// 库比程序新 → 拒绝开库,而且不能把库改坏。
+    ///
+    /// 守的是一个**静默**:迁移循环对 `current > want` 的库本来就是空转,
+    /// 旧二进制会一声不响地拿一份自己不认识的 schema 跑下去。
+    /// 报错文案里两个版本号都要在 —— 只说「版本不对」的话人还得自己去查该用哪个版本。
+    #[tokio::test]
+    async fn a_database_newer_than_the_binary_is_refused() {
+        let path = tmp_db();
+        let url = format!("sqlite://{}?mode=rwc", path);
+        let ahead = schema_version() + 3;
+        {
+            let pool = init_pool(&path).await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version = {ahead}")).execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+
+        let err = init_pool(&path).await.expect_err("库比程序新时必须报错,不能照常开库");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("v{ahead}")), "要说清库是哪个版本: {msg}");
+        assert!(
+            msg.contains(&format!("v{}", schema_version())),
+            "也要说清程序只认到哪个版本: {msg}"
+        );
+
+        // 拒绝得是只读的:报错之后库里的版本号不能被改动,
+        // 否则用回新版二进制时就变成一个被动过手脚的库了。
+        let mut conn = SqliteConnectOptions::from_str(&url).unwrap().connect().await.unwrap();
+        let still: i64 = sqlx::query("PRAGMA user_version")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        assert_eq!(still, ahead, "拒绝路径不得改库");
+    }
+
     #[tokio::test]
     async fn migrations_run_to_latest_and_are_idempotent() {
         let path = tmp_db();
         let url = format!("sqlite://{}?mode=rwc", path);
         let pool = init_pool(&path).await.unwrap();
-        let version: i64 = sqlx::query("PRAGMA user_version")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .try_get(0)
-            .unwrap();
+        let version: i64 =
+            sqlx::query("PRAGMA user_version").fetch_one(&pool).await.unwrap().try_get(0).unwrap();
         assert_eq!(version, schema_version());
         // 再跑一次不应报错(幂等)
         migrate(&url).await.unwrap();
@@ -290,20 +336,18 @@ mod tests {
         assert_eq!(columns(&upgraded).await, columns(&fresh).await);
         // 再钉一遍那几个最容易漏的:光比「两边一致」的话,两边一起漏了也发现不了。
         let names: Vec<String> = columns(&fresh).await.into_iter().map(|(n, _)| n).collect();
-        for must in
-            [
-                "cpu_pct",
-                "mem_used",
-                "mem_total",
-                "load1",
-                "uptime_secs",
-                "sysinfo_at",
-                "outbound_strategy",
-                "nic_accounting_mode",
-                "reported_utc_offset_secs",
-                "nic_reset_offset_secs",
-            ]
-        {
+        for must in [
+            "cpu_pct",
+            "mem_used",
+            "mem_total",
+            "load1",
+            "uptime_secs",
+            "sysinfo_at",
+            "outbound_strategy",
+            "nic_accounting_mode",
+            "reported_utc_offset_secs",
+            "nic_reset_offset_secs",
+        ] {
             assert!(names.contains(&must.to_string()), "重建后的 agents 缺列 {must}:{names:?}");
         }
     }
@@ -361,14 +405,16 @@ mod tests {
         migrate(&url).await.unwrap();
 
         let pool = init_pool(&path).await.unwrap();
-        let nodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes").fetch_one(&pool).await.unwrap();
+        let nodes: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM nodes").fetch_one(&pool).await.unwrap();
         assert_eq!(nodes, 1, "重建 agents 表把节点一起删了");
         let rx: i64 = sqlx::query_scalar("SELECT cycle_rx FROM agent_nic_traffic")
             .fetch_one(&pool)
             .await
             .unwrap();
         assert_eq!(rx, 111, "重建 agents 表把流量一起删了");
-        let agents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents").fetch_one(&pool).await.unwrap();
+        let agents: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agents").fetch_one(&pool).await.unwrap();
         assert_eq!(agents, 1, "agent 自己也得留着");
         let mode: String =
             sqlx::query_scalar("SELECT nic_accounting_mode FROM agents WHERE name = 'keep-me'")
@@ -450,10 +496,11 @@ mod tests {
             .unwrap();
         }
 
-        let rows = sqlx::query("SELECT name, cycle_up, cycle_down FROM user_traffic_total ORDER BY name")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let rows =
+            sqlx::query("SELECT name, cycle_up, cycle_down FROM user_traffic_total ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows.len(), 2, "无流量的用户也必须出现在视图里");
 
         let alice = &rows[0];
@@ -496,10 +543,7 @@ mod tests {
             .await
             .unwrap();
 
-        sqlx::query("DELETE FROM agents WHERE id = 1")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query("DELETE FROM agents WHERE id = 1").execute(&pool).await.unwrap();
 
         for (table, what) in [("nodes", "节点"), ("user_nodes", "用户-节点分配")] {
             let n: i64 = sqlx::query(&format!("SELECT COUNT(*) FROM {table}"))
@@ -510,11 +554,8 @@ mod tests {
             assert_eq!(n, 0, "删除 agent 后应级联清掉{what}");
         }
         // 用户本身不该被删
-        let n: i64 = sqlx::query("SELECT COUNT(*) FROM users")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get(0);
+        let n: i64 =
+            sqlx::query("SELECT COUNT(*) FROM users").fetch_one(&pool).await.unwrap().get(0);
         assert_eq!(n, 1, "删除 agent 不应删掉用户");
     }
 
@@ -531,10 +572,8 @@ mod tests {
             held.push(pool.acquire().await.unwrap());
         }
         for (i, conn) in held.iter_mut().enumerate() {
-            let on: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
-                .fetch_one(&mut **conn)
-                .await
-                .unwrap();
+            let on: i64 =
+                sqlx::query_scalar("PRAGMA foreign_keys").fetch_one(&mut **conn).await.unwrap();
             assert_eq!(on, 1, "第 {i} 条连接上的 foreign_keys 是关的");
         }
     }

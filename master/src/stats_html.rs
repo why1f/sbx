@@ -162,10 +162,9 @@ pub fn render(v: &StatsView, links: &[ShareLink], base_url: &str) -> String {
     // 绑了网卡就多一行,把账号自己的用量也写出来 —— 少了这一行,
     // 「已用 900 GB」旁边挂着「正常」会像是个 bug,而那才是账号的真实状态。
     let own_row = match &v.nic {
-        Some(_) => format!(
-            r#"<span>账号自身: <b>{}</b>(停用判定按这个数)</span>"#,
-            fmt_bytes(v.used())
-        ),
+        Some(_) => {
+            format!(r#"<span>账号自身: <b>{}</b>(停用判定按这个数)</span>"#, fmt_bytes(v.used()))
+        }
         None => String::new(),
     };
 
@@ -520,7 +519,12 @@ mod tests {
 
         // 网卡烧爆了也不该把状态染红 —— 那是厂商的账,不是这个号的账。
         let mut v = nic_view();
-        v.nic = Some(NicUsage { agents: 1, up: 0, down: 3000 * 1_073_741_824, quota: 100 * 1_073_741_824 });
+        v.nic = Some(NicUsage {
+            agents: 1,
+            up: 0,
+            down: 3000 * 1_073_741_824,
+            quota: 100 * 1_073_741_824,
+        });
         let html = render(&v, &[], "https://sub.example.com");
         assert!(html.contains("正常"), "网卡超了不该让账号显示成超额:\n{html}");
     }
@@ -601,11 +605,8 @@ mod tests {
         let mut v = view();
         v.name = r#"<script>alert(1)</script>"#.into();
         let evil_tag = r#"a"><img src=x onerror=alert(1)>"#;
-        let html = render(
-            &v,
-            &[link(evil_tag, r#"vless://x?sni="evil'"#)],
-            "https://sub.example.com",
-        );
+        let html =
+            render(&v, &[link(evil_tag, r#"vless://x?sni="evil'"#)], "https://sub.example.com");
 
         // 判据是「有没有生成新标签」,不是「文本里有没有出现 onerror」——
         // 转义之后 `onerror=` 这几个字仍然会作为**可见文本**留在页面上,那是无害的。

@@ -83,10 +83,7 @@ async fn handle_sub(
     Query(q): Query<SubQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
     let fmt = pick_format(q.ty.as_deref(), ua);
 
     if !token_looks_valid(&token) {
@@ -124,7 +121,11 @@ async fn handle_sub(
             let base = resolve_base_url(&s.cfg.public_base, &headers);
             match stats_view(&s.pool, user_id, &user.name).await {
                 Ok(view) => (
-                    crate::stats_html::render(&view, &sub::generate_links(&user, &nodes, &opts), &base),
+                    crate::stats_html::render(
+                        &view,
+                        &sub::generate_links(&user, &nodes, &opts),
+                        &base,
+                    ),
                     "text/html; charset=utf-8",
                 ),
                 Err(e) => {
@@ -133,10 +134,9 @@ async fn handle_sub(
                 }
             }
         }
-        Format::Yaml => (
-            sub::generate_clash_yaml(&user, &nodes, &opts),
-            "text/yaml; charset=utf-8",
-        ),
+        Format::Yaml => {
+            (sub::generate_clash_yaml(&user, &nodes, &opts), "text/yaml; charset=utf-8")
+        }
         Format::Base64 => (
             sub::subscription_b64(&sub::generate_links(&user, &nodes, &opts)),
             "text/plain; charset=utf-8",
@@ -155,10 +155,7 @@ async fn handle_sub(
         }
         Err(e) => tracing::warn!(error = %e, "算 subscription-userinfo 失败,已跳过该头"),
     }
-    out.insert(
-        HeaderName::from_static("profile-update-interval"),
-        HeaderValue::from_static("6"),
-    );
+    out.insert(HeaderName::from_static("profile-update-interval"), HeaderValue::from_static("6"));
 
     (StatusCode::OK, out, body)
 }
@@ -200,15 +197,16 @@ fn resolve_base_url(public_base: &str, headers: &HeaderMap) -> String {
     if host.is_empty() {
         return String::new();
     }
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("https");
+    let scheme = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("https");
     format!("{scheme}://{host}")
 }
 
 /// 统计页要用的用户信息。
-async fn stats_view(pool: &SqlitePool, user_id: i64, name: &str) -> Result<crate::stats_html::StatsView> {
+async fn stats_view(
+    pool: &SqlitePool,
+    user_id: i64,
+    name: &str,
+) -> Result<crate::stats_html::StatsView> {
     let (enabled, auto_disabled, quota_bytes, mult, expire_at, reset_day, sub_token): (
         bool,
         bool,
@@ -373,8 +371,8 @@ mod tests {
             crate::model::agent::NicAccountingMode::Sum,
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO agent_nic_traffic
                (agent_id, boot_id, last_rx, last_tx, cycle_rx, cycle_tx, cycle_start, updated_at)
@@ -390,11 +388,7 @@ mod tests {
         (uid, aid)
     }
 
-    async fn set_mode(
-        p: &SqlitePool,
-        agent_id: i64,
-        mode: crate::model::agent::NicAccountingMode,
-    ) {
+    async fn set_mode(p: &SqlitePool, agent_id: i64, mode: crate::model::agent::NicAccountingMode) {
         sqlx::query("UPDATE agents SET nic_accounting_mode = ? WHERE id = ?")
             .bind(mode.key())
             .bind(agent_id)
@@ -560,10 +554,8 @@ mod tests {
     async fn binding_a_missing_agent_errors_clearly() {
         let p = nic_pool().await;
         let (uid, _) = fixture(&p, None, 1, 1).await;
-        let err = crate::db::node_repo::set_user_nics(&p, uid, &[999])
-            .await
-            .unwrap_err()
-            .to_string();
+        let err =
+            crate::db::node_repo::set_user_nics(&p, uid, &[999]).await.unwrap_err().to_string();
         assert!(err.contains("999"), "{err}");
     }
 
@@ -591,10 +583,7 @@ mod tests {
     /// 所以客户端关键字必须先于浏览器判定命中。
     #[test]
     fn clash_wins_over_the_mozilla_prefix() {
-        assert_eq!(
-            pick_format(None, "Mozilla/5.0 clash-verge/1.5"),
-            Format::Yaml
-        );
+        assert_eq!(pick_format(None, "Mozilla/5.0 clash-verge/1.5"), Format::Yaml);
     }
 
     #[test]
@@ -666,13 +655,18 @@ mod tests {
             .unwrap();
         let mut params = NodeParams::default();
         crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
-        let (node_id, _) =
-            crate::db::node_repo::add_node(pool, agent_id, "in-1", Protocol::VlessReality, 8443, &params)
-                .await
-                .unwrap();
-        let uid = crate::db::node_repo::add_user(pool, "alice", 10 * 1_073_741_824, 0)
-            .await
-            .unwrap();
+        let (node_id, _) = crate::db::node_repo::add_node(
+            pool,
+            agent_id,
+            "in-1",
+            Protocol::VlessReality,
+            8443,
+            &params,
+        )
+        .await
+        .unwrap();
+        let uid =
+            crate::db::node_repo::add_user(pool, "alice", 10 * 1_073_741_824, 0).await.unwrap();
         crate::db::node_repo::assign_node(pool, uid, node_id).await.unwrap();
         sqlx::query_scalar("SELECT sub_token FROM users WHERE id = ?")
             .bind(uid)
@@ -809,12 +803,15 @@ mod tests {
             .fetch_one(&p)
             .await
             .unwrap();
-        let nid: i64 = sqlx::query_scalar("SELECT id FROM nodes LIMIT 1").fetch_one(&p).await.unwrap();
-        sqlx::query("UPDATE users SET traffic_multiplier = 2.0, expire_at = 1893456000 WHERE id = ?")
-            .bind(uid)
-            .execute(&p)
-            .await
-            .unwrap();
+        let nid: i64 =
+            sqlx::query_scalar("SELECT id FROM nodes LIMIT 1").fetch_one(&p).await.unwrap();
+        sqlx::query(
+            "UPDATE users SET traffic_multiplier = 2.0, expire_at = 1893456000 WHERE id = ?",
+        )
+        .bind(uid)
+        .execute(&p)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO user_traffic (user_id, node_id, cycle_up, cycle_down, updated_at)
              VALUES (?, ?, 100, 200, 0)",
@@ -879,12 +876,18 @@ mod tests {
         let (status, _, body) = get(&p, &format!("/sub/{}?type=stats", token), "Mozilla").await;
 
         assert_eq!(status, StatusCode::OK, "请求该成功");
-        assert!(body.contains("900.00 GB"), "已用该显示网卡口径 300+600:
-{body}");
+        assert!(
+            body.contains("900.00 GB"),
+            "已用该显示网卡口径 300+600:
+{body}"
+        );
         assert!(body.contains("300.00 GB"), "上行该是网卡上行");
         assert!(body.contains("600.00 GB"), "下行该是网卡下行");
-        assert!(body.contains("正常"), "账号自己没超,状态该是正常:
-{body}");
+        assert!(
+            body.contains("正常"),
+            "账号自己没超,状态该是正常:
+{body}"
+        );
         assert!(body.contains("账号自身"), "得把账号自己的用量也写出来");
     }
 

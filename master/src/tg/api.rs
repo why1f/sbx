@@ -73,10 +73,8 @@ impl Api {
             .send()
             .await
             .with_context(|| format!("请求 Telegram {method} 失败"))?;
-        let value: Value = resp
-            .json()
-            .await
-            .with_context(|| format!("解析 Telegram {method} 响应失败"))?;
+        let value: Value =
+            resp.json().await.with_context(|| format!("解析 Telegram {method} 响应失败"))?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = value.get("error_code").and_then(Value::as_i64).unwrap_or_default();
             let desc = value.get("description").and_then(Value::as_str).unwrap_or("无描述");
@@ -98,13 +96,10 @@ impl Api {
             "timeout": LONG_POLL_SECS,
             "allowed_updates": ["message", "callback_query"],
         });
-        let value = self
-            .post("getUpdates", &payload, Duration::from_secs(LONG_POLL_SECS + 10))
-            .await?;
-        let result = value
-            .get("result")
-            .cloned()
-            .ok_or_else(|| anyhow!("getUpdates 响应缺少 result"))?;
+        let value =
+            self.post("getUpdates", &payload, Duration::from_secs(LONG_POLL_SECS + 10)).await?;
+        let result =
+            value.get("result").cloned().ok_or_else(|| anyhow!("getUpdates 响应缺少 result"))?;
         serde_json::from_value(result).context("解析 getUpdates 的 result 失败")
     }
 
@@ -187,8 +182,7 @@ impl Api {
 
     /// 应答 callback,让客户端上的转圈停下来。失败无所谓 —— 它纯粹是 UI 反馈。
     pub async fn answer_callback(&self, id: &str) -> Result<()> {
-        self.post("answerCallbackQuery", &json!({ "callback_query_id": id }), self.timeout)
-            .await?;
+        self.post("answerCallbackQuery", &json!({ "callback_query_id": id }), self.timeout).await?;
         Ok(())
     }
 

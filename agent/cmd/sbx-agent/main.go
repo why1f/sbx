@@ -18,12 +18,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/yourorg/sbx-agent/boxctl"
-	"github.com/yourorg/sbx-agent/config"
-	"github.com/yourorg/sbx-agent/master"
-	"github.com/yourorg/sbx-agent/state"
-	"github.com/yourorg/sbx-agent/sysinfo"
-	"github.com/yourorg/sbx-agent/tracker"
+	"github.com/why1f/sbx/agent/boxctl"
+	"github.com/why1f/sbx/agent/config"
+	"github.com/why1f/sbx/agent/master"
+	"github.com/why1f/sbx/agent/state"
+	"github.com/why1f/sbx/agent/sysinfo"
+	"github.com/why1f/sbx/agent/tracker"
 )
 
 // Version 由 release 构建注入:`-ldflags "-X main.Version=1.2.3"`(§11.1)。

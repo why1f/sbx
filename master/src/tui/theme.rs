@@ -90,11 +90,8 @@ pub fn gradient_bar(ratio: f64, width: usize) -> Vec<Span<'static>> {
     }
     let ratio = ratio.clamp(0.0, 1.0);
     // 至少填一格:非零用量显示成空条会让人以为没在跑。
-    let filled = if ratio <= 0.0 {
-        0
-    } else {
-        ((ratio * width as f64).round() as usize).clamp(1, width)
-    };
+    let filled =
+        if ratio <= 0.0 { 0 } else { ((ratio * width as f64).round() as usize).clamp(1, width) };
 
     (0..width)
         .map(|i| {
@@ -335,7 +332,10 @@ mod tests {
         for t in texts {
             for w in [1usize, 2, 10, 30, 60, 200] {
                 for line in wrap(t, w) {
-                    assert!(cols(&line) <= w.max(1) || cols(&line) <= 2, "宽度 {w} 折出了 {line:?}");
+                    assert!(
+                        cols(&line) <= w.max(1) || cols(&line) <= 2,
+                        "宽度 {w} 折出了 {line:?}"
+                    );
                 }
             }
         }
@@ -367,7 +367,8 @@ mod tests {
     }
 
     #[test]
-    fn rate_rejects_nonsense_values() {        assert_eq!(rate(f64::NAN), "--");
+    fn rate_rejects_nonsense_values() {
+        assert_eq!(rate(f64::NAN), "--");
         assert_eq!(rate(-1.0), "--");
         assert!(rate(1024.0).ends_with("/s"));
     }
