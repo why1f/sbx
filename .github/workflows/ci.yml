@@ -178,20 +178,22 @@ jobs:
       # 提交时 exec 位容易丢），也把「它是 bash 而不是 POSIX sh」写在明处 ——
       # 与 `packaging/install.sh` 相反，那个是真的要跑在 dash 上的。
       #
-      # timeout 为何是 15 分钟（实测拆解，16 核本地数据，runner 只有 4 vCPU，
-      # 编译时间按 2-3× 估）：
+      # timeout 为何是 15 分钟 —— 以下是首跑（f2d2e78）runner 上的**实测**值：
       #
-      #   cargo build --bin sbx  冷 2m13s / 暖 ~18s   ← 主要开销，327 个 crate
-      #   go build agent          冷   56s / 暖 ~4s    735 个 package
-      #   go build e2e driver     冷    4s             与 agent 共用 build cache
-      #   脚本自身（起进程 + 推流量 + 等上报）  ~30-40s
+      #   e2e/run.sh 这一步        126s   （包含冷 cargo build + 冷 go build + 脚本自身）
+      #   整个 job              153s
       #
-      # 于是冷缓存一轮大约 8-10 分钟，暖缓存 ~3 分钟。脚本里所有 `wait_for`
-      # 的超时上限加起来是 465s，所以即使卡住也是**脚本自己带着诊断信息退出**，
+      # 同一轮里其他 job：agent (Go) 237s、master (Rust) 173s、spike 64s、
+      # install.sh 6s —— 五个 job 并行，**e2e 不是最慢的那个**，加进来不拉长总墙钟。
+      #
+      # 写这个注释时曾按本地 Windows 的数字估成 8-10 分钟（cargo 冷建 2m13s、
+      # go 冷建 56s），实测差了四倍。原因不是核数而是**Windows 的文件系统开销** ——
+      # cargo / go 这种海量小文件的构建在 Linux 上快得多。别拿本地 Windows 的
+      # 构建耗时推算 runner。
+      #
+      # 脚本里所有 `wait_for` 的超时上限加起来是 465s，所以卡住时是**脚本自己
+      # 带着诊断信息退出**（各进程日志 + agent_events + user_traffic 现状），
       # 不靠这个 timeout 兵底；它守的只是构建阶段真挂死的情况。
-      #
-      # 它不会拉长 CI 的总墙钟：五个 job 并行，而 `rust`（build + clippy +
-      # 全量测试）与 `go`（build + vet + 双 arch 交叉 + race）本来就在同一个量级。
       - name: e2e/run.sh
         run: bash e2e/run.sh
         timeout-minutes: 15

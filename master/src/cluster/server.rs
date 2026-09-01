@@ -125,9 +125,24 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
     //
     // 拆成两个函数就是为了让这件事由**结构**保证,而不是靠每次改动都记得
     // 「别在这中间加 `?`」。
-    cleanup_connection(&state, agent_id, registered.epoch).await?;
+    let cleanup_result = cleanup_connection(&state, agent_id, registered.epoch).await;
     tracing::info!(agent_id, "agent 断开");
-    loop_result
+
+    // 收尾的错误**不能盖掉 `loop_result`**。后者说的是「连接为什么断的」,
+    // 那才是排查时想看的那一个;而 `mark_offline` 失败(磁盘忙、库被关掉)只是
+    // 没收干净 —— 真正要紧的注销已经在 `cleanup_connection` 里先做完了,
+    // 而状态字段下一次握手就会被改对。
+    //
+    // 改之前这里是 `cleanup_connection(...).await?`,于是一次收尾失败会把断开原因
+    // 整个丢掉。两个都失败时留 `loop_result`,收尾那个单独记一条 warn。
+    match (loop_result, cleanup_result) {
+        (Err(e), Err(c)) => {
+            tracing::warn!(agent_id, error = %c, "断开收尾也失败了");
+            Err(e)
+        }
+        (Err(e), Ok(())) => Err(e),
+        (Ok(()), c) => c,
+    }
 }
 
 /// 登记之后的全部工作:补齐 revision、回 ack、跑收发循环。

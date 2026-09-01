@@ -2455,13 +2455,20 @@ mod tests {
         assert!(!out.contains("天"), "没连过就没有「多久」可说:{out}");
 
         // 时钟回拨或库被手改过时不能显示「离线 -5 天」,宁可不说。
+        //
+        // 断言盯的是 `offline_for` 自己而不是整条摘要行。盯整行(比如
+        // `!out.contains('-')`)看着更严,实际是错的:真实的 `token_prefix` 是
+        // token 前 8 位,而 token 是 base64url —— **本身就能带 `-`**。
+        // 那样写能过只是因为 stub 用了 `abcd1234`;哪天有人把 stub 改得更真实
+        // (那是个改进),测试会因为完全无关的原因挂掉。
         let future = data::AgentRow {
             status: "offline".into(),
             last_seen: Some(now + 9999),
             ..stub_agent(1)
         };
+        assert_eq!(offline_for(&future, now), "", "未来的 last_seen 不该算出时长");
         let out = line(future);
-        assert!(!out.contains('-'), "未来的 last_seen 不该算出负数时长:{out}");
+        assert!(!out.contains("离线 -"), "摘要行里不能出现负数时长:{out}");
     }
 
     /// 「操作」摘要行要带上那几件**列里放不下、又必须看得见**的事。

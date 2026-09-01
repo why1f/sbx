@@ -347,32 +347,59 @@ fn check_systemd_unit() -> Check {
     if !has_systemctl() {
         return Check::new("systemd 单元", Level::Skip, "这台机器上没有 systemctl");
     }
-    let unit_exists = Path::new(UNIT_PATH).exists();
-    let enabled = systemctl_says(&["is-enabled", "sbx"]);
-    let active = systemctl_says(&["is-active", "sbx"]);
-
-    match (unit_exists, enabled.as_deref(), active.as_deref()) {
-        (false, _, _) => Check::new(
+    if !Path::new(UNIT_PATH).exists() {
+        return Check::new(
             "systemd 单元",
             Level::Warn,
             format!("{UNIT_PATH} 不存在(手动跑 sbx daemon 也行,但开机不会自启)"),
-        ),
-        (true, Some("enabled"), Some("active")) => {
-            Check::new("systemd 单元", Level::Ok, format!("已启用且运行中 {UNIT_PATH}"))
+        );
+    }
+    let enabled = systemctl_says(&["is-enabled", "sbx"]);
+    let active = systemctl_says(&["is-active", "sbx"]);
+    let (level, detail) = service_verdict("sbx", UNIT_PATH, enabled.as_deref(), active.as_deref());
+    Check::new("systemd 单元", level, detail)
+}
+
+/// `is-enabled` / `is-active` 的组合 → 结论。**纯函数**,不碰进程也不碰文件系统。
+///
+/// 抽出来的唯一理由是**让这五个分支能被测到**。它原来埋在两个各自 shell 出去的
+/// 函数里,一条测试都没有 —— 而它恰恰是 doctor 唯一会「说错话」的地方:
+/// 判错了就会把一台重启后再也不上线的机器报成全绿。
+///
+/// `unit` 是 systemctl 的单元名(`sbx` / `sbx-agent`),**只**用来拼给人照抄的命令;
+/// `ctx` 是「这东西在哪」(unit 路径 / 二进制路径),只出现在需要它的分支里。
+/// 两个参数分开传是因为两个调用方的 unit 名与路径不同名 —— 拄错一个,
+/// 人照着命令去 enable 的就是另一个服务。
+fn service_verdict(
+    unit: &str,
+    ctx: &str,
+    enabled: Option<&str>,
+    active: Option<&str>,
+) -> (Level, String) {
+    match (enabled, active) {
+        (Some("enabled"), Some("active")) => (Level::Ok, format!("{ctx},已启用且运行中")),
+        (Some("enabled"), Some(s)) => {
+            (Level::Warn, format!("已启用但当前 {s} —— systemctl status {unit} 看原因"))
         }
-        (true, Some("enabled"), Some(s)) => Check::new(
-            "systemd 单元",
+        // **这一条必须单独说。** 它长得最像「一切正常」—— 服务就在跑,
+        // 不看 is-enabled 的话这一项是全绿的 —— 而那台机器重启之后就再也不回来了,
+        // 现场只能看到一盏灭掉的灯,完全看不出跟开机自启有关。
+        // 命令只给 `enable` 不给 `--now`:它已经在跑了,多一个 `--now`
+        // 会让人以为还得重启一次。
+        (Some(e), Some("active")) => (
             Level::Warn,
-            format!("已启用但当前 {s} —— systemctl status sbx 看原因"),
+            format!("在跑但 is-enabled={e} —— 这台机器重启后不会自动上线(systemctl enable {unit})"),
         ),
-        (true, Some(e), Some(s)) => Check::new(
-            "systemd 单元",
+        (Some(e), Some(s)) => (
             Level::Warn,
-            format!("{UNIT_PATH} 在,但 is-enabled={e} is-active={s}(systemctl enable --now sbx)"),
+            format!("{ctx},但 is-enabled={e} is-active={s}(systemctl enable --now {unit})"),
         ),
-        (true, _, _) => {
-            Check::new("systemd 单元", Level::Warn, format!("{UNIT_PATH} 在,但问不出状态"))
-        }
+        // 单元在、systemctl 也在,却问不出状态 —— 那本身就是个可疑的信号,
+        // 不能当成 Skip 放过去。
+        _ => (
+            Level::Warn,
+            format!("{ctx},但问不出状态(systemctl is-enabled/is-active {unit} 都没输出)"),
+        ),
     }
 }
 
@@ -526,10 +553,10 @@ fn check_telegram(cfg: &Config) -> Check {
 /// install.sh 支持在同一台机器上同时装主控和 agent,所以这台机器上**可能**有。
 /// 没有就整条跳过 —— 绝大多数主控机上不该有 agent,报「缺失」是误导。
 ///
-/// **`is-enabled` 和 `is-active` 都要看,和主控那一项一样。** 只看 `is-active` 的话,
-/// 一台「在跑但没设开机自启」的 agent 在这里是全绿的 —— 而那台机器重启之后就再也
-/// 不上线,主控那边只显示一盏灭掉的灯,完全看不出跟开机自启有关。这是真实踩过的
-/// 一类故障,而 doctor 存在的意义正是在它变成故障之前说出来。
+/// **`is-enabled` 与 `is-active` 的判定走 `service_verdict`,与主控那一项是同一份代码。**
+/// 只看 `is-active` 的话,一台「在跑但没设开机自启」的 agent 在这里是全绿的 —— 而那台
+/// 机器重启之后就再也不上线,主控那边只显示一盏灭掉的灯,完全看不出跟开机自启有关。
+/// 这是真实踩过的一类故障,而 doctor 存在的意义正是在它变成故障之前说出来。
 fn check_colocated_agent() -> Check {
     let unit = "/etc/systemd/system/sbx-agent.service";
     let bin = "/usr/local/bin/sbx-agent";
@@ -546,32 +573,15 @@ fn check_colocated_agent() -> Check {
             format!("已安装 {bin},但这台机器上没有 systemctl,状态未知"),
         );
     }
-    let enabled = systemctl_says(&["is-enabled", "sbx-agent"]).unwrap_or_else(|| "?".into());
-    let active = systemctl_says(&["is-active", "sbx-agent"]).unwrap_or_else(|| "?".into());
-    match (enabled.as_str(), active.as_str()) {
-        ("enabled", "active") => {
-            Check::new("同机 agent", Level::Ok, format!("已安装 {bin},已启用且运行中"))
-        }
-        ("enabled", s) => Check::new(
-            "同机 agent",
-            Level::Warn,
-            format!("已启用但当前 {s} —— systemctl status sbx-agent 看原因"),
-        ),
-        (e, "active") => Check::new(
-            "同机 agent",
-            Level::Warn,
-            format!(
-                "在跑但 is-enabled={e} —— 这台机器重启后不会自动上线(systemctl enable sbx-agent)"
-            ),
-        ),
-        (e, s) => Check::new(
-            "同机 agent",
-            Level::Warn,
-            format!(
-                "已安装 {bin},但 is-enabled={e} is-active={s}(systemctl enable --now sbx-agent)"
-            ),
-        ),
-    }
+    let enabled = systemctl_says(&["is-enabled", "sbx-agent"]);
+    let active = systemctl_says(&["is-active", "sbx-agent"]);
+    let (level, detail) = service_verdict(
+        "sbx-agent",
+        &format!("已安装 {bin}"),
+        enabled.as_deref(),
+        active.as_deref(),
+    );
+    Check::new("同机 agent", level, detail)
 }
 
 #[cfg(test)]
@@ -762,6 +772,89 @@ mod tests {
         cfg2.cluster.listen = format!("127.0.0.1:{port}");
         let chk2 = check_cluster_listen(&cfg2).await;
         assert_eq!(chk2.level, Level::Warn, "连不上是 WARN 不是 ERR");
+    }
+
+    /// **只有 enabled + active 是绿的。**
+    ///
+    /// 这段判定原来埋在两个各自 shell 出去的函数里,一条测试都没有 —— 而它恰恰是
+    /// doctor 唯一会「说错话」的地方。表驱动跑完全部组合:多一个绿的就是一台
+    /// 被报成正常的坏机器。
+    #[test]
+    fn only_enabled_and_active_is_green() {
+        let cases: &[(Option<&str>, Option<&str>, Level)] = &[
+            (Some("enabled"), Some("active"), Level::Ok),
+            (Some("enabled"), Some("inactive"), Level::Warn),
+            (Some("enabled"), Some("failed"), Level::Warn),
+            (Some("disabled"), Some("active"), Level::Warn),
+            (Some("static"), Some("active"), Level::Warn),
+            (Some("disabled"), Some("inactive"), Level::Warn),
+            (None, Some("active"), Level::Warn),
+            (Some("enabled"), None, Level::Warn),
+            (None, None, Level::Warn),
+        ];
+        for (e, a, want) in cases {
+            let (level, detail) = service_verdict("sbx", "/x/sbx.service", *e, *a);
+            assert_eq!(level, *want, "is-enabled={e:?} is-active={a:?} → {detail}");
+        }
+    }
+
+    /// **在跑但没 enable 要明说「重启后不会回来」。**
+    ///
+    /// 这是最难发现的一种:现在一切正常,重启之后静默消失。只说
+    /// 「is-enabled=disabled」不够 —— 那是个事实,不是个后果。
+    ///
+    /// 命令只能是 `enable`,**不能带 `--now`**:它已经在跑了,
+    /// 多一个 `--now` 会让人以为还得重启一次服务。
+    #[test]
+    fn running_but_not_enabled_warns_about_the_next_reboot() {
+        let (level, detail) = service_verdict(
+            "sbx-agent",
+            "已安装 /usr/local/bin/sbx-agent",
+            Some("disabled"),
+            Some("active"),
+        );
+        assert_eq!(level, Level::Warn);
+        assert!(detail.contains("重启"), "要说出后果而不是只报状态:{detail}");
+        assert!(detail.contains("systemctl enable sbx-agent"), "要给能照抄的命令:{detail}");
+        assert!(!detail.contains("--now"), "已经在跑了,不该再让人 `--now`:{detail}");
+    }
+
+    /// 单元在、systemctl 也在,却问不出状态 —— 那本身就可疑,不能当正常放过。
+    /// (真正该 Skip 的是「这台机器没有 systemctl」,那一层在调用方里就返回了。)
+    #[test]
+    fn an_unanswerable_state_is_a_warning_not_a_pass() {
+        let (level, detail) = service_verdict("sbx", "/x/sbx.service", None, None);
+        assert_eq!(level, Level::Warn);
+        assert!(detail.contains("问不出状态"), "{detail}");
+    }
+
+    /// **提示里的单元名必须是问的那个。**
+    ///
+    /// 两个调用方只差一个 `-agent` 后缀,而这种近乎拷贝的代码最容易出的错就是
+    /// 把命令里的单元名拄成另一个 —— 人照着跑完以为修好了,实际 enable 的是别的服务。
+    /// 它不会报错,只会让人下次重启时再碰一次同一个故障。
+    #[test]
+    fn the_hint_names_the_unit_it_was_asked_about() {
+        for unit in ["sbx", "sbx-agent"] {
+            for (e, a) in [
+                (Some("enabled"), Some("failed")),
+                (Some("disabled"), Some("active")),
+                (Some("disabled"), Some("inactive")),
+                (None, None),
+            ] {
+                let (_, detail) = service_verdict(unit, "位置", e, a);
+                assert!(
+                    detail.contains(unit),
+                    "{unit} 的结论里没提到它自己(is-enabled={e:?} is-active={a:?}):{detail}"
+                );
+                if unit == "sbx" {
+                    assert!(
+                        !detail.contains("sbx-agent"),
+                        "问的是 sbx,提示里却出现了 sbx-agent:{detail}"
+                    );
+                }
+            }
+        }
     }
 
     /// Telegram 开着却没填 token 是 ERR:bot 起不来,而通知会**静默**地一条都不发。
