@@ -49,6 +49,12 @@ pub struct AgentRow {
     /// 这批指标是哪一刻的。少了它,一台离线三天的机器会一直显示三天前那个
     /// CPU 数字,看起来和在线的机器毫无区别。
     pub sysinfo_at: Option<i64>,
+    /// 最后一次心跳的时刻。`None` = **从来没连上过**(与「连过又断了」是两回事:
+    /// 前者通常是 token 或防火墙,后者是机器/网络,排查方向完全不同)。
+    ///
+    /// 表里不给它列 —— 那张表已经在抢列宽了。它进摘要行:「离线」是个红点就够了,
+    /// 而「离线多久」才是决定要不要去看那台机器的信息,红点自己说不出来。
+    pub last_seen: Option<i64>,
 }
 
 impl AgentRow {
@@ -626,6 +632,7 @@ pub async fn load_agents(
                 load1: r.load1,
                 uptime_secs: r.uptime_secs,
                 sysinfo_at: r.sysinfo_at,
+                last_seen: r.last_seen,
             }
         })
         .collect();
@@ -963,6 +970,7 @@ mod tests {
             load1: None,
             uptime_secs: None,
             sysinfo_at: None,
+            last_seen: None,
         };
         assert_eq!(a.quota_ratio(), None, "不限流量时不该有比例(否则会画出 0% 的条)");
         a.nic_quota_bytes = Some(0);
@@ -1023,6 +1031,7 @@ mod tests {
             load1: None,
             uptime_secs: None,
             sysinfo_at: None,
+            last_seen: None,
         }
     }
 

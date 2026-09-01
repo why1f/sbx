@@ -102,7 +102,7 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
     let Authenticated { agent_id, hello, hello_id } = hello;
 
     // ── 登记(驱逐同 id 旧连接,§4.1)──
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
     let registered = state.registry.lock().await.register(agent_id, tx);
     if registered.evicted_previous {
         // 正常现象,不写 agent_events(§4.1),但值得留一条 debug:
@@ -110,6 +110,40 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
         tracing::debug!(agent_id, "同 agent 的新连接驱逐了旧连接");
     }
 
+    let loop_result =
+        serve_registered(sink, &mut stream, rx, agent_id, hello, hello_id, &state).await;
+
+    // ── 清理 ──
+    //
+    // **必须无条件执行。** 早先这一段和上面那些 `?` 在同一个函数里,于是
+    // `load_revisions` / `mark_online` / 发 ack 任一失败都会带着一条**已经登记**的
+    // 连接直接 return:registry 里留下一个接收端已 drop 的幽灵条目
+    // (`is_online()` 是 true、`send()` 却永远 false),`mark_offline` 不执行,
+    // 挂在这台 agent 上的 pending RPC 也不取消、只能干等 30 秒超时。
+    // 它会在 agent 下次重连时被 `register` 驱逐掉,所以能自愈 —— 但在那之前
+    // 仪表盘的在线数是虚高的,而这种「数字不对但没人报错」最难查。
+    //
+    // 拆成两个函数就是为了让这件事由**结构**保证,而不是靠每次改动都记得
+    // 「别在这中间加 `?`」。
+    cleanup_connection(&state, agent_id, registered.epoch).await?;
+    tracing::info!(agent_id, "agent 断开");
+    loop_result
+}
+
+/// 登记之后的全部工作:补齐 revision、回 ack、跑收发循环。
+///
+/// **它怎么失败都不影响清理** —— 调用方拿到 `Result` 之后才走清理路径(见 `serve`)。
+/// 这里可以放心用 `?`,那正是把它拆出来的目的。
+#[allow(clippy::too_many_arguments)]
+async fn serve_registered(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    stream: &mut futures_util::stream::SplitStream<WebSocket>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Envelope>,
+    agent_id: i64,
+    hello: AgentHello,
+    hello_id: String,
+    state: &ServerState,
+) -> Result<()> {
     let now = chrono::Local::now().timestamp();
     let db_state = load_revisions(&state.pool, agent_id).await?;
     mark_online(&state.pool, agent_id, &hello, now).await?;
@@ -169,27 +203,34 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
         }
     });
 
-    let loop_result = recv_loop(&mut stream, agent_id, &state).await;
-
-    // ── 清理 ──
+    let loop_result = recv_loop(stream, agent_id, state).await;
     catchup.abort(); // 连接断了,补齐没意义了
     send_task.abort();
+    loop_result
+}
+
+/// 一条连接的收尾:注销、取消它的 pending RPC、标离线。
+///
+/// **注销排在最前面,而且它的成败不依赖数据库。** 顺序反过来的话,一次
+/// `mark_offline` 失败(磁盘忙、库被关掉)会让 registry 里留下一个幽灵条目,
+/// 而那比「状态字段没更新」难查得多:状态字段下一次握手就会被改对,
+/// 幽灵条目却会让仪表盘的在线数一直虚高。
+async fn cleanup_connection(state: &ServerState, agent_id: i64, epoch: u64) -> Result<()> {
     // 带上自己的 epoch:若这条连接已被更新的连接驱逐,这次注销会被忽略,
     // 不会把新连接踢下线(registry 的 stale-unregister 测试覆盖了这条)。
-    let still_mine = state.registry.lock().await.unregister(agent_id, registered.epoch);
-    if still_mine {
-        // 这条 agent 上还挂着的 pending RPC 立刻失败,不必干等 30 秒超时。
-        //
-        // **必须在 still_mine 里面。** 若这条连接已被更新的连接驱逐,
-        // cancel_agent 是按 agent_id 清的,会把新连接正在等的 RPC 一起打掉。
-        let cancelled = state.rpc.cancel_agent(agent_id).await;
-        if cancelled > 0 {
-            tracing::debug!(agent_id, cancelled, "断开时取消了 pending RPC");
-        }
-        mark_offline(&state.pool, agent_id, chrono::Local::now().timestamp()).await?;
+    let still_mine = state.registry.lock().await.unregister(agent_id, epoch);
+    if !still_mine {
+        return Ok(());
     }
-    tracing::info!(agent_id, "agent 断开");
-    loop_result
+    // 这条 agent 上还挂着的 pending RPC 立刻失败,不必干等 30 秒超时。
+    //
+    // **必须在 still_mine 里面。** 若这条连接已被更新的连接驱逐,
+    // cancel_agent 是按 agent_id 清的,会把新连接正在等的 RPC 一起打掉。
+    let cancelled = state.rpc.cancel_agent(agent_id).await;
+    if cancelled > 0 {
+        tracing::debug!(agent_id, cancelled, "断开时取消了 pending RPC");
+    }
+    mark_offline(&state.pool, agent_id, chrono::Local::now().timestamp()).await
 }
 
 /// 握手后补齐 agent 错过的变更(§4.1)。
@@ -683,6 +724,19 @@ mod tests {
         crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap()
     }
 
+    /// 只为直接调 `cleanup_connection` 这类函数用:不起监听、不接真 socket。
+    fn state_with(pool: SqlitePool) -> ServerState {
+        ServerState {
+            pool,
+            registry: Arc::new(Mutex::new(Registry::new())),
+            rpc: Arc::new(crate::cluster::Rpc::new()),
+            speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            heartbeat_secs: 10,
+            report_interval_secs: 30,
+            idle_limit: idle_limit(10),
+        }
+    }
+
     fn hello(token: &str) -> AgentHello {
         AgentHello {
             token: token.into(),
@@ -727,6 +781,53 @@ mod tests {
         let (id, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
         p.close().await; // 池关掉 = 之后每次查询都失败
         assert!(agent_exists(&p, id).await, "查不动库时不该把 agent 判死");
+    }
+
+    /// **清理必须先注销,再动数据库。**
+    ///
+    /// 顺序反过来的话,一次 `mark_offline` 失败(磁盘忙、库被关掉)会让 registry 里
+    /// 留下一个幽灵条目:`is_online()` 是 true、`send()` 却永远 false。那比
+    /// 「状态字段没更新」难查得多 —— 状态字段下一次握手就会被改对,而幽灵条目会让
+    /// 仪表盘的在线数一直虚高,直到那台 agent 重连把它驱逐掉。
+    #[tokio::test]
+    async fn cleanup_unregisters_even_when_the_database_is_gone() {
+        let p = pool().await;
+        let (id, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let state = state_with(p.clone());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let epoch = state.registry.lock().await.register(id, tx).epoch;
+        assert!(state.registry.lock().await.is_online(id));
+
+        p.close().await; // 之后每次查询都失败
+        let err = cleanup_connection(&state, id, epoch).await;
+        assert!(err.is_err(), "标离线该报错报出来,不该悄悄吞掉");
+        assert!(
+            !state.registry.lock().await.is_online(id),
+            "库挂了也必须先把连接注销掉,不能留幽灵条目"
+        );
+    }
+
+    /// 陈旧的清理**不能**把已经接上的新连接踢掉。
+    ///
+    /// 与 registry 的 stale-unregister 测试是同一条性质,但守的是 `cleanup_connection`
+    /// 这一层:它除了注销还会 `cancel_agent`,而那是按 agent_id 清的 ——
+    /// 漏掉 epoch 判断就会把新连接正在等的 RPC 一起打掉。
+    #[tokio::test]
+    async fn a_stale_cleanup_leaves_the_live_connection_alone() {
+        let p = pool().await;
+        let (id, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let state = state_with(p.clone());
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let old = state.registry.lock().await.register(id, tx1).epoch;
+        state.registry.lock().await.register(id, tx2); // 新连接驱逐旧的
+        mark_online(&p, id, &hello("t"), 100).await.unwrap();
+
+        cleanup_connection(&state, id, old).await.unwrap();
+
+        assert!(state.registry.lock().await.is_online(id), "新连接必须还在线");
+        let a = crate::db::agent_repo::get(&p, id).await.unwrap().unwrap();
+        assert!(a.is_online(), "陈旧的清理不该把状态改成离线");
     }
 
     #[tokio::test]

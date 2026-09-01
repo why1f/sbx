@@ -525,6 +525,11 @@ fn check_telegram(cfg: &Config) -> Check {
 
 /// install.sh 支持在同一台机器上同时装主控和 agent,所以这台机器上**可能**有。
 /// 没有就整条跳过 —— 绝大多数主控机上不该有 agent,报「缺失」是误导。
+///
+/// **`is-enabled` 和 `is-active` 都要看,和主控那一项一样。** 只看 `is-active` 的话,
+/// 一台「在跑但没设开机自启」的 agent 在这里是全绿的 —— 而那台机器重启之后就再也
+/// 不上线,主控那边只显示一盏灭掉的灯,完全看不出跟开机自启有关。这是真实踩过的
+/// 一类故障,而 doctor 存在的意义正是在它变成故障之前说出来。
 fn check_colocated_agent() -> Check {
     let unit = "/etc/systemd/system/sbx-agent.service";
     let bin = "/usr/local/bin/sbx-agent";
@@ -532,13 +537,41 @@ fn check_colocated_agent() -> Check {
     if !ue && !be {
         return Check::new("同机 agent", Level::Skip, "未安装(主控机上通常也不需要)");
     }
-    let active = if has_systemctl() {
-        systemctl_says(&["is-active", "sbx-agent"]).unwrap_or_else(|| "?".into())
-    } else {
-        "?".into()
-    };
-    let level = if active == "active" { Level::Ok } else { Level::Warn };
-    Check::new("同机 agent", level, format!("已安装 {bin},服务 {active}"))
+    if !has_systemctl() {
+        // 没有 systemctl 就问不出这两个状态。**不报 Warn** —— OpenRC 的机器上
+        // 「查不到」不等于「配错了」,而一条查不出所以然的 Warn 只会教人忽略退出码。
+        return Check::new(
+            "同机 agent",
+            Level::Skip,
+            format!("已安装 {bin},但这台机器上没有 systemctl,状态未知"),
+        );
+    }
+    let enabled = systemctl_says(&["is-enabled", "sbx-agent"]).unwrap_or_else(|| "?".into());
+    let active = systemctl_says(&["is-active", "sbx-agent"]).unwrap_or_else(|| "?".into());
+    match (enabled.as_str(), active.as_str()) {
+        ("enabled", "active") => {
+            Check::new("同机 agent", Level::Ok, format!("已安装 {bin},已启用且运行中"))
+        }
+        ("enabled", s) => Check::new(
+            "同机 agent",
+            Level::Warn,
+            format!("已启用但当前 {s} —— systemctl status sbx-agent 看原因"),
+        ),
+        (e, "active") => Check::new(
+            "同机 agent",
+            Level::Warn,
+            format!(
+                "在跑但 is-enabled={e} —— 这台机器重启后不会自动上线(systemctl enable sbx-agent)"
+            ),
+        ),
+        (e, s) => Check::new(
+            "同机 agent",
+            Level::Warn,
+            format!(
+                "已安装 {bin},但 is-enabled={e} is-active={s}(systemctl enable --now sbx-agent)"
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]

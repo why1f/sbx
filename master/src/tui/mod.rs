@@ -233,7 +233,7 @@ impl App {
                 // token_prefix 有实际用途:主控日志里认证失败只记前 8 位
                 // (§8.1 不回显完整 token),对不上号时靠它把日志和某一行连起来。
                 Some(a) => vec![format!(
-                    "  选中: {}  token: {}…  节点: {} 个  状态: {}  网卡: {}  出站: {}{}",
+                    "  选中: {}  token: {}…  节点: {} 个  状态: {}{}  网卡: {}  出站: {}{}",
                     a.name,
                     a.token_prefix,
                     a.node_count,
@@ -242,6 +242,7 @@ impl App {
                         "offline" => "● 离线",
                         _ => "○ 从未连接",
                     },
+                    offline_for(a, chrono::Local::now().timestamp()),
                     a.nic_accounting_mode.short(),
                     a.outbound.label(),
                     if self.pending_cmds > 0 {
@@ -1331,6 +1332,28 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
     )
 }
 
+/// 摘要行里跟在「● 离线」后面的那一小段:离线多久。
+///
+/// **为什么值得占这几个字。** 表里那个红点只说「现在连不上」,而决定要不要动身
+/// 去查那台机器的是**多久**:离线 3 分钟大概是它自己在重连(agent 退避上限 60 秒),
+/// 离线 3 天就是机器或防火墙的事了。以前这个信息只在库里,排查时得手工去
+/// `SELECT last_seen`,而那正是最不该需要开一个 sqlite 会话的时刻。
+///
+/// 三种情况都返回空串,各有理由:
+///   * 在线 —— `last_seen` 约等于现在,写出来是噪声;
+///   * `None`(从没连上过)—— 状态那一格已经写着「○ 从未连接」,再说一遍是重复。
+///     而且它和「连过又断了」是两回事:前者通常是 token 或防火墙,后者是机器/网络;
+///   * `last_seen` 在未来 —— 时钟回拨或库被手改过。宁可不说,也不要显示「离线 -5 天」。
+fn offline_for(a: &data::AgentRow, now: i64) -> String {
+    if a.status == "online" {
+        return String::new();
+    }
+    match a.last_seen.map(|t| now - t) {
+        Some(d) if d > 0 => format!(" {}", pages::uptime_label(d)),
+        _ => String::new(),
+    }
+}
+
 /// 接入命令的信息框:命令自己一行,底下是说明,`y` 复制整条。
 ///
 /// 命令**单独占一行**放在最上面,而不是混在说明里:它是这个框存在的唯一理由,
@@ -2393,6 +2416,54 @@ mod tests {
         }
     }
 
+    /// **摘要行要说清「离线多久」。**
+    ///
+    /// 表里只有一个红点,而决定要不要动身去查那台机器的是时长:离线 3 分钟大概是
+    /// 它自己在重连(agent 退避上限 60 秒),离线 3 天就是机器或防火墙的事。
+    /// 这个信息以前只在库里,排查时得手工 `SELECT last_seen` —— 而那正是最不该
+    /// 需要开一个 sqlite 会话的时刻。
+    #[tokio::test]
+    async fn the_agent_ops_line_says_how_long_it_has_been_offline() {
+        let now = chrono::Local::now().timestamp();
+        let line = |a: data::AgentRow| {
+            let mut app = app();
+            app.page = Page::Agents;
+            app.agents = vec![a];
+            app.ops_lines().join("\n")
+        };
+
+        let off = data::AgentRow {
+            status: "offline".into(),
+            last_seen: Some(now - 3 * 86_400 - 5 * 3600),
+            ..stub_agent(1)
+        };
+        let out = line(off);
+        assert!(out.contains("● 离线 3 天 5 小时"), "离线时长要跟在状态后面:{out}");
+
+        // 在线的机器不写时长:`last_seen` 约等于现在,写出来是噪声。
+        let on =
+            data::AgentRow { status: "online".into(), last_seen: Some(now - 3), ..stub_agent(1) };
+        let out = line(on);
+        assert!(out.contains("● 在线"), "{out}");
+        assert!(!out.contains("分"), "在线不该带时长:{out}");
+
+        // 从没连上过:状态那一格已经写着「从未连接」,不再重复一遍。
+        // 它和「连过又断了」是两回事 —— 前者查 token/防火墙,后者查机器/网络。
+        let never = data::AgentRow { status: "never".into(), last_seen: None, ..stub_agent(1) };
+        let out = line(never);
+        assert!(out.contains("○ 从未连接"), "{out}");
+        assert!(!out.contains("天"), "没连过就没有「多久」可说:{out}");
+
+        // 时钟回拨或库被手改过时不能显示「离线 -5 天」,宁可不说。
+        let future = data::AgentRow {
+            status: "offline".into(),
+            last_seen: Some(now + 9999),
+            ..stub_agent(1)
+        };
+        let out = line(future);
+        assert!(!out.contains('-'), "未来的 last_seen 不该算出负数时长:{out}");
+    }
+
     /// 「操作」摘要行要带上那几件**列里放不下、又必须看得见**的事。
     ///
     /// 这三条原来盯的是「详情」面板。那个面板和摘要行前半段逐字重复,
@@ -2791,6 +2862,7 @@ mod tests {
             load1: None,
             uptime_secs: None,
             sysinfo_at: None,
+            last_seen: None,
         }
     }
 

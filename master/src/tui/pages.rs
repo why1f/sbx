@@ -674,7 +674,11 @@ fn host_metrics(a: &AgentRow, now: i64, width: usize) -> String {
 }
 
 /// 秒 → 「3 天 4 小时」。只给两级 —— 「3 天 4 小时 12 分 7 秒」没人会读到最后。
-fn uptime_label(secs: i64) -> String {
+///
+/// `pub(super)` 是给服务管理页的摘要行用的:那里要说「离线多久」,和这里说
+/// 「开机多久」是同一种量,共用一份写法才不会出现「一处 3 天 4 小时、
+/// 另一处 3d4h」这种同一屏里两种格式。
+pub(super) fn uptime_label(secs: i64) -> String {
     let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
     if d > 0 {
         format!("{d} 天 {h} 小时")
@@ -1764,6 +1768,7 @@ mod tests {
             load1: Some(0.62),
             uptime_secs: Some(86_400 * 3 + 3600 * 4),
             sysinfo_at: Some(NOW - 5),
+            last_seen: None,
         }
     }
 

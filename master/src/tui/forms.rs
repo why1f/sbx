@@ -739,6 +739,7 @@ mod preview {
             load1: None,
             uptime_secs: None,
             sysinfo_at: None,
+            last_seen: None,
         }];
         let node = NodeRow {
             id: 1,
