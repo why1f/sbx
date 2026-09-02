@@ -201,3 +201,36 @@ func TestCloseIsIdempotent(t *testing.T) {
 		t.Errorf("重复 Close 应当无害,得到: %v", err)
 	}
 }
+
+// **同一份配置在自己跑着的时候也得能 Check。**
+//
+// 这是主控 `[K]` 的全部前提。它发给 agent 的就是**即将下发的那一份字节**,
+// 而那份配置里的 inbound 端口此刻正被这个 agent 自己占着。
+//
+// 与上面 `TestCheckDoesNotTouchRunningInstance` 的分工(两条都要,别当重复删掉):
+// 那一条 Check 的是**另一个空端口**上的配置,验的是「Check 不真的监听」与
+// 「不搞坏正在跑的那个」。它盖不到本条:假如 `box.New()` 会预绑端口,
+// 那一条仍然会过(因为 other 是空的),而 `[K]` 在生产里会永远报
+// address in use —— 还是最难察觉的那种:报的错看起来像「你的配置有问题」,
+// 人会去改一份没病的配置。
+//
+// 写这条之前,「Check 不占端口」只是读代码得出的推断(它建完立即 Close,
+// 没 Start 过)。推断对了,但§7.4 那组测试恰好证明了推断在这件事上不可靠:
+// 「先起新的再停旧的」纸面上更安全,实际直接 EADDRINUSE。
+func TestCheckWorksWhileTheSameConfigIsRunning(t *testing.T) {
+	port := freePort(t)
+	c := New(tracker.New())
+	t.Cleanup(func() { _ = c.Close() })
+
+	if err := c.Apply(configOn(port)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	// 端口真的被占上了才算造好了场景 —— 否则这条会因为 box 没起来而假通过。
+	waitPort(t, port, true)
+
+	if err := c.Check(configOn(port)); err != nil {
+		t.Fatalf("Check 自己正在跑的配置时报错 —— [K] 在生产里会永远失败: %v", err)
+	}
+	// 且正在跑的实例没被动过。
+	waitPort(t, port, true)
+}
