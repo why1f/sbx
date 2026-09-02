@@ -793,6 +793,36 @@ fn which(cmd: &str) -> bool {
 ///
 /// sing-box 接受 `//`、`#`、`/* */` 和尾随逗号(实测确认过),所以这份带注释的
 /// 模板原样存下去也能过 —— 不需要让人先把注释删干净。
+/// 模板里带的示例 —— 独立成常量，用**原始字符串**：
+/// JSON 里四处都是大括号，塞进 `format!` 的字符串等于每对都要转义成 `{{}}`，
+/// 读的人是看不出原文的。原始字符串里它们就是自己。
+const CUSTOM_EXAMPLE: &str = r#"/*
+{
+  "dns": { "servers": [{ "type": "local", "tag": "local" }] },
+  // 1.14 起远程 rule-set 的下载通道走顶层 http_clients(旧的 download_detour 已弃用)
+  "http_clients": [{ "tag": "fetch", "detour": "direct" }],
+  "outbounds": [
+    { "type": "direct", "tag": "direct-v6",
+      "domain_resolver": { "server": "local", "strategy": "ipv6_only" } }
+  ],
+  "route": {
+    "default_http_client": "fetch",
+    "rule_set": [
+      { "tag": ["ai"], "type": "remote", "format": "binary",
+        "url": "https://github.com/DustinWin/ruleset_geodata/releases/download/sing-box-ruleset/{tag}.srs",
+        "http_client": "fetch" }
+    ],
+    "rules": [
+      { "rule_set": ["ai"], "action": "route", "outbound": "direct-v6" },
+      { "protocol": "bittorrent", "action": "reject" }
+    ],
+    "final": "direct"
+  },
+  // 不开这个,每次 config.apply 都会重下一遍全部规则集。路径缺省在 ~/.cache/sing-box
+  "experimental": { "cache_file": { "enabled": true } }
+}
+*/"#;
+
 async fn custom_config_template(pool: &SqlitePool, id: i64, name: &str) -> Result<String> {
     let effective = crate::service::build_agent_config(pool, id).await?;
     // 当前的出站策略只用一行交代。它值得占这一行,是因为人在下面写
@@ -813,9 +843,14 @@ async fn custom_config_template(pool: &SqlitePool, id: i64, name: &str) -> Resul
 // outbounds 是追加,tag 不能叫 direct。inbounds 归主控(记账靠 inbound tag),在「节点」页加减。
 // 注释与尾随逗号都行;清空存盘 = 恢复默认;存完按【K】让它自己的 sing-box 验一遍。
 // {now}
+//
+// 下面是个例子:AI 站点走 IPv6、屏蔽 BT。要用就把 /* 和 */ 两行删掉,
+// 并把最后那个空的 {{}} 一并删掉;不用就整段删掉。
+{example}
 {{
 }}
-"
+",
+        example = CUSTOM_EXAMPLE
     ))
 }
 
