@@ -130,12 +130,14 @@ sbx --config /etc/sbx/config.toml tui
 
 - `[c]` 显示主控现场组装、实际下发的完整配置，**包含原始凭据且不脱敏**；不要截图或外传。
 - `[o]` 按 agent 设置自动、优先 IPv4、优先 IPv6、仅 IPv4、仅 IPv6。
-- `[C]` 拉编辑器改这台的**自定义片段**：只能写 `outbounds` / `route` / `dns` 三个顶层字段。
+- `[C]` 拉编辑器改这台的**自定义片段**：只能写 `outbounds` / `route` / `dns` / `http_clients` / `experimental`。
   编辑器优先用 `$VISUAL` / `$EDITOR`；都没设就按 `nano` → `micro` → `nvim` → `vim` → `vi`
   挑一个这台机器上真装了的。落到 vi 族时会先把退出方法写出来（`:wq` / `:q!`）再进去。
   注释（`//` `#` `/* */`）与尾随逗号都行，而且**原文存进库里**，下次打开还在。
   全部清空存盘 = 恢复默认。
   **`inbounds` 不在内** —— 记账键是（用户, inbound tag），改了 tag 流量会静默停止记账。
+  `experimental` 里不能写 `clash_api` / `v2ray_api`（会在落地机上开管理端口）；`cache_file` 可以，远程 rule-set 靠它缓存。
+  `endpoints`（WireGuard / WARP）用不了 —— agent 只带 `with_quic,with_utls`，没编进 WireGuard。
   自定义里写了 `route.default_domain_resolver` 就等于接管 `[o]`，那时摘要行会标「由自定义配置接管」。
 - `[K]` 把即将下发的那份配置交给**那台机器自己的 sing-box** 试建一次（`config.check`，建完立即关掉，不接管当前实例、不占端口）。
   字段名拼错、`route` 引用了不存在的 outbound tag 这类错只有它能报 —— 主控里没有 sing-box。

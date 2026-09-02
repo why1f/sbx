@@ -795,49 +795,27 @@ fn which(cmd: &str) -> bool {
 /// 模板原样存下去也能过 —— 不需要让人先把注释删干净。
 async fn custom_config_template(pool: &SqlitePool, id: i64, name: &str) -> Result<String> {
     let effective = crate::service::build_agent_config(pool, id).await?;
-    let mut refs = Vec::new();
-    for key in ["outbounds", "route", "dns"] {
-        if let Some(v) = effective.get(key) {
-            let text =
-                serde_json::to_string_pretty(&serde_json::json!({ key: v })).unwrap_or_default();
-            // 只取大括号中间的那几行,拼成一段可直接拄的参考。
-            for line in text.lines().skip(1).take(text.lines().count().saturating_sub(2)) {
-                refs.push(format!("//   {line}"));
-            }
+    // 当前的出站策略只用一行交代。它值得占这一行,是因为人在下面写
+    // `route.default_domain_resolver` 就等于接管它 —— 不说的话那是个静默的意外。
+    let now = match effective
+        .get("route")
+        .and_then(|r| r.get("default_domain_resolver"))
+        .and_then(|d| d.get("strategy"))
+        .and_then(|s| s.as_str())
+    {
+        Some(s) => {
+            format!("【o】出站策略现在是 {s};你写 route.default_domain_resolver 就接管它")
         }
-    }
-    let has_resolver = crate::model::outbound::has_custom_resolver(&effective);
-    let resolver_note = if has_resolver {
-        "//   ↑ 上面那个 default_domain_resolver 来自【o】的出站策略。\n\
-         //     你在下面自己写一个就等于接管它,那时【o】会显示「由自定义配置接管」。"
-    } else {
-        "//   (这台的出站策略是「自动」,所以没有 default_domain_resolver。\n\
-         //    你写了一个也不会和【o】打起来。)"
+        None => "【o】出站策略现在是自动(没写 default_domain_resolver)".to_string(),
     };
     Ok(format!(
-        "// {name} 的自定义 sing-box 片段。只能写这三个顶层字段:
-//   outbounds  —— **追加**到主控那个 direct 后面(tag 不能叫 direct)
-//   route      —— 逐 key 并入,同名字段以这里为准
-//   dns        —— 同上
-//
-// inbounds **不在内**。记账键是 (用户, inbound tag):改了 tag,上报会被当成
-// 「主控没分配过的 (user, tag)」直接丢弃 —— 流量静默停止记账,一句报错都没有。
-// 节点请在「节点」页里加减。
-//
-// 注释(// # /* */)与尾随逗号都行 —— sing-box 自己也接受,而且原文存进库里,
-// 下次打开还在。全部清空存盘 = 恢复默认配置。
-//
-// rule_set 两个坑:远程的要这台 agent 能出网去拉(拉不到会在 config.apply 失败,
-// 而 [K] 的 config.check 验不出来);本地的 path 指的是 **agent 那台机器上**的文件,
-// 而主控没有推文件的机制。
-//
-// 当前生效的等价配置(参考,不用拄):
-{refs}
-{resolver_note}
+        "// {name} 的自定义片段。可写 outbounds / route / dns / http_clients / experimental
+// outbounds 是追加,tag 不能叫 direct。inbounds 归主控(记账靠 inbound tag),在「节点」页加减。
+// 注释与尾随逗号都行;清空存盘 = 恢复默认;存完按【K】让它自己的 sing-box 验一遍。
+// {now}
 {{
 }}
-",
-        refs = if refs.is_empty() { "//   (空)".to_string() } else { refs.join("\n") },
+"
     ))
 }
 

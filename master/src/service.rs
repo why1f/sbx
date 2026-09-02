@@ -326,13 +326,27 @@ pub async fn disabled_users(pool: &SqlitePool) -> Result<Vec<String>> {
 
 // ── 自定义配置片段(§1.2 / 迁移 012)─────────────────────────────
 
-/// 自定义片段**只能**碰这三个顶层 key。
+/// 自定义片段**只能**碰这几个顶层 key。
 ///
 /// `inbounds` 不在这里,而且不是为了「少改点东西」:记账键是 (用户, inbound tag)
 /// (§14)。改一个 tag,`ingest_stats` 会把上报当成「主控没给这个用户分配过的
 /// (user, tag)」**直接丢弃** —— 流量静默停止记账,一句报错都没有。
 /// 那是最坏的一类 bug,所以它得靠代码拦,不靠文档提醒。
-const CUSTOM_ALLOWED_KEYS: &[&str] = &["outbounds", "route", "dns"];
+///
+/// `http_clients` 与 `experimental` 是后来补的,两个都是**远程 rule-set 真跑起来
+/// 就需要**的:
+///   * sing-box 1.14 把下载通道改成了顶层 `http_clients` + `route.default_http_client`,
+///     旧的 `download_detour` 已弃用,而「隐式用默认出站下载」也已弃用 ——
+///     也就是说不写 `http_clients` 就没有不带弃用警告的写法了;
+///   * `experimental.cache_file` 不开的话远程 rule-set 不缓存,而 `config.apply` 每次都
+///     重建 box —— 每改一次配置就重下一次全部规则集,慢且会失败。
+const CUSTOM_ALLOWED_KEYS: &[&str] = &["outbounds", "route", "dns", "http_clients", "experimental"];
+
+/// `experimental` 里这两个子项不行:它们会开一个 HTTP 管理端口。
+///
+/// 与「agent 不开放管理端口,管理面只有 agent 主动连主控的 WebSocket」直接冲突 ——
+/// 而且 clash_api 默认不带鉴权,相当于在落地机上开一个能改路由的匿名接口。
+const CUSTOM_FORBIDDEN_EXPERIMENTAL: &[&str] = &["clash_api", "v2ray_api"];
 
 /// 主控自己组的那个出站 tag。自定义里再出一个同名的,sing-box 会报重复 tag,
 /// 而那句错误看不出是自己写的还是主控加的 —— 所以在这里先拦下来。
@@ -470,7 +484,29 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             );
         }
         if !CUSTOM_ALLOWED_KEYS.contains(&k.as_str()) {
+            // `endpoints` 是真字段,但本仓库的 agent 没编 wireguard。不说清的话
+            // 人会以为是白名单小气,而真相是就算放进去也跑不起来。
+            if k == "endpoints" {
+                anyhow::bail!(
+                    "endpoints 用不了:agent 的 sing-box 只带 with_quic,with_utls 两个 build tag,\
+                     没编进 WireGuard(它会报 `WireGuard is not included in this build`)。\n\
+                     要接 WARP 这类落地,得先给 agent 加 with_wireguard 重新构建"
+                );
+            }
             anyhow::bail!("不允许的顶层字段 `{k}`。只能写:{}", CUSTOM_ALLOWED_KEYS.join(" / "));
+        }
+    }
+    // `experimental` 整体放开了(cache_file 对远程 rule-set 是必需的),
+    // 但不能靠它开管理端口。
+    if let Some(exp) = obj.get("experimental").and_then(|v| v.as_object()) {
+        for bad in CUSTOM_FORBIDDEN_EXPERIMENTAL {
+            if exp.contains_key(*bad) {
+                anyhow::bail!(
+                    "experimental.{bad} 不行 —— 它会在这台机器上开一个 HTTP 管理端口,\
+                     而 agent 的设计是不开管理端口、管理面只走它主动连主控的 WebSocket。\n\
+                     experimental 里用 cache_file 就行(远程 rule-set 靠它缓存)"
+                );
+            }
         }
     }
     if let Some(arr) = obj.get("outbounds").and_then(|v| v.as_array()) {
@@ -507,6 +543,13 @@ fn merge_custom(cfg: &mut serde_json::Value, custom: serde_json::Map<String, ser
                     dst.extend(add.iter().cloned());
                 }
             }
+            // 主控自己不写这两个,直接放进去就行 —— 而且它们是数组/对象两种形状,
+            // 跟着下面那条「逐 key 并入」走会靠一个 fallthrough 担着,很难看出意图。
+            "http_clients" | "experimental" => {
+                root.insert(k, v);
+            }
+            // `route` / `dns` 主控也要往里面写(出站策略、DNS server tag),
+            // 所以逐 key 并入而不是整个替换。
             _ => {
                 let slot = root
                     .entry(k)
@@ -600,21 +643,61 @@ mod tests {
     }
 
     #[test]
-    fn custom_config_only_allows_three_keys() {
+    fn custom_config_only_allows_the_whitelisted_keys() {
         for ok in [
             r#"{ "outbounds": [] }"#,
             r#"{ "route": {} }"#,
             r#"{ "dns": {} }"#,
+            // 1.14 把远程 rule-set 的下载通道改成了顶层 `http_clients`,
+            // 旧的 `download_detour` 已弃用 —— 不放它进来,就没有不带弃用警告的写法。
+            r#"{ "http_clients": [{ "tag": "hc", "detour": "direct" }] }"#,
+            // 不开 cache_file 的话远程 rule-set 不缓存,而 `config.apply` 每次都重建 box
+            // —— 每改一次配置就重下一次全部规则集。
+            r#"{ "experimental": { "cache_file": { "enabled": true } } }"#,
             "",
             "   \n // 只有注释 \n ",
         ] {
             assert!(validate_custom(ok).is_ok(), "该接受:{ok:?}");
         }
-        for bad in [r#"{ "log": {} }"#, r#"{ "experimental": {} }"#, r#"{ "endpoints": [] }"#] {
+        for bad in [r#"{ "log": {} }"#, r#"{ "ntp": {} }"#, r#"{ "certificate": {} }"#] {
             assert!(validate_custom(bad).is_err(), "该拒绝:{bad}");
         }
         // 最外层必须是对象 —— 人很容易直接粘一个 `outbounds` 数组进来。
         assert!(validate_custom("[]").is_err(), "数组该被拒");
+    }
+
+    /// **`experimental` 放进来了,但不能靠它开管理端口。**
+    ///
+    /// `clash_api` 默认不带鉴权,相当于在落地机上开一个能改路由的匿名接口 ——
+    /// 而「agent 不开放管理端口,管理面只有它主动连主控的 WebSocket」是硬约束。
+    /// 报错要同时告诉人 `cache_file` 是可以用的,否则他会以为整个 experimental 都不行。
+    #[test]
+    fn experimental_may_not_open_a_management_port() {
+        for bad in [
+            r#"{ "experimental": { "clash_api": { "external_controller": "127.0.0.1:9090" } } }"#,
+            r#"{ "experimental": { "v2ray_api": { "listen": "127.0.0.1:8080" } } }"#,
+        ] {
+            let e = validate_custom(bad).unwrap_err().to_string();
+            assert!(e.contains("管理端口"), "要说出理由:{e}");
+            assert!(e.contains("cache_file"), "要说清 experimental 里什么能用:{e}");
+        }
+    }
+
+    /// **`endpoints` 要说清是构建里没编 WireGuard,不是白名单小气。**
+    ///
+    /// 它是 sing-box 的真字段(1.11 之后接 WARP 就走它),所以人会写。但 agent 只带
+    /// `with_quic,with_utls` 两个 build tag —— 就算放进去,sing-box 也会报
+    /// `WireGuard is not included in this build`。实测确认过。
+    ///
+    /// 一句「不允许的顶层字段」会让人去想办法绕过白名单(比如手改库),
+    /// 而那条路的尽头是一样的报错。
+    #[test]
+    fn endpoints_explains_the_missing_build_tag() {
+        let e = validate_custom(r#"{ "endpoints": [{ "type": "wireguard" }] }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("WireGuard"), "{e}");
+        assert!(e.contains("with_wireguard"), "要给出真正的出路:{e}");
     }
 
     /// 自定义里再出一个 `direct` 要当场拦住。
@@ -1134,6 +1217,77 @@ mod tests {
         assert!(tags.contains(&"direct") && tags.contains(&"upstream"), "{tags:?}");
         let rule_out = cfg["route"]["rules"][0]["outbound"].as_str().unwrap();
         assert!(tags.contains(&rule_out), "route 引用的 {rule_out} 不在 outbounds 里");
+    }
+
+    /// **人真会写的那种形状:远程 rule-set + http_clients + cache_file。**
+    ///
+    /// 与上一条 golden 的分工:那一条验的是 `outbounds` 追加与 `route` 并入;
+    /// 这一条验的是 **1.14 那套新字段能不能穿过整条链** —— `http_clients` 与
+    /// `experimental` 不走 `route`/`dns` 那条逐 key 并入的路(它们是数组/对象两种形状),
+    /// 而且它们是后来才补进白名单的。
+    ///
+    /// `rule_set.tag` 写成数组 + url 里用 `{tag}` 占位符是 1.14 的写法 ——
+    /// 这个形状也要真 sing-box 点头,光看文档不算。
+    #[tokio::test]
+    async fn a_remote_ruleset_config_matches_its_golden() {
+        let p = pool().await;
+        // 用 vless-ws 而不是 reality:**golden 必须是确定的**。reality 节点的私钥是
+        // 建节点时随机生成的(§9.1),写进 golden 之后下一次跑就对不上了。
+        // 第一版这么写了,表现是 Go 侧报 `invalid private key` —— 正好被
+        // 跨语言那一步拓住了。本条要验的是合并,跟协议无关。
+        let (agent_id, _) = agent_with_node(&p, "vless-ws").await;
+        crate::db::agent_repo::set_custom_config(
+            &p,
+            agent_id,
+            Some(
+                r#"{
+  // 让 AI 站点走 IPv6 出去
+  "dns": { "servers": [{ "type": "local", "tag": "local" }] },
+  "http_clients": [{ "tag": "fetch", "detour": "direct" }],
+  "outbounds": [
+    { "type": "direct", "tag": "direct-v6",
+      "domain_resolver": { "server": "local", "strategy": "ipv6_only" } }
+  ],
+  "route": {
+    "default_http_client": "fetch",
+    "rule_set": [
+      { "tag": ["ai"], "type": "remote", "format": "binary",
+        "url": "https://github.com/DustinWin/ruleset_geodata/releases/download/sing-box-ruleset/{tag}.srs",
+        "http_client": "fetch" }
+    ],
+    "rules": [
+      { "rule_set": ["ai"], "action": "route", "outbound": "direct-v6" }
+    ],
+    "final": "direct",
+  },
+  "experimental": { "cache_file": { "enabled": true, "path": "/var/lib/sbx-agent/cache.db" } },
+}"#,
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cfg = build_agent_config(&p, agent_id).await.unwrap();
+        let pretty = serde_json::to_string_pretty(&cfg).unwrap() + "\n";
+
+        let dir = testdata_dir().join("custom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("remote-ruleset.json");
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if existing.replace("\r\n", "\n") == pretty => {}
+            Ok(_) => {
+                std::fs::write(path.with_extension("json.actual"), &pretty).unwrap();
+                panic!(
+                    "合并结果与 testdata/custom/remote-ruleset.json 不一致。\n\
+                     确认改动是有意的之后,用同目录下的 .actual 覆盖 .json 并提交。"
+                );
+            }
+            Err(_) => std::fs::write(&path, &pretty).unwrap(),
+        }
+
+        // 不靠 golden 的两条:两个新字段真的到位了,而不是被静默丢掉。
+        assert_eq!(cfg["http_clients"][0]["tag"], "fetch", "http_clients 丢了:{cfg}");
+        assert_eq!(cfg["experimental"]["cache_file"]["enabled"], true, "cache_file 丢了:{cfg}");
     }
 
     #[test]

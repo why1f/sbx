@@ -1,0 +1,78 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "local"
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/var/lib/sbx-agent/cache.db"
+    }
+  },
+  "http_clients": [
+    {
+      "detour": "direct",
+      "tag": "fetch"
+    }
+  ],
+  "inbounds": [
+    {
+      "listen": "::",
+      "listen_port": 8443,
+      "tag": "in-1",
+      "transport": {
+        "early_data_header_name": "Sec-WebSocket-Protocol",
+        "max_early_data": 2048,
+        "path": "/vless",
+        "type": "ws"
+      },
+      "type": "vless",
+      "users": []
+    }
+  ],
+  "log": {
+    "level": "warn"
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    },
+    {
+      "domain_resolver": {
+        "server": "local",
+        "strategy": "ipv6_only"
+      },
+      "tag": "direct-v6",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "default_http_client": "fetch",
+    "final": "direct",
+    "rule_set": [
+      {
+        "format": "binary",
+        "http_client": "fetch",
+        "tag": [
+          "ai"
+        ],
+        "type": "remote",
+        "url": "https://github.com/DustinWin/ruleset_geodata/releases/download/sing-box-ruleset/{tag}.srs"
+      }
+    ],
+    "rules": [
+      {
+        "action": "route",
+        "outbound": "direct-v6",
+        "rule_set": [
+          "ai"
+        ]
+      }
+    ]
+  }
+}
