@@ -844,8 +844,10 @@ async fn custom_config_template(pool: &SqlitePool, id: i64, name: &str) -> Resul
         None => "【o】出站策略现在是自动(没写 default_domain_resolver)".to_string(),
     };
     Ok(format!(
-        "// {name} 的自定义片段。可写 outbounds / route / dns / http_clients / experimental
+        "// {name} 的自定义片段。可写 log / outbounds / route / dns / http_clients / experimental
 // outbounds 是追加,tag 不能叫 direct。inbounds 归主控(记账靠 inbound tag),在「节点」页加减。
+// 想看哪个域名走了哪个出站:写 \"log\": {{\"level\": \"info\"}},然后在那台机器上
+// journalctl -u sbx-agent -f。info 是每条连接一行,看完记得删回去。
 // 注释与尾随逗号都行;清空存盘 = 恢复默认;存完按【K】让它自己的 sing-box 验一遍。
 // {now}
 //

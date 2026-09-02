@@ -130,7 +130,9 @@ sbx --config /etc/sbx/config.toml tui
 
 - `[c]` 显示主控现场组装、实际下发的完整配置，**包含原始凭据且不脱敏**；不要截图或外传。
 - `[o]` 按 agent 设置自动、优先 IPv4、优先 IPv6、仅 IPv4、仅 IPv6。
-- `[C]` 拉编辑器改这台的**自定义片段**：只能写 `outbounds` / `route` / `dns` / `http_clients` / `experimental`。
+- `[C]` 拉编辑器改这台的**自定义片段**：只能写 `log` / `outbounds` / `route` / `dns` / `http_clients` / `experimental`。
+  要看“哪个域名走了哪个出站”就写 `"log": {"level": "info"}`，然后在那台机器上
+  `journalctl -u sbx-agent -f`（`log.output` 被拒：写成文件没人给它转圈）。
   编辑器优先用 `$VISUAL` / `$EDITOR`；都没设就按 `nano` → `micro` → `nvim` → `vim` → `vi`
   挑一个这台机器上真装了的。落到 vi 族时会先把退出方法写出来（`:wq` / `:q!`）再进去。
   注释（`//` `#` `/* */`）与尾随逗号都行，而且**原文存进库里**，下次打开还在。

@@ -340,7 +340,8 @@ pub async fn disabled_users(pool: &SqlitePool) -> Result<Vec<String>> {
 ///     也就是说不写 `http_clients` 就没有不带弃用警告的写法了;
 ///   * `experimental.cache_file` 不开的话远程 rule-set 不缓存,而 `config.apply` 每次都
 ///     重建 box —— 每改一次配置就重下一次全部规则集,慢且会失败。
-const CUSTOM_ALLOWED_KEYS: &[&str] = &["outbounds", "route", "dns", "http_clients", "experimental"];
+const CUSTOM_ALLOWED_KEYS: &[&str] =
+    &["log", "outbounds", "route", "dns", "http_clients", "experimental"];
 
 /// `experimental` 里这两个子项不行:它们会开一个 HTTP 管理端口。
 ///
@@ -496,6 +497,17 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             anyhow::bail!("不允许的顶层字段 `{k}`。只能写:{}", CUSTOM_ALLOWED_KEYS.join(" / "));
         }
     }
+    // `log.output` 拒掉。agent 的 sing-box 日志本来就进进程的 stderr → journald,
+    // 那里有现成的轮转;写成文件后没人给它转圈 —— 而这台机子上改成 info
+    // 以后是**每条连接一行**,磁盘满只是时间问题。而且路径不在
+    // StateDirectory 下的话,ProtectSystem=strict 下只读,跟 cache_file 同一类坑。
+    if let Some(out) = obj.get("log").and_then(|v| v.get("output")) {
+        anyhow::bail!(
+            "log.output 用不了(你写的是 {out})—— agent 的 sing-box 日志已经进 journald,\
+             `journalctl -u sbx-agent -f` 就能看;写成文件没人给它转圈,\
+             而改成 info 以后是每条连接一行。只写 level 就行"
+        );
+    }
     // `cache_file` 开着却不写 `path`:sing-box 的缺省是**相对路径** `cache.db`
     // (落在工作目录),而 agent 的 systemd unit 是 ProtectSystem=strict ——
     // 整棵文件系统只读,只有 StateDirectory(默认 /var/lib/sbx-agent)可写。
@@ -577,6 +589,8 @@ fn detours_to_master_direct(v: &serde_json::Value) -> bool {
 ///     默认出口,覆盖式写法则把它弄没 —— 两者表现都不是报错。
 ///   * `route` / `dns` —— **逐 key 并入**,里层同名字段以自定义为准。
 ///     整个替换会把后面 `outbound::apply` 要往里面塞的东西一起抹掉。
+///   * `log` —— 同样逐 key 并入。主控写的是 `{ "level": "warn" }`,人只写
+///     `{ "level": "info" }` 时只盖掉 level,以后主控往 log 里加别的字段也不会被抹。
 fn merge_custom(cfg: &mut serde_json::Value, custom: serde_json::Map<String, serde_json::Value>) {
     let Some(root) = cfg.as_object_mut() else {
         return;
@@ -702,12 +716,15 @@ mod tests {
             // 不开 cache_file 的话远程 rule-set 不缓存,而 `config.apply` 每次都重建 box
             // —— 每改一次配置就重下一次全部规则集。
             r#"{ "experimental": { "cache_file": { "enabled": true, "path": "/var/lib/sbx-agent/cache.db" } } }"#,
+            // `log` 开放于 v0.4.34。主控钉的是 warn,而想看“哪个域名走了哪个出站”
+            // 就得要 info 的路由日志 —— agent 不开 clash_api,日志是那台机器上唯一的观察窗。
+            r#"{ "log": { "level": "info" } }"#,
             "",
             "   \n // 只有注释 \n ",
         ] {
             assert!(validate_custom(ok).is_ok(), "该接受:{ok:?}");
         }
-        for bad in [r#"{ "log": {} }"#, r#"{ "ntp": {} }"#, r#"{ "certificate": {} }"#] {
+        for bad in [r#"{ "ntp": {} }"#, r#"{ "certificate": {} }"#] {
             assert!(validate_custom(bad).is_err(), "该拒绝:{bad}");
         }
         // 最外层必须是对象 —— 人很容易直接粘一个 `outbounds` 数组进来。
@@ -738,6 +755,23 @@ mod tests {
         // DialerOptions 里(见 agent 侧 TestDetourEmptyDirectVersusDomainResolver);
         // 完全不写 detour 也不拦(缺省走 box 自己的直连,没有这个检查)。
         validate_custom(r#"{ "http_clients": [{ "tag": "hc", "detour": "direct-v6" }] }"#).unwrap();
+    }
+
+    /// **日志级别可以改,但 `log.output` 不行。**
+    ///
+    /// 改级别是真需求:主控钉的是 `warn`,而想确认“某个域名到底走了哪个出站”
+    /// 就得看 info 的路由日志 —— 而 agent 不开 clash_api(不在落地机开管理端口),
+    /// 日志是那台机器上唯一的观察窗。并法得是逐 key 盖:只写 level 不能把主控
+    /// 以后可能往 `log` 里加的字段抹掉。
+    #[test]
+    fn log_level_can_be_overridden_but_not_the_output_path() {
+        let obj = validate_custom(r#"{ "log": { "level": "info" } }"#).unwrap();
+        assert_eq!(obj["log"]["level"], "info");
+
+        let e = validate_custom(r#"{ "log": { "level": "info", "output": "/var/log/box.log" } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("journalctl"), "要告诉人日志在哪看:{e}");
     }
 
     /// **`cache_file` 开着却不写 `path` 必须在存盘时拦下。**
@@ -851,6 +885,27 @@ mod tests {
         // inbounds 仍然是主控算出来的那一份。
         assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["inbounds"][0]["tag"], "in-1");
+    }
+
+    /// **自定义里的 `log.level` 要盖掉主控那个 `warn`。**
+    ///
+    /// `log` 是主控自己先写了的 key(不像 `http_clients` 那样只有人写),
+    /// 所以并法必须是**逐 key 盖**而不是追加也不是整个替换:
+    /// 盖不上就成了“界面收下了、机器上还是 warn”—— 人会去查一个根本没变的日志。
+    #[tokio::test]
+    async fn a_custom_log_level_overrides_the_master_default() {
+        let p = pool().await;
+        let (agent_id, _) = agent_with_node(&p, "vless-ws").await;
+        crate::db::agent_repo::set_custom_config(
+            &p,
+            agent_id,
+            Some(r#"{ "log": { "level": "info" } }"#),
+        )
+        .await
+        .unwrap();
+
+        let cfg = build_agent_config(&p, agent_id).await.unwrap();
+        assert_eq!(cfg["log"]["level"], "info", "主控的 warn 没被盖掉:{cfg}");
     }
 
     /// **自定义写了 `default_domain_resolver` 时,`[o]` 的策略让位。**

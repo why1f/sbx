@@ -1287,7 +1287,7 @@ Reality 需要 `with_utls`,Hysteria2/TUIC 需要 `with_quic`;编译期哨兵阻�
 - 改 `agent/tracker` 同步改 `spike/`;改主控配置生成同步改 golden。
 - URI 与结构化订阅的 IPv6 形状不同,不能共享带框后的 host。
 - TUI 中文宽度使用 `theme::cols/pad/truncate`,不得用 `format!("{:<n}")` 对齐。
-- 自定义片段(`agents.custom_json`)只能碰 `outbounds` / `route` / `dns` / `http_clients` / `experimental`。**`inbounds` 不开放** ——
+- 自定义片段(`agents.custom_json`)只能碰 `log` / `outbounds` / `route` / `dns` / `http_clients` / `experimental`。**`inbounds` 不开放** ——
   记账键是 (用户, inbound tag),改了 tag 后 `ingest_stats` 会把上报当成「未分配」直接丢弃,
   流量静默停止记账。这条由 `service::validate_custom` 拦,不靠文档提醒。
 - `experimental.clash_api` / `v2ray_api` 在自定义片段里被拒:它们会在落地机上开一个

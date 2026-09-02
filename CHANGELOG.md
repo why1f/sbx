@@ -4,6 +4,35 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.34
+
+### 改
+
+- **自定义片段现在可以写 `log`** —— 主要是为了 `{"level": "info"}`。
+
+  主控把 sing-box 的日志级别钉在 `warn`，于是「某个域名到底走了哪个出站」这件事
+  在被控机上**没有任何观察窗**：`clash_api` 被明令挡掉（不在落地机开管理端口），
+  连接级日志在 `warn` 下不打，剩下的办法只有 `ss -tnp6` 猜。真机上第一次想验
+  「AI 站点是不是真走了 IPv6」就撞在这儿。
+
+  ```jsonc
+  { "log": { "level": "info" } }        // 存盘 → 下发 → journalctl -u sbx-agent -f
+  ```
+
+  并法是**逐 key 盖**而不是整块替换：`log` 是主控自己先写了的 key（`level: warn`），
+  只写 `level` 时不能把主控以后往 `log` 里加的字段一起抹掉。看完记得删回去 ——
+  `info` 是每条连接一行。
+
+  **`log.output` 仍然拒绝**，理由不是保守：agent 的 sing-box 日志本来就进 stderr →
+  journald，那里有现成的轮转；写成文件后没人给它转圈，而这台机器上开了 `info`
+  之后是每条连接一行，磁盘满只是时间问题。路径不在 `StateDirectory` 下的话还会
+  撞上 `ProtectSystem=strict` 的只读 —— 跟 `cache_file` 那个坑同一类。报错里直接
+  给出 `journalctl -u sbx-agent -f`。
+
+  顺带说明一件事：协议里那个 agent → 主控的 `log` 方法（`{level, line}`）**声明了
+  但从未实现**，所以改级别不会把日志灌进主控或 WS 通道，只影响那台机器上的
+  journald 体积。
+
 ## v0.4.33
 
 ### 改
