@@ -569,9 +569,11 @@ fn detours_to_master_direct(v: &serde_json::Value) -> bool {
 /// 把自定义片段并入一份已组好的配置。
 ///
 /// 三个 key 三种并法,各有理由:
-///   * `outbounds` —— **追加**。主控那个 `direct` 必须留着:节点默认走直连,
-///     而且 `route` 里没匀到的流量靠它。覆盖式写法会把它弄没,
-///     表现是「部分流量无法出站」而不是报错。
+///   * `outbounds` —— **追加**。主控那个 `direct` 必须留着、而且必须留在第一位:
+///     节点默认走直连,`route` 里没匀到的流量靠它;而且主控从不写
+///     `route.final`,sing-box 在 final 缺省时把第一个出站当默认出站
+///     (adapter/outbound/manager.go:303)。所以往前插会让人写的第一个出站静默当上
+///     默认出口,覆盖式写法则把它弄没 —— 两者表现都不是报错。
 ///   * `route` / `dns` —— **逐 key 并入**,里层同名字段以自定义为准。
 ///     整个替换会把后面 `outbound::apply` 要往里面塞的东西一起抹掉。
 fn merge_custom(cfg: &mut serde_json::Value, custom: serde_json::Map<String, serde_json::Value>) {
@@ -837,6 +839,12 @@ mod tests {
             cfg["outbounds"].as_array().unwrap().iter().filter_map(|o| o["tag"].as_str()).collect();
         assert!(tags.contains(&"direct"), "主控的 direct 被抹掉了:{tags:?}");
         assert!(tags.contains(&"warp"), "自定义的 outbound 没并进去:{tags:?}");
+        // **主控的 direct 必须仍在第一位。**不是美观问题:主控从不写
+        // `route.final`,而 sing-box 在 final 缺省时把**第一个出站**当默认出站
+        // (adapter/outbound/manager.go:303)。哪天这里从 extend 改成往前插,人写的
+        // 第一个自定义出站就会**静默地**变成这台机器的默认出口 ——
+        // 没规则匹配的流量全走它,一句报错都没有。
+        assert_eq!(tags[0], "direct", "direct 得排第一 —— final 缺省时它就是默认出站:{tags:?}");
         assert!(cfg["route"]["rules"].is_array(), "route.rules 没并进去:{cfg}");
         // inbounds 仍然是主控算出来的那一份。
         assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 1);
