@@ -32,6 +32,25 @@ agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.
   sing-box 1.14 放弃了 go1.24，三个 module 的 `go` 指令随 `go mod tidy` 升到
   1.25.5。CI/release 用的是 `go-version: stable`，不需要改。
 
+  **代价：agent 的 `boxctl` 包在 CI 里不再带 `-race` 跑。** 升级后 CI 立刻红了，
+  报的是上游 v1.14.0 的一个竞态：`route.NetworkManager.Start()` 先启动网卡监视器
+  （首次回调立刻在另一个 goroutine 里跑），**然后**才写 `r.started = true`
+  （`network.go:220`），而那个 goroutine 正读它（`network.go:574`）。beta.3 里
+  `updateInterface` 是同步调用、没有这个并发，1.14.0 为支持取消把它包进
+  `go func()`（`network.go:527`）才引入 —— 于是**每次 `box.Start()` 必触发**。
+
+  影响面是一个裸 bool 的读写，最坏后果是那一次 `ResetNetwork` 被跳过：不崩、
+  不串数据，而且 agent 根本不配 tun／网卡策略。让步只限于这一个包 —— 那里我们
+  自己的并发只有 `Controller` 的一把锁、测试还是顺序跑的，`-race` 在那儿保护的
+  本来就不是我们的代码；tracker 的计数器、master 的连接与 registry、state 的落盘
+  照旧带 `-race`。全部测试（含八协议跨语言 golden）仍然照跑，只是不开检测器。
+  上游修好后把 CI 里那两步合回一条。
+
+  顺带补了一件基础设施：`-race` 失败时把 race 报告头部作为 **annotation** 抛出。
+  Actions 的完整日志要 admin 权限才能用 API 取（匿名 403），job summary 也不进
+  check-run 的 `output` 字段 —— 只有 annotation 匿名可读。没有它，这次的竞态只能
+  靠反复盲推提交来定位。
+
 - 文档与注释里的版本基准同步到 `v1.14.0`：`DESIGN.md` §0.2 的源码核实基准、
   §12.0、`agent/tracker/tracker.go`、`master/src/model/outbound.rs`（讲
   `domain_strategy` 已被移除的那两处）、`agent/boxctl/golden_test.go`、
