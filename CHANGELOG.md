@@ -4,6 +4,46 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.29
+
+### 改
+
+- **自定义片段白名单补上 `http_clients` 与 `experimental`（`cache_file`）。**
+
+  sing-box 1.14 把远程 rule-set 的下载通道改成了顶层 `http_clients` ＋
+  `route.default_http_client`，旧的 `download_detour` 和「隐式用默认出站下载」都已
+  弃用 —— 不放 `http_clients` 进白名单，就没有一份不带弃用警告的写法。真机第一份
+  自定义片段就撞上了这个口子：配置本身是对的，主控先拒了。
+
+  `experimental` 同理：不开 `cache_file` 的话，`config.apply` 每次都重建 box，等于
+  每改一次配置就重下一遍全部规则集 —— 慢，而且会失败。但 `clash_api` / `v2ray_api`
+  单独挡掉：它们会在落地机上开一个 HTTP 管理端口（clash_api 默认无鉴权），与
+  「agent 不开放管理端口」直接冲突。`endpoints` 也拒，但换成一句实话：agent 只编了
+  `with_quic,with_utls`，sing-box 会报 `WireGuard is not included in this build` ——
+  一句「不允许的顶层字段」只会让人去想办法绕白名单，而那条路的尽头是一样的报错。
+
+- **`[C]` 模板：说明缩到 4 行，并带上一个 `/* */` 包住的可用示例。**
+
+  v0.4.27 的模板有 20 行注释，太吵；砍完只剩 4 行说明，但空白模板让人不知道从哪
+  下手。现在模板带一份**真 sing-box 验过**的完整示例（AI 站点走 IPv6、屏蔽 BT、
+  远程 rule-set、`cache_file`），用 `/* */` 注释包住：原样存盘什么都不会变；要用
+  就删掉 `/*` `*/` 两行和尾部那个空 `{}`。
+
+  示例里的 `cache_file` 只写 `enabled` 不写 `path`：模板发给所有 agent，写死
+  `/var/lib/sbx-agent/cache.db` 的话目录不存在的那台起不来，而这类错 `[K]` 查不出
+  来（`box.New()` 不碰磁盘，要到 `Start` 才炸）。缺省路径 `~/.cache/sing-box` 谁都
+  可用。
+
+### 内部
+
+- 新增 golden `master/testdata/custom/remote-ruleset.json`，由 Go 侧喂真 sing-box：
+  验 1.14 那套新字段（`http_clients`、数组形式的 `rule_set.tag`、`{tag}` 占位符）
+  能穿过「白名单 → 合并 → 下发」整条链。它的第一版用了 reality 节点，被跨语言那步
+  当场拦下 —— 私钥是建节点时随机生成的，写进 golden 下一次跑就对不上。
+- 落一条实测测试：agent 自己正跑着的配置，`Check` 同一份也必须过。`box.New()` 不
+  绑端口是 `[K]` 的整个前提（`[K]` 验的正是「即将下发的那份」，端口此刻被自己占
+  着），而这条性质此前零覆盖。
+
 ## v0.4.28
 
 ### 修
