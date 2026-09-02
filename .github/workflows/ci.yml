@@ -107,14 +107,26 @@ jobs:
         # Linux 上 -race 报的竞态只能靠反复盲推。成功时不产生任何输出。
         run: |
           set -o pipefail
-          go test -race -tags with_quic,with_utls -count=1 ./... 2>&1 | tee /tmp/agent-test.log || {
-            msg=$( { grep -E '^(--- FAIL|FAIL|ok )' /tmp/agent-test.log | head -12
-                     echo '--- race 报告头部 ---'
-                     awk '/WARNING: DATA RACE/,0' /tmp/agent-test.log | head -40
-                   } | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\r","%0D").replace("\n","%0A"))')
-            echo "::error title=go test -race 失败::$msg"
-            exit 1
-          }
+          if go test -race -tags with_quic,with_utls -count=1 ./... 2>&1 | tee /tmp/agent-test.log; then
+            exit 0
+          fi
+          # 纯 python 提取:用 `grep | head` 会在 pipefail 下被 SIGPIPE 杀掉(exit 141),
+          # 连 annotation 那一行都轮不到。
+          msg=$(python3 - <<'PY'
+          import io
+          lines = io.open('/tmp/agent-test.log', encoding='utf-8', errors='replace').read().splitlines()
+          out = [l for l in lines if l.startswith(('--- FAIL', 'FAIL', 'ok '))][:12]
+          hit = [k for k, l in enumerate(lines) if 'WARNING: DATA RACE' in l]
+          if hit:
+              out += ['--- race 报告头部 ---'] + lines[hit[0]:hit[0] + 45]
+          else:
+              out += ['--- 日志尾部 ---'] + lines[-45:]
+          s = '\n'.join(out)
+          print(s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PY
+          )
+          echo "::error title=go test -race 失败::$msg"
+          exit 1
 
   spike:
     name: §12.0 spike(回归)
