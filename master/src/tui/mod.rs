@@ -798,6 +798,9 @@ fn which(cmd: &str) -> bool {
 /// 读的人是看不出原文的。原始字符串里它们就是自己。
 const CUSTOM_EXAMPLE: &str = r#"/*
 {
+  // 下面这行打开就能在 journalctl -u sbx-agent -f 里看到每条连接选了哪个出站
+  // —— 验完记得再注释回去:info 是每条连接一行。不写就是主控的 warn。
+  // "log": { "level": "info" },
   "dns": { "servers": [{ "type": "local", "tag": "local" }] },
   // 1.14 起远程 rule-set 的下载通道走顶层 http_clients(旧的 download_detour 已弃用);
   // 不写 detour 就是直连(缺省行为),写 "detour": "direct" 反而会被 sing-box 拒 ——
@@ -3929,6 +3932,11 @@ mod tests {
             .expect("模板示例删掉 /* */ 后必须能直接存");
         assert!(!obj.is_empty(), "示例得有实际内容,不然演示不了任何东西");
         assert!(obj.get("experimental").is_some(), "示例要演示 cache_file 的正确写法");
+        // **示例里的 log 必须是注释掉的。** 它在那儿只为了告诉人「写在哪、怎么写」;
+        // 真开着的话,把示例整段当模板用的人就突然给那台机器开了逐连接日志,
+        // 而他只是想加一条路由。
+        assert!(obj.get("log").is_none(), "示例里的 log 得保持注释状态:{obj:?}");
+        assert!(CUSTOM_EXAMPLE.contains(r#"// "log""#), "但那一行得在,否则没地方告诉人该怎么写");
     }
 
     #[tokio::test]
