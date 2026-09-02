@@ -544,8 +544,9 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             "detour 不能指向 direct —— 主控那个 direct 出站是空配置(没配任何拨号选项),\
              sing-box 对「显式绕道一个空 direct」会报 `detour to an empty direct outbound\
              makes no sense`,而且只在 Start 阶段炸(【K】的 box.New 查不出来)。\
-             想走默认就把 detour 整个去掉。注意指向自己加的 direct 出站也一样炸:\
-             「空不空」只看拨号选项(bind_interface / override_* 这类),domain_resolver 不算"
+             想走默认就把 detour 整个去掉(缺省走 box 自己的直连,行为一样);\
+             指自己加的出站没问题 —— 只要它配了拨号选项(domain_resolver 也算),\
+             比如带 domain_resolver 的 direct-v6 就是合法目标;selector 之类不参与这个检查"
         );
     }
     Ok(obj)
@@ -733,7 +734,8 @@ mod tests {
             assert!(e.contains("direct"), "要说清指错了谁:{e}");
             assert!(e.contains("去掉"), "要给出修法:{e}");
         }
-        // 指向自己加的出站不拦(那台有没有配拨号选项主控不知道,交给 sing-box 判);
+        // 指向自己加的出站不拦:只要配了拨号选项就不算空,而 domain_resolver 就在
+        // DialerOptions 里(见 agent 侧 TestDetourEmptyDirectVersusDomainResolver);
         // 完全不写 detour 也不拦(缺省走 box 自己的直连,没有这个检查)。
         validate_custom(r#"{ "http_clients": [{ "tag": "hc", "detour": "direct-v6" }] }"#).unwrap();
     }

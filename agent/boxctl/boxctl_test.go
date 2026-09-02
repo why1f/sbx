@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -233,4 +234,71 @@ func TestCheckWorksWhileTheSameConfigIsRunning(t *testing.T) {
 	}
 	// 且正在跑的实例没被动过。
 	waitPort(t, port, true)
+}
+
+// **detour 指向哪种出站会炸,只能让真 sing-box 回答。**
+//
+// 主控那个 `direct` 是「空出站」(没配任何拨号选项),显式 detour 指它在 sing-box
+// 1.12+ 是启动期错误(`detour to an empty direct outbound makes no sense`)。
+// 但带了 `domain_resolver` 的 direct **不算空** —— `domain_resolver` 是
+// `DialerOptions` 的字段(option/outbound.go 里的 AbstractDialerOptions.DomainResolver),
+// 而 isEmpty 比的正是整个 DialerOptions。
+//
+// 这条我第一次读源码读反了,还把「domain_resolver 不算、指自己加的 direct-v6
+// 一样炸」写进了 validate_custom 的报错文案 —— 那句话是给人的修改建议,
+// 指错方向比不给建议更糟。所以这里改成让真 sing-box 判。
+//
+// 判定手法:检查是懒初始化(sync.Once,首次拨号才触发),而远程 rule-set 在 Start
+// 时就会拉一次。把 URL 指向一个必然连不上的本地端口,两种结果就能分开:
+//   - 检查触发 → 错误里有 makes no sense(init 阶段失败,根本没发起连接)
+//   - 检查没触发 → 是连接被拒这类网络错误
+//
+// 顺带钉住第二件事:两种情况 build() 都成功 —— 也就是【K】(config.check 只做
+// box.New)对这类错误天生无能,只能靠存盘时拦。
+func TestDetourEmptyDirectVersusDomainResolver(t *testing.T) {
+	cfgWithDetour := func(detour string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{
+			"log": {"level": "error"},
+			"dns": {"servers": [{"type": "local", "tag": "local"}]},
+			"inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": %d}],
+			"outbounds": [
+				{"type": "direct", "tag": "direct"},
+				{"type": "direct", "tag": "direct-v6",
+				 "domain_resolver": {"server": "local", "strategy": "prefer_ipv6"}}
+			],
+			"http_clients": [{"tag": "fetch", "detour": "%s"}],
+			"route": {
+				"rule_set": [{"tag": "probe", "type": "remote", "format": "binary",
+				              "url": "http://127.0.0.1:1/probe.srs", "http_client": "fetch"}],
+				"rules": [{"rule_set": ["probe"], "action": "route", "outbound": "direct"}],
+				"final": "direct"
+			}
+		}`, freePort(t), detour))
+	}
+
+	const lint = "makes no sense"
+	for _, tc := range []struct {
+		detour   string
+		wantLint bool
+		why      string
+	}{
+		{"direct", true, "主控的 direct 没配任何拨号选项,是空出站"},
+		{"direct-v6", false, "domain_resolver 属于 DialerOptions,配了就不算空"},
+	} {
+		nb, err := build(cfgWithDetour(tc.detour))
+		if err != nil {
+			t.Fatalf("detour=%s: build 就失败了 —— 那【K】本该能查出来,与线上现象不符: %v",
+				tc.detour, err)
+		}
+		err = nb.Start()
+		_ = nb.Close()
+		if err == nil {
+			t.Fatalf("detour=%s: Start 居然成功了(URL 指向必然连不上的端口)", tc.detour)
+		}
+		got := strings.Contains(err.Error(), lint)
+		if got != tc.wantLint {
+			t.Fatalf("detour=%s: 期望 %s 空出站检查(%s),实际错误是: %v",
+				tc.detour, map[bool]string{true: "触发", false: "不触发"}[tc.wantLint], tc.why, err)
+		}
+	}
 }

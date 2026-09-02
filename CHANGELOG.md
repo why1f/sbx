@@ -4,6 +4,42 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.32
+
+### 修
+
+- **`detour` 拦截的报错文案说错了一半：带 `domain_resolver` 的 direct 出站其实是
+  合法的 detour 目标。**
+
+  v0.4.31 的文案写着「指向自己加的 direct 出站也一样炸，`domain_resolver` 不算」
+  —— 读源码读反了：`domain_resolver` 就在 `DialerOptions` 里
+  （`option/outbound.go` 的 `AbstractDialerOptions.DomainResolver`），而 `isEmpty`
+  比的正是整个 `DialerOptions`。所以模板示例里那个 `direct-v6` 配了
+  `domain_resolver`，**不算空出站**，`detour: "direct-v6"` 完全合法。
+
+  错的建议比不给建议更糟：人会以为自己加的出站也不能当 detour 目标，于是绕远路。
+  现在文案说的是实话 —— 想走默认就把 `detour` 去掉；指自己加的出站没问题，只要
+  它配了拨号选项（`domain_resolver` 也算）；`selector` 之类根本不参与这个检查
+  （检查是个类型断言，全仓只有 `protocol/direct` 实现 `IsEmpty()`）。
+
+  拦截逻辑本身没动 —— 它只拦值等于 `"direct"` 的那一种，那一种在 sbx 里必然是
+  主控那个空出站。
+
+### 内部
+
+- 新增真 sing-box 测试 `TestDetourEmptyDirectVersusDomainResolver`（agent/boxctl）：
+  同一份配置分别 `detour` 到 `direct` 和 `direct-v6`，前者 `Start` 报
+  `makes no sense`、后者报网络错误。手法是利用「检查是懒初始化、首次拨号才触发」
+  这一点，把远程 rule-set 的 URL 指向一个必然连不上的本地端口 —— 两种结果就此
+  分开，不需要联网。顺带钉住第二件事：**两种情况 `build()` 都成功**，也就是
+  `[K]`（`config.check` 只做 `box.New`）对这类错误天生无能，只能靠存盘时拦。
+
+- 钉住「主控的 `direct` 必须排在 `outbounds` 第一位」：主控从不写 `route.final`，
+  而 sing-box 在 `final` 缺省时把**第一个出站**当默认出站
+  （`adapter/outbound/manager.go:303`）。合并从追加改成往前插的话，人写的第一个
+  自定义出站会**静默变成**这台机器的默认出口 —— 没规则匹配的流量全走它，一句
+  报错都没有。原来那条测试只断言了 `direct` 还在，没断言它在第几位。
+
 ## v0.4.31
 
 ### 修
@@ -18,11 +54,13 @@ agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.
   起来」：主控每轮巡检重试、错误刷屏。
 
   现在存盘校验**直接拒绝** `"detour": "direct"`（递归扫整个文档 —— 挂在
-  `dns.servers` / `outbounds` 里也一样拦），报错说明修法。一个反直觉的点写进了
-  文案：指向**自己加的** direct 出站同样会炸 —— sing-box 判「空不空」只看拨号
-  选项（bind_interface / override_* 这类），`domain_resolver` 不算，所以示例里
-  那个 direct-v6 也是「空」的。想走默认就把 `detour` 整个去掉（缺省走 box 进程
-  自己的直连，没有这个检查）。
+  `dns.servers` / `outbounds` 里也一样拦），报错说明修法：想走默认就把 `detour`
+  整个去掉（缺省走 box 进程自己的直连，没有这个检查）。
+
+  > **v0.4.32 更正**：这条当初的文案里还有一句「指向自己加的 direct 出站同样会炸，
+  > `domain_resolver` 不算」——**那句是错的**（读源码读反了）。`domain_resolver`
+  > 就在 `DialerOptions` 里，配了就不算空出站，所以 `detour: "direct-v6"` 是合法的。
+  > 详见 v0.4.32。
 
   已经存进去的坏片段不受影响（回滚机制保证旧配置还在跑），把 `"detour": "direct"`
   删掉再存一遍即可。
