@@ -799,11 +799,12 @@ fn which(cmd: &str) -> bool {
 const CUSTOM_EXAMPLE: &str = r#"/*
 {
   "dns": { "servers": [{ "type": "local", "tag": "local" }] },
-  // 1.14 起远程 rule-set 的下载通道走顶层 http_clients(旧的 download_detour 已弃用)
-  "http_clients": [{ "tag": "fetch", "detour": "direct" }],
+  // 1.14 起远程 rule-set 的下载通道走顶层 http_clients(旧的 download_detour 已弃用);
+  // 这里不能写 "detour": "direct" —— 主控那个 direct 是空出站,sing-box 启动时会拒
+  "http_clients": [{ "tag": "fetch" }],
   "outbounds": [
     { "type": "direct", "tag": "direct-v6",
-      "domain_resolver": { "server": "local", "strategy": "ipv6_only" } }
+      "domain_resolver": { "server": "local", "strategy": "prefer_ipv6" } }
   ],
   "route": {
     "default_http_client": "fetch",

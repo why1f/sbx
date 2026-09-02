@@ -4,6 +4,35 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.31
+
+### 修
+
+- **远程 rule-set 一下发就炸：`detour to an empty direct outbound makes no sense`。**
+
+  v0.4.29 模板示例的 http_clients 里写了 `"detour": "direct"`。查了 agent 内嵌
+  sing-box（1.14.0-beta.3）的源码：旧的 `download_detour` 路径**内部豁免**「空
+  direct」检查（`DisableEmptyDirectCheck: true`），新的 `http_clients` 路径不豁免
+  —— 同一个写法在 1.13 能跑、到 1.14 变成启动期错误。而且炸在 `Start`（rule-set
+  首次下载时才拨号），`[K]` 的 `box.New()` 查不出来，又是一处「存得进去、起不
+  起来」：主控每轮巡检重试、错误刷屏。
+
+  现在存盘校验**直接拒绝** `"detour": "direct"`（递归扫整个文档 —— 挂在
+  `dns.servers` / `outbounds` 里也一样拦），报错说明修法。一个反直觉的点写进了
+  文案：指向**自己加的** direct 出站同样会炸 —— sing-box 判「空不空」只看拨号
+  选项（bind_interface / override_* 这类），`domain_resolver` 不算，所以示例里
+  那个 direct-v6 也是「空」的。想走默认就把 `detour` 整个去掉（缺省走 box 进程
+  自己的直连，没有这个检查）。
+
+  已经存进去的坏片段不受影响（回滚机制保证旧配置还在跑），把 `"detour": "direct"`
+  删掉再存一遍即可。
+
+### 改
+
+- 模板示例的 `direct-v6` 策略从 `ipv6_only` 换成 `prefer_ipv6`：`ipv6_only` 对
+  规则集里没有 AAAA 记录的域名是**硬失败**（域名直接连不上）；`prefer_ipv6` 优先
+  v6、缺了退回 v4，坏情况从「断」变成「退回 v4」。
+
 ## v0.4.30
 
 ### 修

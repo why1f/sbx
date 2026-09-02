@@ -539,7 +539,31 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             }
         }
     }
+    if detours_to_master_direct(&serde_json::Value::Object(obj.clone())) {
+        anyhow::bail!(
+            "detour 不能指向 direct —— 主控那个 direct 出站是空配置(没配任何拨号选项),\
+             sing-box 对「显式绕道一个空 direct」会报 `detour to an empty direct outbound\
+             makes no sense`,而且只在 Start 阶段炸(【K】的 box.New 查不出来)。\
+             想走默认就把 detour 整个去掉。注意指向自己加的 direct 出站也一样炸:\
+             「空不空」只看拨号选项(bind_interface / override_* 这类),domain_resolver 不算"
+        );
+    }
     Ok(obj)
+}
+
+/// 全文递归找 `"detour": "direct"`。
+///
+/// 不限定挂在哪一层:`outbounds` / `dns.servers` / `http_clients` 里都可能有 detour,
+/// 白名单只管顶层键,里面怎么嵌是 sing-box 的事。tag 叫 `direct` 的出站只能是主控的
+/// (自己想叫这个名会在更早的地方被拒),所以值等于 `"direct"` 时指向必是那个空出站。
+fn detours_to_master_direct(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(m) => m.iter().any(|(k, val)| {
+            (k == "detour" && val.as_str() == Some(DIRECT_TAG)) || detours_to_master_direct(val)
+        }),
+        serde_json::Value::Array(a) => a.iter().any(detours_to_master_direct),
+        _ => false,
+    }
 }
 
 /// 把自定义片段并入一份已组好的配置。
@@ -670,7 +694,8 @@ mod tests {
             r#"{ "dns": {} }"#,
             // 1.14 把远程 rule-set 的下载通道改成了顶层 `http_clients`,
             // 旧的 `download_detour` 已弃用 —— 不放它进来,就没有不带弃用警告的写法。
-            r#"{ "http_clients": [{ "tag": "hc", "detour": "direct" }] }"#,
+            // 注意这里不能带 `"detour": "direct"`:见 detour_may_not_point_at_the_master_direct。
+            r#"{ "http_clients": [{ "tag": "hc" }] }"#,
             // 不开 cache_file 的话远程 rule-set 不缓存,而 `config.apply` 每次都重建 box
             // —— 每改一次配置就重下一次全部规则集。
             r#"{ "experimental": { "cache_file": { "enabled": true, "path": "/var/lib/sbx-agent/cache.db" } } }"#,
@@ -684,6 +709,31 @@ mod tests {
         }
         // 最外层必须是对象 —— 人很容易直接粘一个 `outbounds` 数组进来。
         assert!(validate_custom("[]").is_err(), "数组该被拒");
+    }
+
+    /// **detour 不能指向主控的 direct(空出站)。**
+    ///
+    /// sing-box 1.14 起,「显式绕道一个空 direct 出站」是个启动期错误
+    /// (`detour to an empty direct outbound makes no sense`)——旧的
+    /// `download_detour` 写法内部豁免了这个检查,新 `http_clients` 不豁免,
+    /// 于是 1.13 能跑的写法到 1.14 会炸。而且炸在 Start(远程 rule-set 首次
+    /// 下载时),`[K]` 的 box.New 查不出来 —— 又一处「存得进去、起不起来」,
+    /// 只能在存盘时拦。
+    #[test]
+    fn detour_may_not_point_at_the_master_direct() {
+        // 三处常见挂点都得拦:不止 http_clients,dns.servers 和 outbounds 里也有 detour。
+        for bad in [
+            r#"{ "http_clients": [{ "tag": "hc", "detour": "direct" }] }"#,
+            r#"{ "dns": { "servers": [{ "type": "udp", "tag": "d", "detour": "direct" }] } }"#,
+            r#"{ "outbounds": [{ "type": "selector", "tag": "sel", "detour": "direct" }] }"#,
+        ] {
+            let e = validate_custom(bad).unwrap_err().to_string();
+            assert!(e.contains("direct"), "要说清指错了谁:{e}");
+            assert!(e.contains("去掉"), "要给出修法:{e}");
+        }
+        // 指向自己加的出站不拦(那台有没有配拨号选项主控不知道,交给 sing-box 判);
+        // 完全不写 detour 也不拦(缺省走 box 自己的直连,没有这个检查)。
+        validate_custom(r#"{ "http_clients": [{ "tag": "hc", "detour": "direct-v6" }] }"#).unwrap();
     }
 
     /// **`cache_file` 开着却不写 `path` 必须在存盘时拦下。**
@@ -1287,10 +1337,10 @@ mod tests {
                 r#"{
   // 让 AI 站点走 IPv6 出去
   "dns": { "servers": [{ "type": "local", "tag": "local" }] },
-  "http_clients": [{ "tag": "fetch", "detour": "direct" }],
+  "http_clients": [{ "tag": "fetch" }],
   "outbounds": [
     { "type": "direct", "tag": "direct-v6",
-      "domain_resolver": { "server": "local", "strategy": "ipv6_only" } }
+      "domain_resolver": { "server": "local", "strategy": "prefer_ipv6" } }
   ],
   "route": {
     "default_http_client": "fetch",
