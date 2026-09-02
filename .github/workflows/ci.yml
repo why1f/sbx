@@ -108,7 +108,10 @@ jobs:
         run: |
           set -o pipefail
           go test -race -tags with_quic,with_utls -count=1 ./... 2>&1 | tee /tmp/agent-test.log || {
-            msg=$(tail -70 /tmp/agent-test.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\r","%0D").replace("\n","%0A"))')
+            msg=$( { grep -E '^(--- FAIL|FAIL|ok )' /tmp/agent-test.log | head -12
+                     echo '--- race 报告头部 ---'
+                     awk '/WARNING: DATA RACE/,0' /tmp/agent-test.log | head -40
+                   } | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\r","%0D").replace("\n","%0A"))')
             echo "::error title=go test -race 失败::$msg"
             exit 1
           }
