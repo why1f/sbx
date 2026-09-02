@@ -4,6 +4,44 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.30
+
+### 修
+
+- **`[C]` 拉起 vim 后按键失灵、一卡一卡、经常要输两遍 —— 键盘线程在和编辑器抢
+  tty。**
+
+  TUI 启动时开了一条键盘线程（`event::poll(200ms)` → `event::read()` → channel），
+  拉外部编辑器时只挂起了终端（raw mode / alternate screen），**那条线程没停** ——
+  于是 vim 和它共用同一个 tty、谁先醒谁拿走字节。被偷走的键还排在 channel 里，
+  编辑器一关会**回放成 TUI 的随机操作**：在 vim 里敲 `:wq`，被偷走的那个 `q` 就是
+  TUI 的退出键。现在拉编辑器／升级脚本前先把键盘线程停住（`AtomicBool`），退场后
+  **先排空编辑期间被偷走的键、再放行** —— 顺序反了就会把新键和旧键一起排掉，或
+  让旧键漏进主循环。自升级脚本走同一个处理，它有同一个问题，只是脚本不收键盘
+  输入、一直没人撞见。
+
+- **自定义片段里 `cache_file` 开着不写 `path`，agent 上必炸成只读文件系统。**
+
+  sing-box 的缺省路径是**相对的** `cache.db`（落在工作目录），而 agent 的 systemd
+  unit 是 `ProtectSystem=strict` —— 整棵文件系统只读，只有 `StateDirectory`
+  （默认 `/var/lib/sbx-agent`）可写。这份配置能一路过 `[K]`（`box.New()` 不碰
+  磁盘）、能过下发，然后在 agent 的 `Start` 上炸成 `initialize cache-file: open
+  cache.db: read-only file system`，主控从此每轮巡检重试、错误刷屏。v0.4.29 的
+  模板就带过这么一份（当时还把缺省路径错说成 `~/.cache/sing-box`），真机上撞了个
+  正着。现在两层都堵上：
+
+  - 模板示例写明 `"path": "/var/lib/sbx-agent/cache.db"`；
+  - 存盘校验直接拒绝「`enabled` 开着却没有 `path`」，报错里给出修法 —— 把一处
+    运行期的无限重试变成存盘时眼前的一句话。
+
+  已经存进去的坏片段不受影响（回滚机制保证旧配置还在跑），在 `[C]` 里给
+  `cache_file` 补上 `"path"` 再存一遍即可。
+
+### 内部
+
+- 模板示例常量新增一条守卫测试：删掉 `/* */` 后必须能原样存过校验 —— 示例一旦
+  自相矛盾，第一个照着做的人会在存盘时撞上一句跟示例打架的报错。
+
 ## v0.4.29
 
 ### 改

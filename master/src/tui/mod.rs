@@ -818,8 +818,10 @@ const CUSTOM_EXAMPLE: &str = r#"/*
     ],
     "final": "direct"
   },
-  // 不开这个,每次 config.apply 都会重下一遍全部规则集。路径缺省在 ~/.cache/sing-box
-  "experimental": { "cache_file": { "enabled": true } }
+  // 不开这个,每次 config.apply 都会重下一遍全部规则集。path 必须写:
+  // sing-box 缺省是相对路径 cache.db,agent 的 systemd unit 是 ProtectSystem=strict,
+  // 只除了 StateDirectory 别处全只读 —— 相对路径必然启动失败
+  "experimental": { "cache_file": { "enabled": true, "path": "/var/lib/sbx-agent/cache.db" } }
 }
 */"#;
 
@@ -862,7 +864,17 @@ async fn event_loop<B: ratatui::backend::Backend>(
     // 循环里调用会把 runtime 的工作线程按住。走 channel 之后,主循环可以用
     // select 同时等按键和刷新计时。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // `input_paused`:拉外部程序(vim / 升级脚本)期间必须把键盘线程停住 ——
+    // 子进程和这个线程共用同一个 tty,谁先醒谁拿走字节。不停的话 vim 里
+    // 按键要输两遍;更糟的是被偷走的键排在 channel 里,编辑器一关会**回放成
+    // TUI 的随机操作**(vim 里敲的 :wq,被偷走的 q 就是 TUI 的退出键)。
+    let input_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let paused_in_thread = input_paused.clone();
     std::thread::spawn(move || loop {
+        if paused_in_thread.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
         match event::poll(Duration::from_millis(200)) {
             Ok(true) => match event::read() {
                 Ok(ev) => {
@@ -908,19 +920,23 @@ async fn event_loop<B: ratatui::backend::Backend>(
                             perform(&mut app, action).await;
                             if app.want_self_upgrade {
                                 app.want_self_upgrade = false;
+                                input_paused.store(true, std::sync::atomic::Ordering::SeqCst);
                                 let msg = run_self_upgrade(term);
                                 match msg {
                                     Ok(m) => app.note(m),
                                     Err(e) => app.fail(format!("升级失败: {e}")),
                                 }
+                                resume_input(&input_paused, &mut rx);
                             }
                             // 与自升级同一个做法:要挂起终端的事必须在主循环里做,
                             // `perform` 里拿不到 `term`。
                             if let Some((id, name)) = app.want_edit_custom.take() {
+                                input_paused.store(true, std::sync::atomic::Ordering::SeqCst);
                                 match edit_custom_config(term, &app.pool, id, &name).await {
                                     Ok(m) => app.note(m),
                                     Err(e) => app.fail(format!("{name} 的自定义配置没存上: {e}")),
                                 }
+                                resume_input(&input_paused, &mut rx);
                             }
                             app.refresh().await?;
                         }
@@ -934,6 +950,19 @@ async fn event_loop<B: ratatui::backend::Backend>(
             }
         }
     }
+}
+
+/// 外部程序(编辑器 / 升级脚本)退场后恢复键盘线程。
+///
+/// 先把编辑期间被它偷走的键从 channel 里排掉、再放行 —— 顺序反过来的话,
+/// 刚放行就可能读到新键,和要排掉的旧键分不开;而那些旧键里完全可能有
+/// TUI 的退出键(人在 vim 里敲的 `:wq`),放给主循环就是随机操作。
+fn resume_input(
+    input_paused: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<crossterm::event::Event>,
+) {
+    while rx.try_recv().is_ok() {}
+    input_paused.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
@@ -3876,6 +3905,25 @@ mod tests {
         // 而它们只能是注释:原样存盘 → 解析出来是空对象。
         let obj = crate::service::validate_custom(&tpl).expect("模板本身必须能过校验");
         assert!(obj.is_empty(), "模板不该带实际内容,否则「打开就保存」会意外接管:{obj:?}");
+    }
+
+    /// **模板里 /* */ 包着的那个示例必须本身就能存。**
+    ///
+    /// 它是给人删掉注释直接用的 —— 一旦示例本身过不了校验(比如 cache_file
+    /// 忘了写 path),第一个照着做的人就会在存盘时撞上一句跟示例矛盾的报错,
+    /// 那比没有示例更让人迷糊。模板改了什么,这条部得跟着重跑一遍。
+    #[test]
+    fn the_template_example_is_savable_as_is() {
+        // 常量自带 /* */ 包裹(模板靠它当注释);验的是删掉包裹后的内容 ——
+        // 那才是人删掉两行注释后要存的东西。
+        let inner = CUSTOM_EXAMPLE
+            .strip_prefix("/*")
+            .and_then(|s| s.strip_suffix("*/"))
+            .expect("示例常量必须由 /* */ 包着");
+        let obj = crate::service::validate_custom(inner.trim())
+            .expect("模板示例删掉 /* */ 后必须能直接存");
+        assert!(!obj.is_empty(), "示例得有实际内容,不然演示不了任何东西");
+        assert!(obj.get("experimental").is_some(), "示例要演示 cache_file 的正确写法");
     }
 
     #[tokio::test]

@@ -496,6 +496,26 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             anyhow::bail!("不允许的顶层字段 `{k}`。只能写:{}", CUSTOM_ALLOWED_KEYS.join(" / "));
         }
     }
+    // `cache_file` 开着却不写 `path`:sing-box 的缺省是**相对路径** `cache.db`
+    // (落在工作目录),而 agent 的 systemd unit 是 ProtectSystem=strict ——
+    // 整棵文件系统只读,只有 StateDirectory(默认 /var/lib/sbx-agent)可写。
+    // 相对路径在 unit 里必炸,而且炸在 `Start` 而不是 `[K]` 的 Check
+    // (box.New() 不碰磁盘) —— 表现是主控每轮巡检重试、错误刷屏。
+    // 在存盘这一步拦下,把一处运行期的无限重试变成眼前的一句话。
+    if let Some(cf) =
+        obj.get("experimental").and_then(|v| v.get("cache_file")).and_then(|v| v.as_object())
+    {
+        let enabled = cf.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let path = cf.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if enabled && path.is_empty() {
+            anyhow::bail!(
+                "cache_file 开着就得写 path —— sing-box 的缺省是相对路径 cache.db,\
+                 在 agent 的 systemd unit(ProtectSystem=strict)下落在只读区,必然启动失败。\
+                 写 \"path\": \"/var/lib/sbx-agent/cache.db\"(agent 的 StateDirectory;\
+                 改过 agent 的 state_dir 就换成那个目录)"
+            );
+        }
+    }
     // `experimental` 整体放开了(cache_file 对远程 rule-set 是必需的),
     // 但不能靠它开管理端口。
     if let Some(exp) = obj.get("experimental").and_then(|v| v.as_object()) {
@@ -653,7 +673,7 @@ mod tests {
             r#"{ "http_clients": [{ "tag": "hc", "detour": "direct" }] }"#,
             // 不开 cache_file 的话远程 rule-set 不缓存,而 `config.apply` 每次都重建 box
             // —— 每改一次配置就重下一次全部规则集。
-            r#"{ "experimental": { "cache_file": { "enabled": true } } }"#,
+            r#"{ "experimental": { "cache_file": { "enabled": true, "path": "/var/lib/sbx-agent/cache.db" } } }"#,
             "",
             "   \n // 只有注释 \n ",
         ] {
@@ -664,6 +684,30 @@ mod tests {
         }
         // 最外层必须是对象 —— 人很容易直接粘一个 `outbounds` 数组进来。
         assert!(validate_custom("[]").is_err(), "数组该被拒");
+    }
+
+    /// **`cache_file` 开着却不写 `path` 必须在存盘时拦下。**
+    ///
+    /// sing-box 的缺省路径是相对的 `cache.db`,而 agent 的 systemd unit 是
+    /// ProtectSystem=strict(整棵树只读,只有 StateDirectory 可写)—— 这份配置
+    /// 一路能过 `[K]`(box.New 不碰磁盘)、能过下发,然后在 agent 的 Start 上
+    /// 炸成 `read-only file system`,主控从此每轮巡检重试。v0.4.29 的模板就
+    /// 带过这么一份,真机上撞了个正着。
+    #[test]
+    fn cache_file_enabled_requires_a_path() {
+        let e = validate_custom(r#"{ "experimental": { "cache_file": { "enabled": true } } }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("path"), "要给出修法:{e}");
+        assert!(e.contains("/var/lib/sbx-agent"), "要说清写到哪:{e}");
+
+        // 写了就放行;enabled 不开(或写 false)时 path 无关紧要,不强制。
+        validate_custom(
+            r#"{ "experimental": { "cache_file": { "enabled": true, "path": "/var/lib/sbx-agent/cache.db" } } }"#,
+        )
+        .unwrap();
+        validate_custom(r#"{ "experimental": { "cache_file": { "enabled": false } } }"#).unwrap();
+        validate_custom(r#"{ "experimental": { "cache_file": {} } }"#).unwrap();
     }
 
     /// **`experimental` 放进来了,但不能靠它开管理端口。**
