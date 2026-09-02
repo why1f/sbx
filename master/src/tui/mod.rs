@@ -800,7 +800,9 @@ const CUSTOM_EXAMPLE: &str = r#"/*
 {
   "dns": { "servers": [{ "type": "local", "tag": "local" }] },
   // 1.14 起远程 rule-set 的下载通道走顶层 http_clients(旧的 download_detour 已弃用);
-  // 这里不能写 "detour": "direct" —— 主控那个 direct 是空出站,sing-box 启动时会拒
+  // 不写 detour 就是直连(缺省行为),写 "detour": "direct" 反而会被 sing-box 拒 ——
+  // 主控那个 direct 没配任何拨号选项,指它等于把「走默认拨号」说了两遍。
+  // 想指定下载路径就指一个真配了东西的出站(如下面那个 direct-v6)。
   "http_clients": [{ "tag": "fetch" }],
   "outbounds": [
     { "type": "direct", "tag": "direct-v6",
