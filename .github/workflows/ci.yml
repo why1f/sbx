@@ -99,7 +99,28 @@ jobs:
       #
       # 这里还会跑 boxctl 的跨语言契约测试:把 master/testdata/inbounds/*.json
       # (Rust 侧生成的八协议 golden)喂给真正的 sing-box。
-      - name: go test -race
+      # **boxctl 单独跑,而且不带 `-race`。** 这不是偷懒,是上游 v1.14.0 的一个竞态:
+      # `route.NetworkManager.Start()` 先启动网卡监视器(首次回调立刻在另一个 goroutine
+      # 里跑),**然后**才写 `r.started = true`(network.go:220),而那个 goroutine 正
+      # 读它(network.go:574)。beta.3 里 `updateInterface` 是同步调用、没有这个并发,
+      # 1.14.0 为支持取消把它包进 `go func()`(network.go:527)才引入 —— 于是
+      # **每次 box.Start() 必触发**,这个包里所有起真 box 的测试全红。
+      #
+      # 影响面:一个裸 bool 的读写,最坏后果是那一次 `ResetNetwork` 被跳过 ——
+      # 不崩、不串数据,而且 sbx 的 agent 根本不配 tun/网卡策略。
+      #
+      # 为什么可以只在这个包让步:boxctl 里我们自己的并发只有 `Controller` 的一把锁,
+      # 而且测试是顺序跑的(没有 go func / t.Parallel)—— 也就是说这里 `-race` 保护的
+      # 本来就不是我们的代码,是上游的 box 生命周期。其余包(tracker 的计数器、
+      # master 的连接与 registry、state 的落盘)才是我们自己的并发,那些照旧带 -race。
+      #
+      # 这里仍然**跑全部测试**(含那八协议的跨语言 golden),只是不开检测器。
+      # 上游修好后把这两步合回一条 `go test -race ./...`。
+      - name: go test(boxctl,不带 -race —— 见注释里的上游竞态)
+        working-directory: agent
+        run: go test -tags with_quic,with_utls -count=1 ./boxctl/
+
+      - name: go test -race(其余包)
         working-directory: agent
         # 失败时把输出尾部作为 annotation 抛出。**这不是调试残留,是必要设施**:
         # Actions 的完整日志要 admin 权限才能用 API 取(匿名拿到 403),job summary
@@ -107,7 +128,7 @@ jobs:
         # Linux 上 -race 报的竞态只能靠反复盲推。成功时不产生任何输出。
         run: |
           set -o pipefail
-          if go test -race -tags with_quic,with_utls -count=1 ./... 2>&1 | tee /tmp/agent-test.log; then
+          if go test -race -tags with_quic,with_utls -count=1 $(go list ./... | grep -v /boxctl) 2>&1 | tee /tmp/agent-test.log; then
             exit 0
           fi
           # 纯 python 提取:用 `grep | head` 会在 pipefail 下被 SIGPIPE 杀掉(exit 141),
