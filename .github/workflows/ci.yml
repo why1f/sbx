@@ -101,19 +101,15 @@ jobs:
       # (Rust 侧生成的八协议 golden)喂给真正的 sing-box。
       - name: go test -race
         working-directory: agent
-        # 失败时把输出尾部写进 job summary。**这不是调试残留,是必要设施**:
-        # Actions 的完整日志要 admin 权限才能用 API 取(匿名拿到 403),而 summary
-        # 走 check-run 的 output 字段、匿名可读 —— 没有它,-race 在 Linux 上报的
-        # 竞态只能靠反复盲推。成功时这段不产生任何输出。
+        # 失败时把输出尾部作为 annotation 抛出。**这不是调试残留,是必要设施**:
+        # Actions 的完整日志要 admin 权限才能用 API 取(匿名拿到 403),job summary
+        # 也不进 check-run 的 output 字段 —— 只有 annotation 匿名可读。没有它,
+        # Linux 上 -race 报的竞态只能靠反复盲推。成功时不产生任何输出。
         run: |
           set -o pipefail
           go test -race -tags with_quic,with_utls -count=1 ./... 2>&1 | tee /tmp/agent-test.log || {
-            {
-              echo '### go test -race 失败(输出尾部 150 行)'
-              echo '```'
-              tail -150 /tmp/agent-test.log
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            msg=$(tail -70 /tmp/agent-test.log | python3 -c 'import sys; print(sys.stdin.read().replace("%","%25").replace("\r","%0D").replace("\n","%0A"))')
+            echo "::error title=go test -race 失败::$msg"
             exit 1
           }
 
