@@ -602,7 +602,7 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-/// 拉 `$EDITOR` 去改一台 agent 的自定义配置,回来后校验并存库。
+/// 拉编辑器去改一台 agent 的自定义配置,回来后校验并存库。
 ///
 /// **为什么用外部编辑器而不是在 TUI 里写一个。** 要改的是一段 JSON,
 /// 而设置页那种「一项一个输入框」的形态放不下它;ratatui 也没有现成的多行
@@ -610,25 +610,13 @@ fn restore_terminal() -> Result<()> {
 ///
 /// 挂起/接回终端的做法照 `run_self_upgrade` —— 包括那条教训:
 /// **无论成败都要把终端接回来**,半路 return 会把人扒在一个 raw mode 没关的 shell 里。
-///
-/// **不猜编辑器。** `$EDITOR` 没设就报错让人去设 —— 猜一个 `vi` 的风险是
-/// 把不会用 vi 的人扒进一个退不出来的界面里,而那时候 TUI 已经挂起了。
 async fn edit_custom_config<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     pool: &SqlitePool,
     id: i64,
     name: &str,
 ) -> Result<String> {
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "没设 $EDITOR。先 `export EDITOR=nano`(或 vim / micro)再重进这一页。\n\
-                 或者用 CLI:sbx agent-config-set {id} 片段.json"
-            )
-        })?;
+    let editor = pick_editor(id)?;
 
     let existing = crate::db::agent_repo::custom_config(pool, id).await?;
     let seed = match &existing {
@@ -641,9 +629,26 @@ async fn edit_custom_config<B: ratatui::backend::Backend>(
 
     restore_terminal()?;
     let _ = term.show_cursor();
+    // 落到 vi 族时先把退出方法说清,并等人按一下回车。
+    //
+    // 归根结底是因为这个提示**没处可放**:TUI 已经挂起,而编辑器一启动就会
+    // 盖掉屏幕上任何东西。删掉这一步的代价是把不会用 vi 的人扒进一个
+    // 退不出来的界面 —— 而那时候他的 TUI 也回不了。
+    if editor.needs_exit_hint {
+        println!();
+        println!("没设 $EDITOR,自动挑了这台机器上的 {}。", editor.cmd);
+        println!("  存盘退出:按 Esc,再输 :wq 回车");
+        println!("  不改了:  按 Esc,再输 :q! 回车");
+        println!("  不想用它:退出 TUI 后 `export EDITOR=nano` 再进来");
+        println!();
+        print!("按回车打开…");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut discard = String::new();
+        let _ = std::io::stdin().read_line(&mut discard);
+    }
     let status = std::process::Command::new("sh")
         .arg("-c")
-        .arg(format!("{editor} {}", path.display()))
+        .arg(format!("{} {}", editor.cmd, path.display()))
         .status();
     // 先把终端接回来,再判断结果。顺序反过来的话,编辑器异常退出时会从这里
     // return,把人扒在一个 raw mode 没关的 shell 里。
@@ -656,7 +661,7 @@ async fn edit_custom_config<B: ratatui::backend::Backend>(
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => anyhow::bail!("编辑器非零退出(exit {:?}),没改库", s.code()),
-        Err(e) => anyhow::bail!("起不来 {editor}:{e}"),
+        Err(e) => anyhow::bail!("起不来 {}:{e}", editor.cmd),
     }
     let edited = edited?;
 
@@ -680,6 +685,104 @@ async fn edit_custom_config<B: ratatui::backend::Backend>(
         "已存 {name} 的自定义配置:{}(rev {rev})。按 [K] 让它自己的 sing-box 再验一次",
         obj.keys().cloned().collect::<Vec<_>>().join(" / ")
     ))
+}
+
+/// 选定的编辑器,以及进去之前要不要先告诉人怎么退出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorChoice {
+    cmd: String,
+    /// vi 族且**不是人自己指定的**时为真。
+    ///
+    /// 自己 `export EDITOR=vim` 的人不需要被教怎么退 vim,多一步回车只是碍事。
+    /// 而被自动挑中的人可能压根没用过它。
+    needs_exit_hint: bool,
+}
+
+/// 按这个顺序挑编辑器。**排序的依据是「新手能不能自己退出来」**,
+/// 不是好用程度:
+///   * `nano` / `micro` 把按键写在屏幕底下(Ctrl-X / Ctrl-Q),不需要额外提示;
+///   * `vi` 族放最后,而且落到它们时要先把退出方法说清。
+///
+/// Alpine 上通常只有 busybox 的 `vi`,Debian/Ubuntu 默认带 `nano` ——
+/// 所以带提示的那条路主要是给 Alpine 走的。
+const EDITOR_CANDIDATES: &[&str] = &["nano", "micro", "nvim", "vim", "vi"];
+
+fn is_vi_family(cmd: &str) -> bool {
+    // 只看第一个词:`EDITOR="vim -u NONE"` 这种带参数的很常见。
+    let bin = cmd.split_whitespace().next().unwrap_or("");
+    let bin = bin.rsplit('/').next().unwrap_or(bin);
+    matches!(bin, "vi" | "vim" | "nvim" | "view" | "vimdiff")
+}
+
+/// 先听人的,再看机器上有什么。
+///
+/// **为何不是「没设 $EDITOR 就报错」。** 那是这个功能刚上线时的做法,理由是
+/// 「不猜编辑器,别把不会用 vi 的人扒进退不出来的界面」。真机上立即碰到了
+/// 比那个风险更大的问题:**干净的 VPS 上 `$EDITOR` 本来就没设**,于是
+/// 整个功能直接不可达。
+///
+/// 而且当时那句提示让人「先 export 再重进这一页」—— **那是错的**:
+/// 环境变量读的是本进程的,外面改不了一个已经在跑的 TUI。照那句做一定
+/// 失败,而人会得出「这功能坏的」这个结论。
+///
+/// 现在的做法两边都要:挑一个**真的装了的**编辑器,优先挑能自己退出来的;
+/// 实在只剩 vi 族就先把退出方法说清。一个都没有才报错。
+fn pick_editor(id: i64) -> Result<EditorChoice> {
+    // `VISUAL` 在前:惯例里它是全屏编辑器,`EDITOR` 可能是 `ed` 这种行编辑器。
+    // git 的优先级也是 VISUAL 在 EDITOR 之前。
+    let explicit = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|v| std::env::var(v).ok())
+        .find(|s| !s.trim().is_empty());
+    pick_editor_from(explicit.as_deref(), which, id)
+}
+
+/// `pick_editor` 的纯那一半:环境变量与「装了没装」都从参数进来。
+///
+/// 拆开的理由是**可测性**,而且这一次是被教训推着拆的:上一版测试直接改
+/// 进程的 `EDITOR` / `PATH` 来造场景,而 `cargo test` 默认多线程同进程 ——
+/// 把 `PATH` 清空的那一瞬,任何并行跑着、会 `sh -c` 出去的测试(doctor 那几条
+/// 就是)都可能莫名挂掉。那种失败跟不上任何代码改动,排起来特别费劳。
+fn pick_editor_from(
+    explicit: Option<&str>,
+    found: impl Fn(&str) -> bool,
+    id: i64,
+) -> Result<EditorChoice> {
+    if let Some(cmd) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(EditorChoice { cmd: cmd.to_string(), needs_exit_hint: false });
+    }
+    for cand in EDITOR_CANDIDATES {
+        if found(cand) {
+            return Ok(EditorChoice {
+                cmd: (*cand).to_string(),
+                needs_exit_hint: is_vi_family(cand),
+            });
+        }
+    }
+    anyhow::bail!(
+        "这台机器上一个编辑器都没有(找过 {})。三条路任选:\n\
+         · 装一个:apk add nano 或 apt install -y nano\n\
+         · 指定一个:按 [q] 退出 TUI,`export EDITOR=…` 后重新 `sbx tui`\n\
+           (环境变量对已经在跑的进程没用,必须重进)\n\
+         · 不用编辑器:sbx agent-config-set {id} 片段.json(也可以 `-` 读 stdin)",
+        EDITOR_CANDIDATES.join(" / ")
+    )
+}
+
+/// 这个命令在 PATH 里吗。
+///
+/// 用 `command -v` 而不是自己扫 PATH:它能同时认 shell 内建、函数和 alias,
+/// 而且下面真正启动编辑器走的也是 `sh -c` —— **两边用同一个解释器判断**,
+/// 否则会出现「挑中了但起不来」。
+fn which(cmd: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {cmd}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// 第一次打开编辑器时的初始内容。
@@ -3621,6 +3724,117 @@ mod tests {
         // 库里那份读不懂时仍然要说「有自定义」—— 存在本身就是人要知道的事。
         let out = line(Some("{ 这不是 json"));
         assert!(out.contains("自定义: 有"), "读不懂也该提一句:{out}");
+    }
+
+    /// **人自己指定的编辑器优先,而且不要多一步回车。**
+    ///
+    /// 自己 `export EDITOR=vim` 的人**不需要**被教怎么退 vim —— 那一步回车
+    /// 只是碍事。提示只给被自动挑中的人。
+    ///
+    /// 走纯函数 `pick_editor_from` 而不是改进程环境变量:`cargo test` 默认多线程
+    /// 同进程,而这个仓库里有不少会 `sh -c` 出去的测试。
+    #[test]
+    fn an_explicit_editor_wins_and_needs_no_hand_holding() {
+        let none = |_: &str| false;
+        let all = |_: &str| true;
+
+        let c = pick_editor_from(Some("my-editor --flag"), none, 1).unwrap();
+        assert_eq!(c.cmd, "my-editor --flag", "带参数的 EDITOR 要原样拿着");
+        assert!(!c.needs_exit_hint);
+
+        // 显式指定 vim 也不给提示。
+        let c = pick_editor_from(Some("vim"), all, 1).unwrap();
+        assert_eq!(c.cmd, "vim");
+        assert!(!c.needs_exit_hint, "自己指定的 vim 不应该被教怎么退");
+
+        // 前后空白得去掉 —— `export EDITOR="nano "` 带着尾空格很常见。
+        assert_eq!(pick_editor_from(Some("  nano  "), none, 1).unwrap().cmd, "nano");
+
+        // 空串与纯空白当没设(`EDITOR=` 写在 profile 里很常见)—— 否则会变成
+        // 「起不来 」这种看不懂的错。落到探测,而探测说啥都有 → 挑第一个候选。
+        for blank in [Some(""), Some("   "), None] {
+            assert_eq!(
+                pick_editor_from(blank, all, 1).unwrap().cmd,
+                EDITOR_CANDIDATES[0],
+                "{blank:?} 该当没设"
+            );
+        }
+    }
+
+    /// 自动挑中 vi 族时要标上「得先告诉人怎么退」。
+    #[test]
+    fn an_auto_picked_vi_asks_for_a_heads_up_but_nano_does_not() {
+        // 只有 vi 的机器(Alpine 的典型情况:busybox 带 vi,没 nano)。
+        let c = pick_editor_from(None, |c| c == "vi", 1).unwrap();
+        assert_eq!(c.cmd, "vi");
+        assert!(c.needs_exit_hint, "自动挑中的 vi 必须先把退出方法说清");
+
+        // 装了 nano 的机器(Debian/Ubuntu 默认)—— nano 把按键写在屏幕底下。
+        let c = pick_editor_from(None, |c| c == "nano" || c == "vi", 1).unwrap();
+        assert_eq!(c.cmd, "nano", "两个都有时该挑 nano");
+        assert!(!c.needs_exit_hint);
+    }
+
+    /// **vi 族的识别要能穿过路径和参数。**
+    ///
+    /// 认错的代价不对称:把 `nano` 误判成 vi 族只是多一屏提示;把 `vi` 漏判成
+    /// 非 vi 族,就是把一个不会用它的人直接扒进退不出来的界面 ——
+    /// 而那时候 TUI 已经挂起,他连回去的路都没有。
+    #[test]
+    fn the_vi_family_is_recognised_through_paths_and_flags() {
+        for yes in ["vi", "vim", "nvim", "/usr/bin/vim", "vim -u NONE", "view", "vimdiff"] {
+            assert!(is_vi_family(yes), "{yes} 该算 vi 族");
+        }
+        for no in ["nano", "micro", "/usr/bin/nano", "code --wait", "emacs", "mcedit", ""] {
+            assert!(!is_vi_family(no), "{no} 不该算 vi 族");
+        }
+
+        // **包装形式认不出来,而这不要紧。**
+        //
+        // 看的是第一个词,所以 `busybox vi` 里取到的是 busybox。一开始这条写的是
+        // 断言它该被识别,跑了才发现想错了 —— 两条进入这个函数的路都不会构成风险:
+        //
+        //   * 自动探测传进来的只有 EDITOR_CANDIDATES 里的裸名字。Alpine 上 `vi` 是
+        //     指向 busybox 的符链接,`command -v vi` 找到的就是 `vi` 这个词 —— 认得出来。
+        //   * 自己 `export EDITOR="busybox vi"` 的人本来就不走提示这条路。
+        //
+        // 所以这里钉的是**真实契约**而不是我当时以为的那个。哪天把包装形式也开成
+        // 自动候选(比如直接探测 busybox),这条会提醒同时把判据改成扫全部词。
+        assert!(!is_vi_family("busybox vi"), "看的是第一个词");
+        assert!(!is_vi_family("busybox"), "busybox 本身不是编辑器");
+        assert!(
+            !EDITOR_CANDIDATES.iter().any(|c| c.contains(' ')),
+            "候选里出现了带参数的形式 —— is_vi_family 的判据得跟着改成扫全部词"
+        );
+    }
+
+    /// 候选顺序的依据是「新手能不能自己退出来」,不是好用程度。
+    /// nano / micro 把按键写在屏幕底下,所以它们得在 vi 族前面。
+    #[test]
+    fn the_candidate_order_puts_self_explanatory_editors_first() {
+        let pos = |c: &str| EDITOR_CANDIDATES.iter().position(|x| *x == c);
+        let (nano, micro) = (pos("nano").expect("nano 该在候选里"), pos("micro").unwrap());
+        for vi in ["nvim", "vim", "vi"] {
+            let p = pos(vi).unwrap_or_else(|| panic!("{vi} 该在候选里"));
+            assert!(nano < p && micro < p, "{vi} 排在了 nano/micro 前面");
+        }
+        // 每个候选都得能被 is_vi_family 正确分类 —— 否则提示会发错对象。
+        assert!(!is_vi_family("nano") && !is_vi_family("micro"));
+        assert!(is_vi_family("vi") && is_vi_family("vim") && is_vi_family("nvim"));
+    }
+
+    /// **一个编辑器都没有时,三条出路都要给。**
+    ///
+    /// 尤其是不能再说「重进这一页」—— 那是第一版真实发出去过的提示,而它是错的:
+    /// 环境变量读的是本进程的,外面改不了一个已经在跑的 TUI。照那句做一定失败,
+    /// 而人会得出「这功能坏的」这个结论。
+    #[test]
+    fn with_no_editor_at_all_the_error_offers_three_ways_out() {
+        let e = pick_editor_from(None, |_| false, 5).unwrap_err().to_string();
+        assert!(e.contains("nano"), "该告诉人装一个:{e}");
+        assert!(e.contains("agent-config-set 5"), "该给不用编辑器的那条路,带上 id:{e}");
+        assert!(e.contains("sbx tui"), "该说清要重进整个 TUI:{e}");
+        assert!(!e.contains("重进这一页"), "这句是错的 —— 环境变量改不了已在跑的进程:{e}");
     }
 
     /// **模板里当前生效的配置只能是注释。**
