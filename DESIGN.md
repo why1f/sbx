@@ -43,8 +43,8 @@ Rust 主控无法访问 Go 对象。完整推论见 §0.2 / §0.3。
 
 ### 0.2 采用的方案:`Router().AppendTracker()`(读源码核实)
 
-> 核实基准:`github.com/SagerNet/sing-box` tag **`v1.14.0-beta.3`**,commit `1569c529`,
-> 关键行在默认分支 **`testing`** 上逐条复核一致。
+> 核实基准:`github.com/SagerNet/sing-box` tag **`v1.14.0`**(正式版;beta.3 时期核实的
+> 关键行逐条复核一致,`AppendTracker` 与 `md.Inbound` 语义未变 —— 见 §12.0 的 spike)。
 > **该仓库没有 `main` 也没有 `dev-next` 分支**,默认分支是 `testing`;别再去找 `main`。
 
 **统计不走任何 API 面,而是用 sing-box 的公开接口把自己的计数器挂到数据路径上。**
@@ -594,7 +594,7 @@ func (t *Tracker) RoutedConnection(ctx context.Context, conn net.Conn,
 `stats.report` 的记录是 `(name, tag, up, down)`(§4.3)——**填不进去**。
 这不是能事后补救的取舍:合并发生在计数阶段,数据一旦塌掉就无法拆回。
 
-> ✅ **`md.Inbound` 已由 §12.0 的 spike 在 sing-box v1.14.0-beta.3 上实测确认。**
+> ✅ **`md.Inbound` 已由 §12.0 的 spike 在 sing-box v1.14.0 上实测确认。**
 > 已核实的是 `adapter.InboundContext.User string`(`adapter/inbound.go:54`);
 > inbound tag 的字段名确实是 `md.Inbound`,且填的是**配置里的 tag 字符串**
 > （实测 `md.Inbound == "vless-in"`，与配置一致；另有 `md.InboundType == "vless"` 是协议名，不是 tag）。
@@ -674,7 +674,7 @@ box.New(新配置)                       ← 构造期校验,不绑端口。这�
 
 ### 7.5 用户启停:走内存,不重建 box
 
-**已核实的事实(v1.14.0-beta.3 / `testing`):sing-box 不支持运行时改用户,八个协议里只有 Shadowsocks 多用户例外。**
+**已核实的事实(v1.14.0 / `testing`):sing-box 不支持运行时改用户,八个协议里只有 Shadowsocks 多用户例外。**
 
 | 协议 | inbound 上有导出的 `UpdateUsers`? | 底层库支持? |
 |---|---|---|
@@ -1215,7 +1215,7 @@ tracked 源码资产,安装脚本从与二进制相同的 `v${VERSION}` tag 获�
 
 ## 12. 真实 sing-box 验证基线
 
-`spike/` 已在 sing-box v1.14.0-beta.3 上验证并进入 CI:
+`spike/` 已在 sing-box v1.14.0 上验证并进入 CI:
 
 1. per-user / inbound tag 流量真实到账,read=上行、write=下行；
 2. 禁用用户的新连接在毫秒级被拒,错误文本不泄露 quota/expire/ban 状态；

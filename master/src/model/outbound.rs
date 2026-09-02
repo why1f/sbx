@@ -3,7 +3,7 @@
 //! ## 为什么不是 `domain_strategy`
 //!
 //! sing-box 的 dial 字段 `domain_strategy` 从 1.12.0 起弃用、**1.14.0 已移除**,
-//! 而 agent 内嵌的正是 v1.14.0-beta.3(§0.3)。写它的后果不是「不生效」,
+//! 而 agent 内嵌的正是 v1.14.0(§0.3)。写它的后果不是「不生效」,
 //! 是 `box.New()` 直接失败 —— 整台机器的代理一起停,而错误信息只说
 //! 「配置无效」,离真正的原因很远。
 //!
@@ -176,7 +176,7 @@ mod tests {
     use super::*;
 
     /// **绝不能写 `domain_strategy`。** 那个字段 1.14.0 已移除,而 agent 内嵌的
-    /// 就是 1.14.0-beta.3 —— 写了不是「不生效」,是 `box.New()` 直接失败,
+    /// 就是 1.14.0 —— 写了不是「不生效」,是 `box.New()` 直接失败,
     /// 整台机器的代理一起停,错误信息只说「配置无效」。
     #[test]
     fn never_writes_the_removed_domain_strategy_field() {

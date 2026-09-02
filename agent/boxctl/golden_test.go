@@ -99,7 +99,7 @@ func TestRealityGoldenHasNoPublicKey(t *testing.T) {
 //     `{"address":"local"}`。
 //
 // 另外直接断言配置里没有 `domain_strategy`。那个字段 1.14.0 已移除,而这里
-// require 的就是 1.14.0-beta.3 —— 但它**移除得没有声音**:实测 Check 会照常
+// require 的就是 1.14.0 —— 但它**移除得没有声音**:实测 Check 会照常
 // 返回 nil,字段被静默丢掉。所以这一条不能指望 sing-box 帮我们发现,
 // 只能在这里自己按字符串挡:线上写错了是不会有任何报错的。
 const outboundGoldenDir = "../../master/testdata/outbound"

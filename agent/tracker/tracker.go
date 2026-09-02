@@ -8,7 +8,7 @@
 //     只按用户名记账会让它们塌成一个数字,而 master 的 user_traffic 主键是 (user_id, node_id)。
 //   - **只增不减。** 删掉的用户/节点会继续上报到进程重启为止,master 侧丢弃未知条目(§4.3)。
 //
-// §12.0 的 spike 已在 sing-box v1.14.0-beta.3 上实测通过,本文件的两个待确认项都已落定:
+// §12.0 的 spike 已在 sing-box v1.14.0 上实测通过,本文件的两个待确认项都已落定:
 //  1. inbound tag 的字段名确实是 `md.Inbound`,且填的是**配置里的 tag 字符串**
 //     (实测 md.Inbound == "vless-in",与配置一致;另有 md.InboundType == "vless");
 //  2. rejected(conn) 3ms 内生效,客户端看到的是普通的连接中断,不泄露账户状态。

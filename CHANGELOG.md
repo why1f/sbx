@@ -4,6 +4,39 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.33
+
+### 改
+
+- **agent 内嵌的 sing-box 从 `v1.14.0-beta.3` 升到 `v1.14.0` 正式版**（上游 8-31
+  发布）。三个独立 module（`agent/` `spike/` `e2e/`）一起升 —— 后两个不同步升
+  就等于「验的不是 agent 实际跑的那一版」，spike 尤其：它的整个价值就在于
+  「升级 sing-box 后能重跑一遍」。
+
+  验证不是靠读 changelog，是靠跑：
+
+  - **spike 真流量真记账通过**，`up=131080 / down=2097152` 与那组刻意不对称的
+    期望值一字不差。这是本次升级最要紧的一条证据 —— 它同时证明
+    `Router().AppendTracker()`（§0.2 里唯一的非公开 API 依赖）和
+    `md.Inbound`（记账键的来源）语义都没变。
+  - 八协议 golden 跨语言校验通过：真 sing-box 吃主控生成的配置。
+  - `linux/amd64` 与 `linux/arm64` 交叉编译通过；不带 `with_quic,with_utls`
+    时编译期哨兵照旧拒绝构建。
+
+  破坏性变更核查（1.14.0 changelog + 废弃列表）：`rc.1` 到正式版全是 fixes；
+  与本项目相关的移除项只有一条 —— **旧版 DNS server 格式在 1.14.0 移除**，
+  而主控生成的一直是新格式（`{"type": "local", "tag": "local"}`），不受影响；
+  自定义片段里若有人写旧格式（`address:`）会被 sing-box 拒，但那在 beta.3
+  上就已经如此。
+
+  sing-box 1.14 放弃了 go1.24，三个 module 的 `go` 指令随 `go mod tidy` 升到
+  1.25.5。CI/release 用的是 `go-version: stable`，不需要改。
+
+- 文档与注释里的版本基准同步到 `v1.14.0`：`DESIGN.md` §0.2 的源码核实基准、
+  §12.0、`agent/tracker/tracker.go`、`master/src/model/outbound.rs`（讲
+  `domain_strategy` 已被移除的那两处）、`agent/boxctl/golden_test.go`、
+  `spike/README.md`、三个 `go.mod` 的说明注释。
+
 ## v0.4.32
 
 ### 修
