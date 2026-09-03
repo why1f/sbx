@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -38,6 +39,13 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Token == "" {
 		return nil, errors.New("配置缺少 token")
+	}
+	// 明文 ws://(主控 cluster.tls = false 的部署)是允许的,但**指纹在明文下根本
+	// 不会被看一眼** —— 没有 TLS 就没有证书可比。写了 fingerprint 又写 ws:// 的人
+	// 以为自己是钉住了的,而 token 正裸奔到一个没验过身份的对端。这种自相矛盾的
+	// 配置直接拒掉,而不是静默选一边;明文本身的提醒在拨号那里打(conn.tlsConfig)。
+	if !strings.HasPrefix(cfg.Server, "wss://") && cfg.Fingerprint != "" && !cfg.Insecure {
+		return nil, errors.New("server 是明文 ws:// 却配了 fingerprint:没有 TLS 就没有证书可比,指纹不会生效。要钉指纹请改用 wss://;确实要明文就删掉 fingerprint")
 	}
 	if cfg.StateDir == "" {
 		cfg.StateDir = DefaultStateDir

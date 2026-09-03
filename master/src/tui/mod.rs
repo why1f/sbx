@@ -444,6 +444,13 @@ impl App {
                 self.sel[i] = len.saturating_sub(1);
             }
         }
+        // 仪表盘那两个光标同理 —— 否则删掉最后一个用户后按 Enter 会报
+        // 「这一栏还没有节点」,而栏里明明还有行。
+        for (s, len) in self.dash_sel.iter_mut().zip([self.users.len(), self.nodes.len()]) {
+            if *s >= len {
+                *s = len.saturating_sub(1);
+            }
+        }
         Ok(())
     }
 
@@ -541,9 +548,16 @@ pub async fn run(pool: SqlitePool, cfg: Config, cfg_path: String) -> Result<()> 
     }));
 
     enable_raw_mode().context("进入 raw mode 失败(当前不是一个交互终端?)")?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
-    let mut term = Terminal::new(CrosstermBackend::new(stdout))?;
+    // 从这里起 raw mode 已经开了。下面两步任一失败都要把它关回去,否则人回到
+    // shell 时敲什么都不回显 —— panic hook 和循环之后的 restore 都覆盖不到这两行。
+    let mut term = (|| -> Result<_> {
+        let mut stdout = std::io::stdout();
+        crossterm::execute!(stdout, EnterAlternateScreen)?;
+        Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    })()
+    .inspect_err(|_| {
+        let _ = restore_terminal();
+    })?;
 
     let result = event_loop(&mut term, App::new(pool, cfg, cfg_path)).await;
 
@@ -946,7 +960,13 @@ async fn event_loop<B: ratatui::backend::Backend>(
                                 }
                                 resume_input(&input_paused, &mut rx);
                             }
-                            app.refresh().await?;
+                            // 和下面 tick 那条路一样处理:动作本身已经落库了,刷新
+                            // 时撞上 daemon 正在写(busy_timeout 5 秒都等不到)不该
+                            // 让整个 TUI 退到 shell —— 那样人看到的是「按了一下 [d]
+                            // 程序没了」,而删除其实已经成功。
+                            if let Err(e) = app.refresh().await {
+                                app.fail(format!("刷新失败: {e}"));
+                            }
                         }
                     }
                 }

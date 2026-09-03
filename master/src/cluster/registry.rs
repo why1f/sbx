@@ -114,6 +114,14 @@ impl Registry {
         }
     }
 
+    /// 带 `epoch` 的这条连接是不是该 agent **当前登记在册**的那条。
+    ///
+    /// 被驱逐的连接处理协程用它判断自己是否还该处理收到的消息(见 server.rs 的
+    /// recv_loop):驱逐只丢掉发送端,读循环得自己发现「我已经不是正主了」。
+    pub fn owns(&self, agent_id: i64, epoch: u64) -> bool {
+        self.conns.get(&agent_id).is_some_and(|c| c.epoch == epoch)
+    }
+
     /// 取某 agent 当前连接的发送端。离线时为 `None`。
     pub fn get(&self, agent_id: i64) -> Option<&ConnTx> {
         self.conns.get(&agent_id).map(|c| &c.tx)

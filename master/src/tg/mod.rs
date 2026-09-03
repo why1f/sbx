@@ -295,10 +295,16 @@ async fn handle_message(ctx: &Ctx, chat_id: i64, text: &str) -> Result<()> {
         return handle_pending(ctx, chat_id, text, p).await;
     }
 
-    if let Some(code) = text.strip_prefix("/bind") {
-        return bind(ctx, chat_id, code.trim()).await;
+    // 命令按空白切开,并剥掉群里 Telegram 会附上的 `@BotName` 后缀。
+    // 以前用 `strip_prefix("/bind")`:`/bind@sbx_bot CODE` 的「绑定码」会变成
+    // `@sbx_bot CODE` 永远无效,`/bindfoo` 也会被当成 `/bind`。
+    let mut words = text.split_whitespace();
+    let cmd = words.next().unwrap_or("");
+    let cmd = cmd.split('@').next().unwrap_or(cmd);
+    if cmd == "/bind" {
+        return bind(ctx, chat_id, words.next().unwrap_or("")).await;
     }
-    match text {
+    match cmd {
         "/start" | "/menu" => send_home(ctx, chat_id, None).await,
         "/usage" => send_usage(ctx, chat_id, None).await,
         "/sub" => send_sub(ctx, chat_id, None).await,

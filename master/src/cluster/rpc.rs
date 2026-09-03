@@ -118,15 +118,35 @@ impl Rpc {
 
     /// 收到 `resp` 时把它交给等待方。
     ///
-    /// 返回 false 表示没有对应的等待者——通常是**已经超时**的请求的迟到回应。
+    /// `from_agent` 是**这条 resp 从哪条连接读到的**。请求 id 是 `r0`、`r1` 这样
+    /// 可预测的序号,而 pending 表是全局一张 —— 若只按 id 关联,任何一台已认证的
+    /// agent 都能伪造 `{"kind":"resp","id":"r17"}` 替别的 agent 把 `config.apply` /
+    /// `user.state` 应答成「成功」,主控随即 `mark_*_sent`,受害的那台就再也收不到
+    /// 它该收的配置或禁用名单。一台被攻破的 VPS 不该能对其余机器做这件事。
+    /// 所以这里同时校 agent:不是自己的 pending 就原样留着、返回 false。
+    ///
+    /// 返回 false 的另一种情况是没有对应的等待者——通常是**已经超时**的请求的迟到回应。
     /// 这不是错误,记 trace 即可;若频繁出现,说明超时设得太短。
-    pub async fn resolve(&self, resp: Envelope) -> bool {
+    pub async fn resolve(&self, from_agent: i64, resp: Envelope) -> bool {
         let Some(id) = resp.id.clone() else {
             return false;
         };
-        let Some(p) = self.pending.lock().await.remove(&id) else {
+        let mut pending = self.pending.lock().await;
+        let owned = pending.get(&id).is_some_and(|p| p.agent_id == from_agent);
+        if !owned {
+            if pending.contains_key(&id) {
+                tracing::warn!(
+                    from_agent,
+                    id,
+                    "收到一条不属于该 agent 的 resp,已忽略(id 属于另一台 agent 的 pending)"
+                );
+            }
+            return false;
+        }
+        let Some(p) = pending.remove(&id) else {
             return false;
         };
+        drop(pending);
         // 接收端已被丢弃(调用方自己取消了)时 send 失败,不是问题。
         p.tx.send(resp).is_ok()
     }
@@ -184,11 +204,10 @@ mod tests {
         let req = rx.recv().await.unwrap();
         assert_eq!(req.method, method::BOX_STATUS);
         let id = req.id.clone().unwrap();
-        rpc.resolve(Envelope::resp_ok(
-            id,
-            method::BOX_STATUS,
-            serde_json::json!({"running": true}),
-        ))
+        rpc.resolve(
+            1,
+            Envelope::resp_ok(id, method::BOX_STATUS, serde_json::json!({"running": true})),
+        )
         .await;
 
         let payload = caller.await.unwrap().unwrap();
@@ -220,7 +239,7 @@ mod tests {
 
         let id = rx.recv().await.unwrap().id.unwrap();
         // config.apply 失败时回 check 失败原文(§4.2)
-        rpc.resolve(Envelope::resp_err(id, method::CONFIG_APPLY, "解析 inbound 失败: 端口冲突"))
+        rpc.resolve(1, Envelope::resp_err(id, method::CONFIG_APPLY, "解析 inbound 失败: 端口冲突"))
             .await;
 
         let err = caller.await.unwrap().unwrap_err();
@@ -288,7 +307,8 @@ mod tests {
         assert!(matches!(c1.await.unwrap().unwrap_err(), RpcError::Disconnected));
 
         // agent 2 的请求还活着
-        rpc.resolve(Envelope::resp_ok(id2, method::BOX_STATUS, serde_json::json!({"ok": 1}))).await;
+        rpc.resolve(2, Envelope::resp_ok(id2, method::BOX_STATUS, serde_json::json!({"ok": 1})))
+            .await;
         assert!(c2.await.unwrap().is_ok(), "另一台 agent 的 pending 不该被牵连");
     }
 
@@ -296,8 +316,9 @@ mod tests {
     #[tokio::test]
     async fn late_response_is_dropped_quietly() {
         let rpc = Rpc::new();
-        let accepted =
-            rpc.resolve(Envelope::resp_ok("r999", method::BOX_STATUS, serde_json::json!({}))).await;
+        let accepted = rpc
+            .resolve(1, Envelope::resp_ok("r999", method::BOX_STATUS, serde_json::json!({})))
+            .await;
         assert!(!accepted, "没有等待者时应返回 false");
     }
 
@@ -307,7 +328,32 @@ mod tests {
         let rpc = Rpc::new();
         let mut env = Envelope::resp_ok("x", method::BOX_STATUS, serde_json::json!({}));
         env.id = None;
-        assert!(!rpc.resolve(env).await);
+        assert!(!rpc.resolve(1, env).await);
+    }
+
+    /// 别的 agent 拿着可预测的 id 冒充 resp,不能替受害者把请求应答掉。
+    #[tokio::test]
+    async fn response_from_another_agent_does_not_resolve_the_pending() {
+        let rpc = Arc::new(Rpc::new());
+        let (registry, mut rx) = registry_with_agent(1);
+
+        let rpc2 = rpc.clone();
+        let caller = tokio::spawn(async move {
+            rpc2.call(&registry, 1, method::CONFIG_APPLY, serde_json::json!({}), 300).await
+        });
+        let id = rx.recv().await.unwrap().id.unwrap();
+
+        // agent 2 伪造 agent 1 那条请求的 resp
+        let forged = Envelope::resp_ok(id.clone(), method::CONFIG_APPLY, serde_json::json!({}));
+        assert!(!rpc.resolve(2, forged).await, "别人的 resp 不该被接受");
+        assert_eq!(rpc.pending_count().await, 1, "pending 必须原样留着");
+
+        // 真正的 agent 1 回来,照常完成
+        assert!(
+            rpc.resolve(1, Envelope::resp_ok(id, method::CONFIG_APPLY, serde_json::json!({})))
+                .await
+        );
+        assert!(caller.await.unwrap().is_ok());
     }
 
     #[tokio::test]

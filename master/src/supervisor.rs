@@ -76,6 +76,13 @@ pub async fn tick(
     sum.disabled = disabled;
     sum.reenabled = reenabled;
 
+    // 审计表的保留期。`auth_failed` 这一种是**未认证**连接就能写的:对外暴露的
+    // `/ws` 会被扫描,没有上限的话库文件只会一路涨。90 天足够回溯一次事故。
+    // 失败不影响巡检其余部分 —— 少删一轮没有任何后果。
+    if let Err(e) = prune_events(pool, now).await {
+        tracing::warn!(error = %e, "清理过期 agent_events 失败");
+    }
+
     if sum.changed() {
         // 一轮里所有变化共用一次 revision 推进,这样各 agent 拿到的是同一个值。
         sqlx::query("UPDATE agents SET user_state_revision = user_state_revision + 1")
@@ -458,6 +465,40 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
         return;
     }
 
+    // **先读 revision,再读名单。** 顺序反过来会漏掉一次停用:
+    // 先读了名单(旧的),TUI 这时提交「停用 alice」并把 revision 加一,
+    // 然后这里读到**新的** revision —— 于是把旧名单盖着新版本号发出去,还记成
+    // 「这一版已下发」。agent 也把这个版本号落盘,下次握手两边一比相等,什么都不发。
+    // alice 的停用就这样悄悄丢了,直到下一次无关的名单变更。
+    // 现在的顺序下最坏情况是「新名单盖着旧版本号」—— 下一拍会再发一次,无害。
+    let mut revs: Vec<(i64, i64)> = Vec::with_capacity(online.len());
+    for agent_id in online {
+        match sqlx::query_scalar::<_, i64>("SELECT user_state_revision FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(r) => revs.push((agent_id, r)),
+            Err(e) => {
+                tracing::debug!(agent_id, error = %e, "读取 user_state_revision 失败,本轮跳过")
+            }
+        }
+    }
+
+    // 只给真的落后的那些查名单;一台都不落后就一次库都不多查。
+    let behind: Vec<(i64, i64)> = {
+        let reg = registry.lock().await;
+        revs.into_iter()
+            .filter(|(agent_id, master_rev)| {
+                // `None` = 握手的 catch_up 还没跑完(并行 spawn 的),它正要处理这件事。
+                reg.sent_user_rev(*agent_id).is_some_and(|sent| sent < *master_rev)
+            })
+            .collect()
+    };
+    if behind.is_empty() {
+        return;
+    }
+
     // 名单是全局的,查一次给所有人用。
     let disabled = match crate::service::disabled_users(pool).await {
         Ok(d) => d,
@@ -467,28 +508,7 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
         }
     };
 
-    for agent_id in online {
-        let master_rev: i64 =
-            match sqlx::query_scalar("SELECT user_state_revision FROM agents WHERE id = ?")
-                .bind(agent_id)
-                .fetch_one(pool)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::debug!(agent_id, error = %e, "读取 user_state_revision 失败,本轮跳过");
-                    continue;
-                }
-            };
-
-        // `None` = 握手的 catch_up 还没跑完(并行 spawn 的),它正要处理这件事。
-        let Some(sent) = registry.lock().await.sent_user_rev(agent_id) else {
-            continue;
-        };
-        if sent >= master_rev {
-            continue;
-        }
-
+    for (agent_id, master_rev) in behind {
         let payload = serde_json::json!({
             "user_state_revision": master_rev,
             "disabled": disabled,
@@ -508,6 +528,16 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
     }
 }
 
+/// `agent_events` 的保留天数。
+const EVENT_RETENTION_DAYS: i64 = 90;
+
+/// 删掉超过保留期的审计记录。返回删掉的行数。
+async fn prune_events(pool: &SqlitePool, now: i64) -> Result<u64> {
+    let cutoff = now - EVENT_RETENTION_DAYS * 86_400;
+    let r = sqlx::query("DELETE FROM agent_events WHERE at < ?").bind(cutoff).execute(pool).await?;
+    Ok(r.rows_affected())
+}
+
 /// 启动巡检循环。
 ///
 /// 首轮**立刻**跑一次而不是等一个周期:主控刚起来时库里的 enabled 状态
@@ -524,10 +554,16 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
 ///
 /// **一条失败不影响其余。** 十台里有一台取不到产物,另外九台照升;
 /// 失败原因写回那一行,界面上能看到「为什么这台还是旧版本」。
+/// `agent.upgrade` 的等待上限。agent 在应答之前要先把新二进制**下载完、校验完、
+/// 替换掉**(它的 HTTP 客户端超时是 10 分钟),一台从 GitHub 拉 30 MB 只有几百 KB/s
+/// 的 VPS 要跑上一两分钟。用默认的 30 秒等它,主控会把一次正常的升级记成
+/// 「Timeout」,而 agent 随后照样换掉二进制退出 —— 界面上就是一条假失败。
+const UPGRADE_TIMEOUT_SECS: u64 = 10 * 60 + 30;
+
 async fn drain_commands(
     pool: &SqlitePool,
     registry: &std::sync::Arc<tokio::sync::Mutex<crate::cluster::Registry>>,
-    rpc: &crate::cluster::Rpc,
+    rpc: &Arc<Rpc>,
     now: i64,
 ) -> Result<usize> {
     let pending = crate::db::command_repo::take_pending(pool, now).await?;
@@ -554,6 +590,34 @@ async fn drain_commands(
         };
         let payload: serde_json::Value =
             serde_json::from_str(&cmd.payload_json).unwrap_or(serde_json::Value::Null);
+        if method == sbx_shared::method::AGENT_UPGRADE {
+            // 升级单独开一个任务等:十分钟的等待不能挂在巡检循环上,否则这段时间
+            // 里所有 agent 的配置推送、配额判定全停。结果照样写回那一行。
+            // `take_pending` 已经把它标成「取走」,不会被下一拍重复下发。
+            let (pool, registry, rpc) = (pool.clone(), registry.clone(), rpc.clone());
+            tokio::spawn(async move {
+                let result =
+                    rpc.call(&registry, cmd.agent_id, method, payload, UPGRADE_TIMEOUT_SECS).await;
+                let err = match &result {
+                    Ok(_) => {
+                        tracing::info!(agent_id = cmd.agent_id, "agent.upgrade 已完成");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent_id = cmd.agent_id, error = %e, "agent.upgrade 失败");
+                        Some(e.to_string())
+                    }
+                };
+                let done_at = chrono::Local::now().timestamp();
+                if let Err(e) =
+                    crate::db::command_repo::finish(&pool, cmd.id, err.as_deref(), done_at).await
+                {
+                    tracing::error!(id = cmd.id, error = %e, "写回 agent.upgrade 结果失败");
+                }
+            });
+            done += 1;
+            continue;
+        }
         let result = rpc.call_default(registry, cmd.agent_id, method, payload).await;
         let err = match &result {
             Ok(_) => {
@@ -1406,11 +1470,14 @@ mod tests {
             assert_eq!(env.method, method::CONFIG_CHECK, "该是 config.check");
             // payload 是入队方拼好的,daemon 只转发 —— 不能在中间重组。
             assert!(env.payload.get("options").is_some(), "options 丢了:{:?}", env.payload);
-            rpc2.resolve(sbx_shared::Envelope::resp_ok(
-                env.id.clone().unwrap(),
-                method::CONFIG_CHECK,
-                serde_json::json!({}),
-            ))
+            rpc2.resolve(
+                id,
+                sbx_shared::Envelope::resp_ok(
+                    env.id.clone().unwrap(),
+                    method::CONFIG_CHECK,
+                    serde_json::json!({}),
+                ),
+            )
             .await;
         });
 
@@ -1449,11 +1516,14 @@ mod tests {
                 .await
                 .expect("5 秒内没等到下发")
                 .expect("通道被关了");
-            rpc2.resolve(sbx_shared::Envelope::resp_err(
-                env.id.clone().unwrap(),
-                method::CONFIG_CHECK,
-                verbatim,
-            ))
+            rpc2.resolve(
+                id,
+                sbx_shared::Envelope::resp_err(
+                    env.id.clone().unwrap(),
+                    method::CONFIG_CHECK,
+                    verbatim,
+                ),
+            )
             .await;
         });
 
@@ -1505,11 +1575,14 @@ mod tests {
             assert_eq!(env.method, method::CONFIG_APPLY, "该是 config.apply");
             let rev = env.payload.get("revision").and_then(|v| v.as_i64());
             assert_eq!(rev, Some(1), "带的该是新版本号");
-            rpc2.resolve(sbx_shared::Envelope::resp_ok(
-                env.id.clone().unwrap(),
-                method::CONFIG_APPLY,
-                serde_json::json!({}),
-            ))
+            rpc2.resolve(
+                id,
+                sbx_shared::Envelope::resp_ok(
+                    env.id.clone().unwrap(),
+                    method::CONFIG_APPLY,
+                    serde_json::json!({}),
+                ),
+            )
             .await;
         });
 
@@ -1544,11 +1617,14 @@ mod tests {
                 .await
                 .expect("5 秒内没等到下发")
                 .expect("通道被关了");
-            rpc2.resolve(sbx_shared::Envelope::resp_ok(
-                env.id.clone().unwrap(),
-                method::CONFIG_APPLY,
-                serde_json::json!({}),
-            ))
+            rpc2.resolve(
+                id,
+                sbx_shared::Envelope::resp_ok(
+                    env.id.clone().unwrap(),
+                    method::CONFIG_APPLY,
+                    serde_json::json!({}),
+                ),
+            )
             .await;
             // 第二轮不该再来 —— 再收到就是重复下发。
             rx
@@ -1581,11 +1657,14 @@ mod tests {
                 .await
                 .expect("5 秒内没等到下发")
                 .expect("通道被关了");
-            rpc2.resolve(sbx_shared::Envelope::resp_err(
-                env.id.clone().unwrap(),
-                method::CONFIG_APPLY,
-                "端口冲突",
-            ))
+            rpc2.resolve(
+                id,
+                sbx_shared::Envelope::resp_err(
+                    env.id.clone().unwrap(),
+                    method::CONFIG_APPLY,
+                    "端口冲突",
+                ),
+            )
             .await;
         });
         push_config(&p, &reg, &rpc).await;
@@ -1625,11 +1704,14 @@ mod tests {
                 .filter_map(|v| v.as_str())
                 .collect();
             assert!(names.contains(&"alice"), "名单里该有 alice:{names:?}");
-            rpc2.resolve(sbx_shared::Envelope::resp_ok(
-                env.id.clone().unwrap(),
-                method::USER_STATE,
-                serde_json::json!({}),
-            ))
+            rpc2.resolve(
+                id,
+                sbx_shared::Envelope::resp_ok(
+                    env.id.clone().unwrap(),
+                    method::USER_STATE,
+                    serde_json::json!({}),
+                ),
+            )
             .await;
         });
 

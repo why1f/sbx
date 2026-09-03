@@ -145,6 +145,10 @@ async fn handle_sub(
 
     let mut out = HeaderMap::new();
     out.insert(header::CONTENT_TYPE, HeaderValue::from_static(ctype));
+    // 响应体里是密码/uuid,统计页还内嵌 sub_token。前面若有默认会缓存的
+    // nginx/CDN(`use_public_base_as_server` 正是为那种部署准备的),一个用户的
+    // 订阅可能被喂给另一次请求,或在吊销之后还留在缓存里。
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
     // 客户端拿它显示「已用 / 总量 / 到期」。查失败就不发这个头 ——
     // 少一个头只是少显示一行,而让整个订阅 500 会让用户直接断网。
     match usage_header(&s.pool, user_id).await {

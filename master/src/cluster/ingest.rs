@@ -46,8 +46,13 @@ pub async fn ingest_stats(
     let mut out = StatsOutcome::default();
 
     // BEGIN IMMEDIATE 作跨进程写锁(§6.3):daemon 与 TUI 会同时在跑。
-    let mut tx = pool.begin().await?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *tx).await.ok();
+    //
+    // 必须用 `begin_with`:`pool.begin()` 自己已经发了一条 `BEGIN`(DEFERRED),
+    // 之后再执行 `BEGIN IMMEDIATE` 只会得到 "cannot start a transaction within a
+    // transaction" —— 以前这里就是那样写的,错误被 `.ok()` 吞掉,事务实际上一直是
+    // DEFERRED:先读快照、再在 UPSERT 时升级成写锁,TUI 恰好在中间提交时得到的是
+    // SQLITE_BUSY_SNAPSHOT(busy_timeout 对它不生效),整条上报失败等下一轮。
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     for u in &r.users {
         let ids: Option<(i64, i64)> = sqlx::query_as(
@@ -83,7 +88,11 @@ pub async fn ingest_stats(
             None => (None, 0, 0),
         };
 
-        let d = delta::compute_pair(last_epoch, last_up, last_down, &r.counter_epoch, u.up, u.down);
+        // 计数器不可能是负的。收到负数说明 agent 有 bug 或数据被动过手脚:
+        // 若原样存进 `last_*`,下一次上报一个 0 就会算出 `0 - (-X) = X` 的增量,
+        // 凭空记出 X 字节。在这里钳到 0,存的和算的都是钳过的值。
+        let (up, down) = (u.up.max(0), u.down.max(0));
+        let d = delta::compute_pair(last_epoch, last_up, last_down, &r.counter_epoch, up, down);
         out.epoch_changed |= d.epoch_changed;
 
         // UPSERT:第一次见到这个 (user, node) 就建行,之后累加。
@@ -106,8 +115,8 @@ pub async fn ingest_stats(
         .bind(user_id)
         .bind(node_id)
         .bind(&r.counter_epoch)
-        .bind(u.up)
-        .bind(u.down)
+        .bind(up)
+        .bind(down)
         .bind(d.up)
         .bind(d.down)
         .bind(d.up)
@@ -156,8 +165,7 @@ pub async fn ingest_sysinfo(
     r: &SysinfoReport,
     now: i64,
 ) -> Result<SysinfoOutcome> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *tx).await.ok();
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?; // 理由见 ingest_stats
 
     let prev: Option<(Option<String>, i64, i64)> = sqlx::query_as(
         "SELECT boot_id, last_rx, last_tx FROM agent_nic_traffic WHERE agent_id = ?",
@@ -182,10 +190,12 @@ pub async fn ingest_sysinfo(
     // 注意这**不影响 boot_id 变更**那条路:机器重启后计数器确实是从 0 开始的,
     // 那时 delta = new 才是对的。区别只在「有没有基线」,不在「epoch 变没变」。
     let first_contact = prev.is_none();
+    // 负数钳到 0,理由同 ingest_stats。
+    let (rx, tx_) = (r.nic.rx.max(0), r.nic.tx.max(0));
     let d = if first_contact {
         delta::PairDelta { up: 0, down: 0, epoch_changed: false }
     } else {
-        delta::compute_pair(last_boot, last_rx, last_tx, &r.boot_id, r.nic.rx, r.nic.tx)
+        delta::compute_pair(last_boot, last_rx, last_tx, &r.boot_id, rx, tx_)
     };
 
     sqlx::query(
@@ -202,8 +212,8 @@ pub async fn ingest_sysinfo(
     )
     .bind(agent_id)
     .bind(&r.boot_id)
-    .bind(r.nic.rx)
-    .bind(r.nic.tx)
+    .bind(rx)
+    .bind(tx_)
     .bind(d.up)
     .bind(d.down)
     .bind(now) // cycle_start 只在建行时生效(ON CONFLICT 不更新它)

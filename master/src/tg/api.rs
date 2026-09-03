@@ -47,6 +47,8 @@ pub struct Api {
     client: reqwest::Client,
     token: String,
     timeout: Duration,
+    /// 只有测试会改它:把请求指向一个本机端口,好在不出网的前提下制造错误。
+    base: String,
 }
 
 impl Api {
@@ -56,15 +58,24 @@ impl Api {
             .connect_timeout(timeout)
             .build()
             .context("构建 Telegram HTTP 客户端失败")?;
-        Ok(Self { client, token: token.to_string(), timeout })
+        Ok(Self {
+            client,
+            token: token.to_string(),
+            timeout,
+            base: "https://api.telegram.org".to_string(),
+        })
     }
 
     /// **不要把它写进日志。** bot_token 是凭据(§11.3)。
     fn url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.token, method)
+        format!("{}/bot{}/{}", self.base, self.token, method)
     }
 
     async fn post(&self, method: &str, payload: &Value, timeout: Duration) -> Result<Value> {
+        // `reqwest::Error` 的 Display 会带上请求 URL —— 而 URL 里就是 bot_token。
+        // 超时、DNS 抖动这类最常见的错误全走这条路,再被上层 `error = %e` 写进
+        // journald。`without_url()` 把它剥掉;`api_error_display_never_contains_token`
+        // 钉住这件事。
         let resp = self
             .client
             .post(self.url(method))
@@ -72,9 +83,13 @@ impl Api {
             .json(payload)
             .send()
             .await
+            .map_err(reqwest::Error::without_url)
             .with_context(|| format!("请求 Telegram {method} 失败"))?;
-        let value: Value =
-            resp.json().await.with_context(|| format!("解析 Telegram {method} 响应失败"))?;
+        let value: Value = resp
+            .json()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("解析 Telegram {method} 响应失败"))?;
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = value.get("error_code").and_then(Value::as_i64).unwrap_or_default();
             let desc = value.get("description").and_then(Value::as_str).unwrap_or("无描述");
@@ -212,6 +227,23 @@ pub fn is_conflict(e: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 请求失败时的错误文本**不能带 bot_token**。reqwest 的错误默认把 URL 一起
+    /// 打出来,而 URL 里就是 token;上层是 `error = %e` 直接进日志的。
+    /// 连一个本机上没人听的端口,错误必然发生,又不用出网。
+    #[tokio::test]
+    async fn api_error_display_never_contains_token() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let mut api = Api::new("123456:SECRET-BOT-TOKEN", 3).unwrap();
+        api.base = format!("http://127.0.0.1:{port}");
+        let e = api.post("getMe", &json!({}), Duration::from_secs(3)).await.unwrap_err();
+        for text in [format!("{e}"), format!("{e:#}"), format!("{e:?}")] {
+            assert!(!text.contains("SECRET-BOT-TOKEN"), "泄露了 token:{text}");
+            assert!(!text.contains("bot123456"), "泄露了 token:{text}");
+        }
+    }
 
     #[test]
     fn conflict_is_recognised_from_the_error_text() {

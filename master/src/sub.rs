@@ -36,6 +36,10 @@ pub struct ShareLink {
 #[derive(Debug, Clone)]
 pub struct ExportNode {
     pub tag: String,
+    /// 所属 agent 的名字。tag 只在**同一 agent 内**唯一(`UNIQUE(agent_id, tag)`),
+    /// 两台机器都叫 `vless-in` 是合法的;Clash 的 proxy `name` 却必须全局唯一,
+    /// 重名会让 mihomo 拒掉整份配置。导出时靠它给重名的 tag 加后缀。
+    pub agent_name: String,
     pub protocol: Protocol,
     pub listen_port: u16,
     pub params: NodeParams,
@@ -68,12 +72,12 @@ pub struct ExportOptions<'a> {
 ///
 /// 起别名不只是为了让 clippy 闭嘴 —— 后两个 `Option<String>` 相邻且同型,
 /// 解构时写反了就是「v4 节点导出 v6 地址」,而那种链接看起来完全正常,只是连不上。
-type NodeRow = (String, String, i64, String, Option<String>, Option<String>);
+type NodeRow = (String, String, i64, String, Option<String>, Option<String>, String);
 
 /// 查出某用户可导出的全部节点(跨 agent)。
 pub async fn export_nodes(pool: &SqlitePool, user_id: i64) -> Result<Vec<ExportNode>> {
     let rows: Vec<NodeRow> = sqlx::query_as(
-        "SELECT n.tag, n.protocol, n.listen_port, n.params_json, a.ipv4, a.ipv6
+        "SELECT n.tag, n.protocol, n.listen_port, n.params_json, a.ipv4, a.ipv6, a.name
            FROM nodes n
            JOIN user_nodes un ON un.node_id = n.id
            JOIN agents a ON a.id = n.agent_id
@@ -86,8 +90,9 @@ pub async fn export_nodes(pool: &SqlitePool, user_id: i64) -> Result<Vec<ExportN
 
     Ok(rows
         .into_iter()
-        .map(|(tag, proto, port, params_json, ipv4, ipv6)| ExportNode {
+        .map(|(tag, proto, port, params_json, ipv4, ipv6, agent_name)| ExportNode {
             tag,
+            agent_name,
             protocol: Protocol::parse(&proto),
             listen_port: port.clamp(0, u16::MAX as i64) as u16,
             // 参数解不出来时用默认值:一个字段写坏了不该让整份订阅 500。
@@ -122,7 +127,9 @@ pub fn normalize_host(text: &str) -> Option<String> {
     // 管理员可能从 URL 里复制了 `[v6]`,入库/中转也允许这种输入;
     // 规范化时剥掉**一层**框,结构化输出始终拿裸地址。
     let t = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(t);
-    if t.is_empty() || t.len() > 64 {
+    // 253 是 DNS 名字的上限;以前写的 64 会让一个长一点的中转域名静默落空,
+    // 链接随即退回 agent 的裸 IP —— 看起来正常,却绕开了中转/CDN。
+    if t.is_empty() || t.len() > 253 {
         None
     } else {
         Some(t.to_string())
@@ -374,12 +381,18 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
             tag
         )),
 
+        // anytls-go 的 URI 规范写的是 `insecure=1`,v2rayN 认的是 `allowInsecure`。
+        // 两个都给:多一个参数客户端只会忽略,少一个就是握手失败。
         Protocol::Anytls => Some(format!(
             "anytls://{}@{}:{}?{}#{}",
             enc(&u.password),
             authority,
             port,
-            query(&[sni_param(p), insec.then(|| "allowInsecure=1".into())]),
+            query(&[
+                sni_param(p),
+                insec.then(|| "insecure=1".into()),
+                insec.then(|| "allowInsecure=1".into()),
+            ]),
             tag
         )),
 
@@ -424,12 +437,84 @@ fn yaml_str(s: &str) -> String {
         || s.starts_with([
             '-', '?', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '%', '@', '`', ' ',
         ])
-        || s.ends_with(' ');
+        || s.ends_with(' ')
+        || looks_like_yaml_scalar(s);
     if needs_quote {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         s.to_string()
     }
+}
+
+/// 不加引号会被 YAML 解析成非字符串的那些值:`null`/`~`、布尔、数字。
+/// 一个叫 `01` 的 tag 会变成整数 1,叫 `null` 的会让 name 成为 nil 而整份配置报错。
+fn looks_like_yaml_scalar(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "~" | "null"
+            | "true"
+            | "false"
+            | "yes"
+            | "no"
+            | "on"
+            | "off"
+            | "y"
+            | "n"
+            | ".inf"
+            | "-.inf"
+            | ".nan"
+    ) {
+        return true;
+    }
+    // 数字形态:十进制(可带小数点与指数)、`0x` 十六进制、`0o` 八进制,
+    // 可带符号与下划线。**不能**宽到把 `203.0.113.7` 也当数字 —— 那只是多加了
+    // 一对引号,无害,但测试钉着「IPv4 不过度加引号」。
+    let body = lower.trim_start_matches(['+', '-']);
+    if let Some(hex) = body.strip_prefix("0x") {
+        return !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit() || c == '_');
+    }
+    if let Some(oct) = body.strip_prefix("0o") {
+        return !oct.is_empty() && oct.chars().all(|c| matches!(c, '0'..='7' | '_'));
+    }
+    let (mantissa, exponent) = match body.split_once('e') {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let (int, frac) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let digits_only = |s: &str| s.chars().all(|c| c.is_ascii_digit() || c == '_');
+    let has_digit = int.chars().any(|c| c.is_ascii_digit())
+        || frac.is_some_and(|f| f.chars().any(|c| c.is_ascii_digit()));
+    has_digit
+        && digits_only(int)
+        && frac.is_none_or(digits_only)
+        && exponent.is_none_or(|e| {
+            let e = e.trim_start_matches(['+', '-']);
+            !e.is_empty() && e.chars().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// Clash 的 proxy `name` 必须全局唯一,而 tag 只在 agent 内唯一。
+/// 重名时给**每一个**同名节点都带上 agent 名,而不是只给后来者:
+/// 只改一半会让「哪个是哪个」在客户端上不可判断。
+fn clash_names(nodes: &[ExportNode]) -> Vec<String> {
+    let mut count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for n in nodes {
+        *count.entry(n.tag.as_str()).or_default() += 1;
+    }
+    nodes
+        .iter()
+        .map(|n| {
+            if count[n.tag.as_str()] > 1 && !n.agent_name.is_empty() {
+                format!("{} [{}]", n.tag, n.agent_name)
+            } else {
+                n.tag.clone()
+            }
+        })
+        .collect()
 }
 
 /// Clash / Mihomo 的 YAML 订阅。
@@ -447,36 +532,44 @@ pub fn generate_clash_yaml(
     let _ = writeln!(out);
     let _ = writeln!(out, "proxies:");
 
+    let unique = clash_names(nodes);
     let mut names: Vec<String> = Vec::new();
-    for node in nodes {
+    for (node, name) in nodes.iter().zip(&unique) {
         let Some((server, port)) = endpoint(node, opts) else {
             continue;
         };
-        if clash_proxy(&mut out, user, node, &server, port) {
-            names.push(node.tag.clone());
+        if clash_proxy(&mut out, user, node, name, &server, port) {
+            names.push(name.clone());
         }
     }
     if names.is_empty() {
         let _ = writeln!(out, "  []");
     }
 
+    // 没有节点时**不写** `自动选择`:一个 `url-test` 组没有任何 proxies 会让 mihomo
+    // 拒掉整份配置,而这正是「空订阅也要结构合法」想避免的事 —— 客户端报错会把
+    // 上一次能用的配置一起丢掉。`节点选择` 里只留 DIRECT。
     let _ = writeln!(out);
     let _ = writeln!(out, "proxy-groups:");
     let _ = writeln!(out, "  - name: 节点选择");
     let _ = writeln!(out, "    type: select");
     let _ = writeln!(out, "    proxies:");
-    let _ = writeln!(out, "      - 自动选择");
+    if !names.is_empty() {
+        let _ = writeln!(out, "      - 自动选择");
+    }
     let _ = writeln!(out, "      - DIRECT");
     for n in &names {
         let _ = writeln!(out, "      - {}", yaml_str(n));
     }
-    let _ = writeln!(out, "  - name: 自动选择");
-    let _ = writeln!(out, "    type: url-test");
-    let _ = writeln!(out, "    url: http://www.gstatic.com/generate_204");
-    let _ = writeln!(out, "    interval: 300");
-    let _ = writeln!(out, "    proxies:");
-    for n in &names {
-        let _ = writeln!(out, "      - {}", yaml_str(n));
+    if !names.is_empty() {
+        let _ = writeln!(out, "  - name: 自动选择");
+        let _ = writeln!(out, "    type: url-test");
+        let _ = writeln!(out, "    url: http://www.gstatic.com/generate_204");
+        let _ = writeln!(out, "    interval: 300");
+        let _ = writeln!(out, "    proxies:");
+        for n in &names {
+            let _ = writeln!(out, "      - {}", yaml_str(n));
+        }
     }
 
     let _ = writeln!(out);
@@ -491,9 +584,16 @@ pub fn generate_clash_yaml(
 /// 注意 `server:` 一律走 `yaml_str`。IPv6 **保持裸地址**但要加 YAML 引号:
 /// `server: "2001:db8::1"`。方括号只属于 URI authority,写成
 /// `server: "[2001:db8::1]"` 会被客户端当作地址内容,形成错误配置。
-fn clash_proxy(out: &mut String, u: &SubUser, n: &ExportNode, s: &str, port: u16) -> bool {
+fn clash_proxy(
+    out: &mut String,
+    u: &SubUser,
+    n: &ExportNode,
+    name: &str,
+    s: &str,
+    port: u16,
+) -> bool {
     let p = &n.params;
-    let name = yaml_str(&n.tag);
+    let name = yaml_str(name);
     let server = yaml_str(s);
     let insec = skip_cert_verify(n.protocol);
     // SNI 只在节点显式配了 server_name 时才写。
@@ -648,6 +748,7 @@ mod tests {
         crate::secrets::fill(proto, &mut params).unwrap();
         ExportNode {
             tag: "tokyo-1".into(),
+            agent_name: "tokyo".into(),
             protocol: proto,
             listen_port: 8443,
             params,
@@ -672,7 +773,9 @@ mod tests {
         assert_eq!(authority_host("2001:db8::1"), "[2001:db8::1]");
         assert_eq!(authority_host("1.2.3.4"), "1.2.3.4");
         assert_eq!(normalize_host("   "), None);
-        assert_eq!(normalize_host(&"x".repeat(65)), None);
+        // DNS 名字最长 253;以前的 64 会让一个长中转域名静默落空、链接退回裸 IP。
+        assert_eq!(normalize_host(&"x".repeat(253)), Some("x".repeat(253)));
+        assert_eq!(normalize_host(&"x".repeat(254)), None);
     }
 
     #[test]
@@ -961,6 +1064,37 @@ mod tests {
     fn clash_yaml_with_no_nodes_is_still_valid() {
         let yaml = generate_clash_yaml(&user(), &[], &opts());
         assert!(yaml.contains("proxies:\n  []"), "{yaml}");
+        // 空的 url-test 组会让 mihomo 报错,所以没有节点时整个组都不该出现。
+        assert!(!yaml.contains("自动选择"), "空订阅不该有 url-test 组:\n{yaml}");
+        assert!(yaml.contains("      - DIRECT"), "{yaml}");
+    }
+
+    /// 两台 agent 上同名的 tag,Clash 的 proxy name 必须错开,否则整份 YAML 被拒。
+    #[test]
+    fn clash_names_are_unique_across_agents() {
+        let mut a = node(Protocol::Trojan);
+        let mut b = node(Protocol::Trojan);
+        a.agent_name = "tokyo".into();
+        b.agent_name = "osaka".into();
+        b.agent_ipv4 = Some("203.0.113.8".into());
+        let yaml = generate_clash_yaml(&user(), &[a, b], &opts());
+        assert!(yaml.contains("- name: tokyo-1 [tokyo]\n"), "{yaml}");
+        assert!(yaml.contains("- name: tokyo-1 [osaka]\n"), "{yaml}");
+        assert!(!yaml.contains("- name: tokyo-1\n"), "重名的不该有裸名字:\n{yaml}");
+        // 两个 group 里也要用错开后的名字
+        assert_eq!(yaml.matches("      - tokyo-1 [tokyo]\n").count(), 2, "{yaml}");
+    }
+
+    /// 会被 YAML 当成 null/布尔/数字的 tag 必须加引号。
+    #[test]
+    fn yaml_quotes_typed_scalars() {
+        for s in ["null", "~", "true", "no", "01", "0x10", "1e3", "3.14", "-1"] {
+            assert!(yaml_str(s).starts_with('"'), "{s} 该加引号,得到 {}", yaml_str(s));
+        }
+        assert_eq!(yaml_str("tokyo-1"), "tokyo-1");
+        assert_eq!(yaml_str("1a"), "1a"); // 不是数字形态
+        assert_eq!(yaml_str("203.0.113.7"), "203.0.113.7"); // IPv4 不是数字,别过度加引号
+        assert_eq!(yaml_str("1.2.3"), "1.2.3");
     }
 
     /// YAML 标量里的特殊字符要加引号,否则一个带冒号的 tag 会把结构撑坏。

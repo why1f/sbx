@@ -497,11 +497,19 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             anyhow::bail!("不允许的顶层字段 `{k}`。只能写:{}", CUSTOM_ALLOWED_KEYS.join(" / "));
         }
     }
+    // 下面所有嵌套检查都在**键名折成小写**的副本上做。sing-box 用的解码器
+    // (`sjson.UnmarshalExtendedContext` → sing 的 contextjson)和 encoding/json 一样,
+    // 精确匹配不到字段名时会退回**不分大小写**的匹配 —— 所以 `"log": {"Output": …}`
+    // 对它来说就是 `log.output`。检查若只认小写,这些写法会原样存盘、下发,
+    // 然后在 agent 上做出它们本来要拦的事(写日志文件、开管理端口、抢 direct 的 tag)。
+    // 存的还是原文(`obj`),折小写只用来看。
+    let folded = fold_keys(&serde_json::Value::Object(obj.clone()));
+    let look = folded.as_object().expect("fold_keys 保持对象形状");
     // `log.output` 拒掉。agent 的 sing-box 日志本来就进进程的 stderr → journald,
     // 那里有现成的轮转;写成文件后没人给它转圈 —— 而这台机子上改成 info
     // 以后是**每条连接一行**,磁盘满只是时间问题。而且路径不在
     // StateDirectory 下的话,ProtectSystem=strict 下只读,跟 cache_file 同一类坑。
-    if let Some(out) = obj.get("log").and_then(|v| v.get("output")) {
+    if let Some(out) = look.get("log").and_then(|v| v.get("output")) {
         anyhow::bail!(
             "log.output 用不了(你写的是 {out})—— agent 的 sing-box 日志已经进 journald,\
              `journalctl -u sbx-agent -f` 就能看;写成文件没人给它转圈,\
@@ -515,7 +523,7 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
     // (box.New() 不碰磁盘) —— 表现是主控每轮巡检重试、错误刷屏。
     // 在存盘这一步拦下,把一处运行期的无限重试变成眼前的一句话。
     if let Some(cf) =
-        obj.get("experimental").and_then(|v| v.get("cache_file")).and_then(|v| v.as_object())
+        look.get("experimental").and_then(|v| v.get("cache_file")).and_then(|v| v.as_object())
     {
         let enabled = cf.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
         let path = cf.get("path").and_then(|v| v.as_str()).unwrap_or("").trim();
@@ -530,7 +538,7 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
     }
     // `experimental` 整体放开了(cache_file 对远程 rule-set 是必需的),
     // 但不能靠它开管理端口。
-    if let Some(exp) = obj.get("experimental").and_then(|v| v.as_object()) {
+    if let Some(exp) = look.get("experimental").and_then(|v| v.as_object()) {
         for bad in CUSTOM_FORBIDDEN_EXPERIMENTAL {
             if exp.contains_key(*bad) {
                 anyhow::bail!(
@@ -541,7 +549,7 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             }
         }
     }
-    if let Some(arr) = obj.get("outbounds").and_then(|v| v.as_array()) {
+    if let Some(arr) = look.get("outbounds").and_then(|v| v.as_array()) {
         for o in arr {
             if o.get("tag").and_then(|t| t.as_str()) == Some(DIRECT_TAG) {
                 anyhow::bail!(
@@ -551,7 +559,7 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
             }
         }
     }
-    if detours_to_master_direct(&serde_json::Value::Object(obj.clone())) {
+    if detours_to_master_direct(&folded) {
         anyhow::bail!(
             "detour 不能指向 direct —— 主控那个 direct 出站是空配置(没配任何拨号选项),\
              sing-box 对「显式绕道一个空 direct」会报 `detour to an empty direct outbound\
@@ -562,6 +570,17 @@ pub fn validate_custom(raw: &str) -> Result<serde_json::Map<String, serde_json::
         );
     }
     Ok(obj)
+}
+
+/// 把所有对象的键名折成小写(值不动),递归到底。只用于检查,不用于存储。
+fn fold_keys(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => serde_json::Value::Object(
+            m.iter().map(|(k, val)| (k.to_ascii_lowercase(), fold_keys(val))).collect(),
+        ),
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(fold_keys).collect()),
+        other => other.clone(),
+    }
 }
 
 /// 全文递归找 `"detour": "direct"`。
@@ -781,6 +800,25 @@ mod tests {
     /// 一路能过 `[K]`(box.New 不碰磁盘)、能过下发,然后在 agent 的 Start 上
     /// 炸成 `read-only file system`,主控从此每轮巡检重试。v0.4.29 的模板就
     /// 带过这么一份,真机上撞了个正着。
+    /// sing-box 的解码器对字段名不分大小写,检查也必须如此 —— 否则把首字母大写
+    /// 就能绕过每一条守卫。
+    #[test]
+    fn custom_guards_are_case_insensitive_like_singbox() {
+        assert!(validate_custom(r#"{ "log": { "Output": "/tmp/x.log" } }"#).is_err());
+        assert!(validate_custom(r#"{ "experimental": { "Cache_File": { "Enabled": true } } }"#)
+            .is_err());
+        assert!(validate_custom(
+            r#"{ "experimental": { "Clash_API": { "external_controller": "127.0.0.1:9090" } } }"#
+        )
+        .is_err());
+        assert!(validate_custom(r#"{ "outbounds": [ { "type": "direct", "Tag": "direct" } ] }"#)
+            .is_err());
+        assert!(validate_custom(r#"{ "route": { "rules": [ { "Detour": "direct" } ] } }"#).is_err());
+        // 但原文要原样保留,不能被折成小写存起来
+        let ok = validate_custom(r#"{ "route": { "Final": "x" } }"#).unwrap();
+        assert!(ok["route"].get("Final").is_some());
+    }
+
     #[test]
     fn cache_file_enabled_requires_a_path() {
         let e = validate_custom(r#"{ "experimental": { "cache_file": { "enabled": true } } }"#)

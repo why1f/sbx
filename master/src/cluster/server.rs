@@ -110,8 +110,17 @@ async fn serve(socket: WebSocket, state: ServerState) -> Result<()> {
         tracing::debug!(agent_id, "同 agent 的新连接驱逐了旧连接");
     }
 
-    let loop_result =
-        serve_registered(sink, &mut stream, rx, agent_id, hello, hello_id, &state).await;
+    let loop_result = serve_registered(
+        sink,
+        &mut stream,
+        rx,
+        agent_id,
+        registered.epoch,
+        hello,
+        hello_id,
+        &state,
+    )
+    .await;
 
     // ── 清理 ──
     //
@@ -155,6 +164,7 @@ async fn serve_registered(
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Envelope>,
     agent_id: i64,
+    epoch: u64,
     hello: AgentHello,
     hello_id: String,
     state: &ServerState,
@@ -218,7 +228,7 @@ async fn serve_registered(
         }
     });
 
-    let loop_result = recv_loop(stream, agent_id, state).await;
+    let loop_result = recv_loop(stream, agent_id, epoch, state).await;
     catchup.abort(); // 连接断了,补齐没意义了
     send_task.abort();
     loop_result
@@ -317,6 +327,7 @@ async fn catch_up(
                             now,
                         )
                         .await;
+                        state.registry.lock().await.mark_config_sent(agent_id, agent_config_rev);
                     }
                 }
             }
@@ -332,9 +343,15 @@ async fn catch_up(
                     now,
                 )
                 .await;
+                state.registry.lock().await.mark_config_sent(agent_id, agent_config_rev);
             }
         }
     }
+    // 失败路径上记的是 agent **握手时报的** revision,不是主控的:它如实描述
+    // 「这条连接上目前生效的是哪一版」。巡检拿它和库里比,发现落后就会再发 ——
+    // 管理员修好那个缺参数的节点(revision 又加一)之后,下一拍就能补上。
+    // 以前失败时什么都不记,`sent_config_rev` 留在 `None`,而巡检把 `None` 当作
+    // 「catch_up 还没跑完、别抢」直接跳过,于是这条连接活多久就多久收不到配置。
 
     if agent_user_rev == master.user_state_revision {
         // 已经一致,记在连接上,免得巡检把它当成「没下发过」白发一次(理由同上)。
@@ -370,10 +387,16 @@ async fn catch_up(
                             "user.state 已生效"
                         );
                     }
-                    Err(e) => tracing::error!(agent_id, error = %e, "user.state 失败"),
+                    Err(e) => {
+                        tracing::error!(agent_id, error = %e, "user.state 失败");
+                        state.registry.lock().await.mark_user_sent(agent_id, agent_user_rev);
+                    }
                 }
             }
-            Err(e) => tracing::error!(agent_id, error = %e, "查询禁用名单失败"),
+            Err(e) => {
+                tracing::error!(agent_id, error = %e, "查询禁用名单失败");
+                state.registry.lock().await.mark_user_sent(agent_id, agent_user_rev);
+            }
         }
     }
 }
@@ -464,6 +487,7 @@ pub fn idle_limit(heartbeat_secs: u64) -> Duration {
 async fn recv_loop(
     stream: &mut futures_util::stream::SplitStream<WebSocket>,
     agent_id: i64,
+    epoch: u64,
     state: &ServerState,
 ) -> Result<()> {
     // **读超时。少了它,机器突然消失时这条连接会永远挂着。**
@@ -501,6 +525,16 @@ async fn recv_loop(
         if let Err(reason) = env.validate() {
             // 版本不匹配必须断开(§4)。
             anyhow::bail!("信封校验失败:{reason}");
+        }
+        // **被驱逐之后收到的任何消息都不再处理,直接退出。**
+        //
+        // 驱逐只丢掉发送端;这个读循环要等自己的 socket 关掉才会结束,在那之前
+        // 它还在按同一个 agent_id 往库里记账。两个进程拿着同一份 token(克隆的
+        // VPS 镜像、复制过去的 agent.toml)轮流把对方驱逐时,两边都在上报,
+        // 每一条都是「epoch 变了」→ delta = 整个累计值 —— 每 30 秒把全量再记一遍。
+        // 这里一看到自己已经不是登记在册的那条连接,就把循环收掉。
+        if !state.registry.lock().await.owns(agent_id, epoch) {
+            anyhow::bail!("这条连接已被同 agent 的新连接驱逐,停止处理它的消息");
         }
         // **上报之前先确认这个 agent 还在库里。**
         //
@@ -544,7 +578,7 @@ async fn agent_exists(pool: &SqlitePool, agent_id: i64) -> bool {
 async fn dispatch(env: Envelope, agent_id: i64, state: &ServerState) {
     // resp 先于 method 判断:它要按 id 关联回等待方,method 只是给日志看的。
     if env.kind == Kind::Resp {
-        if !state.rpc.resolve(env).await {
+        if !state.rpc.resolve(agent_id, env).await {
             // 通常是已超时请求的迟到回应。频繁出现说明超时设得太短。
             tracing::trace!(agent_id, "收到无人等待的 resp,已丢弃");
         }
@@ -583,10 +617,18 @@ async fn dispatch(env: Envelope, agent_id: i64, state: &ServerState) {
             tracing::info!(agent_id, level, "agent: {line}");
         }
         method::PONG => {
-            // 心跳记账:只更新 last_seen。**超时判定在 `recv_loop` 的读超时那里**
-            // (`idle_limit`)—— 连着 idle 那么久一条 pong 都没来,那条连接
-            // 就会被判成半开并走正常的清理路径(注销 + mark_offline)。
-            let _ = sqlx::query("UPDATE agents SET last_seen = ? WHERE id = ?")
+            // 心跳记账:更新 last_seen,并把 status 重新钉成 online。
+            // **超时判定在 `recv_loop` 的读超时那里**(`idle_limit`)—— 连着 idle
+            // 那么久一条 pong 都没来,那条连接就会被判成半开并走正常的清理路径
+            // (注销 + mark_offline)。
+            //
+            // 为什么这里也要写 status:旧连接的 `cleanup_connection` 先 `unregister`
+            // (那时它还是登记在册的那条,still_mine 为 true),再去写 `mark_offline`;
+            // 而新连接可能正好在这两步之间完成了握手并 `mark_online`。于是一台
+            // 活着的机器在库里显示 offline,而 TUI 的 `derive_status` 只会把
+            // online 翻成 offline,不会反过来。让每一次心跳都重申 online,
+            // 这个错位最多存在一个心跳周期。
+            let _ = sqlx::query("UPDATE agents SET status = 'online', last_seen = ? WHERE id = ?")
                 .bind(now)
                 .bind(agent_id)
                 .execute(&state.pool)
@@ -1443,6 +1485,56 @@ mod tests {
         // 连接仍然可用:agent 还是 online
         let a = crate::db::agent_repo::get(&pool, agent_id).await.unwrap().unwrap();
         assert!(a.is_online(), "组装失败不该断开连接");
+    }
+
+    /// catch_up 失败之后,这条连接**不能**永远被巡检跳过。
+    ///
+    /// 巡检把 `sent_config_rev == None` 当成「握手补齐还没跑完,别抢」。以前失败路径
+    /// 什么都不记,于是管理员修好节点、revision 又加一之后,巡检照样跳过这台 ——
+    /// 直到 agent 进程重启。现在失败时记下 agent 握手报的版本,巡检一比就知道落后。
+    #[tokio::test]
+    async fn catch_up_failure_records_the_agents_revision_so_the_push_loop_retries() {
+        let pool = pool().await;
+        let (agent_id, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        crate::db::node_repo::add_node(
+            &pool,
+            agent_id,
+            "trojan-in",
+            crate::model::node::Protocol::Trojan,
+            8443,
+            &crate::model::node::NodeParams::default(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE nodes SET protocol = 'wireguard-plus' WHERE agent_id = ?")
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let state = ServerState {
+            pool: pool.clone(),
+            registry: Arc::new(Mutex::new(Registry::new())),
+            rpc: Arc::new(crate::cluster::Rpc::new()),
+            speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            heartbeat_secs: 10,
+            report_interval_secs: 30,
+            idle_limit: idle_limit(10),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.registry.lock().await.register(agent_id, tx);
+
+        // agent 报 rev 3,主控是 5:组装失败(未知协议),user.state 那边发出去没人回
+        // (rpc 超时)。两条失败路径都得留下 agent 自己的版本号。
+        let master = Revisions { config_revision: 5, user_state_revision: 9 };
+        // user.state 会等 30 秒超时;这里没有 agent 回应,所以把它跳过:
+        // 让两边 revision 一致即可,本条只盯 config 那条失败路径。
+        let master = Revisions { user_state_revision: 4, ..master };
+        catch_up(agent_id, &state, 3, 4, master).await;
+
+        let reg = state.registry.lock().await;
+        assert_eq!(reg.sent_config_rev(agent_id), Some(3), "失败时该记下 agent 握手报的版本");
+        assert_eq!(reg.sent_user_rev(agent_id), Some(4));
     }
 
     /// 正常断开后应标 offline。

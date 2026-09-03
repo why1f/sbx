@@ -584,6 +584,14 @@ impl Modal {
                         value.pop();
                     }
                     (FieldKind::Text { value }, KeyCode::Char(c)) => {
+                        // Ctrl-C / Alt-x 这类组合键不是要输入那个字母。以前会把 `c`
+                        // 塞进字段 —— 表单开着时全局的 Ctrl-C 退出也到不了这里。
+                        if k.modifiers.intersects(
+                            crossterm::event::KeyModifiers::CONTROL
+                                | crossterm::event::KeyModifiers::ALT,
+                        ) {
+                            return Outcome::Stay;
+                        }
                         value.push(c);
                     }
                     _ => return Outcome::Stay,

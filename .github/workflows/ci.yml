@@ -120,6 +120,21 @@ jobs:
         working-directory: agent
         run: go test -tags with_quic,with_utls -count=1 ./boxctl/
 
+      # 上游修好的探针。只跑一个起真 box 的测试、带 -race、**永不让 CI 变红**:
+      # 现在它必然失败(上面那个竞态),失败时什么都不说;哪天它过了,就说明
+      # 上游把 `started` 的读写同步好了,这里抛一条 warning 提醒把上面两步合回
+      # `go test -race ./...`。没有这一步,"上游修好后合回去"只能靠人记着。
+      # 不能用 continue-on-error 代替:那会在失败时给 job 打一个显眼的叉,
+      # 每次都得点进去看才知道是不是预期内的。
+      - name: 探针:boxctl 的 -race 是否已经能过(上游修好则提醒)
+        working-directory: agent
+        run: |
+          if go test -race -tags with_quic,with_utls -count=1 -run 'TestApplyStartsAndStops' ./boxctl/ >/tmp/race-probe.log 2>&1; then
+            echo "::warning title=上游竞态已修::boxctl 带 -race 已能通过。把 ci.yml 里 boxctl 与其余包的两步 go test 合回一条 go test -race ./...,并删掉这个探针。"
+          else
+            echo "探针照预期失败(上游 sing-box 的 NetworkManager.started 竞态仍在),不影响 CI。"
+          fi
+
       - name: go test -race(其余包)
         working-directory: agent
         # 失败时把输出尾部作为 annotation 抛出。**这不是调试残留,是必要设施**:

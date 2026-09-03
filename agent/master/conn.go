@@ -179,6 +179,10 @@ func (c *Conn) session(parent context.Context) (bool, error) {
 		return false, fmt.Errorf("拨号 %s: %w", c.cfg.Server, err)
 	}
 	defer ws.Close()
+	// gorilla 默认不限单帧大小,一整帧会先完整缓冲进内存。主控下发的最大消息是
+	// config.apply(几十 KB 量级),8 MiB 绰绰有余;信任锚在钉住的证书上,这一条
+	// 只是给「锚不在」(insecure)或主控被攻破的情况兜底,别让 agent 被一帧撑爆。
+	ws.SetReadLimit(8 << 20)
 
 	c.wsMu.Lock()
 	c.ws = ws
@@ -599,7 +603,9 @@ func (c *Conn) send(env *Envelope) error {
 // 少了它,自签证书会先在标准链校验那一步就被拒,根本走不到 VerifyPeerCertificate。
 func (c *Conn) tlsConfig() (*tls.Config, error) {
 	if !strings.HasPrefix(c.cfg.Server, "wss://") {
-		return nil, nil // 明文 ws://,gorilla 会忽略 TLS 配置
+		// 明文 ws://,gorilla 会忽略 TLS 配置。说一声:token 在这条连接上没有任何保护。
+		log.Println("警告:server 是明文 ws://,token 与配置在网络上不加密,也不校验主控身份")
+		return nil, nil
 	}
 	if c.cfg.Insecure {
 		// 仅开发用。生产上没有指纹就该拒绝启动,而不是悄悄降级成不校验。

@@ -170,6 +170,11 @@ pub fn set_value(path: &str, section: &str, key: &str, value: &str) -> anyhow::R
     {
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("写 {tmp} 失败(目录不可写?)"))?;
+        // 临时文件是按 umask 新建的(通常 0644),而原文件里有 bot_token,管理员可能
+        // 特意 chmod 成 0600。rename 之后权限跟着临时文件走,所以先把原来的复制过来。
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = f.set_permissions(meta.permissions());
+        }
         f.write_all(updated.as_bytes())?;
         f.sync_all()?;
     }

@@ -69,7 +69,15 @@ func main() {
 	if len(st.Options) > 0 {
 		if err := bc.Apply(st.Options); err != nil {
 			// 起不来不退出:主控随后的 config.apply 可能正好是修好这个问题的那一版。
-			log.Printf("按 last-applied.json 启动 box 失败(等主控下发新配置): %v", err)
+			//
+			// 但「主控随后下发」不是自动发生的:握手时报的 revision 若和主控一致,
+			// 主控的 catch_up 什么都不发 —— 而冷启动失败最常见的原因(端口还被上一个
+			// 进程占着、证书所在的卷还没挂上)恰恰不改 revision。于是 agent 在线、
+			// 上报正常、什么都不服务,还没法从 TUI 修(box.restart 只认成功 Apply 过的
+			// 配置)。这里把**内存里**的 revision 清零(不落盘),让主控把当前配置再发
+			// 一遍;第二次 Apply 多半就成了。
+			log.Printf("按 last-applied.json 启动 box 失败(向主控报 revision 0 以重新下发): %v", err)
+			st.ConfigRevision = 0
 		} else {
 			log.Printf("已按 last-applied.json 启动 box(config revision %d)", st.ConfigRevision)
 		}

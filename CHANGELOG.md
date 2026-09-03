@@ -4,6 +4,138 @@
 `## v<x>` 标题三者必须一致 —— `release.yml` 会在打 tag 时校验,不一致直接 fail。
 agent 是同一个版本号,通过 `-ldflags "-X main.Version=…"` 注入(§11.1)。
 
+## v0.4.35
+
+一轮全仓库审查(主控集群层 / 订阅与 Telegram / TUI 与库 / Go agent)后的修复版。
+没有新功能;下面每一条都是先在代码里核实了触发路径才动手的。
+
+### 修
+
+- **`push_user_state` 先读名单再读 revision,会丢掉一次停用。** TUI 在这两步之间
+  提交「停用 alice」并把 `user_state_revision` 加一,主控就把**旧**名单盖着**新**版本号
+  发出去,还记成「这一版已下发」;agent 也把版本号落盘,下次握手两边相等、什么都不发。
+  alice 的停用就这样悄悄丢了,直到下一次无关的名单变更。现在先读 revision 再读名单,
+  最坏情况变成「新名单盖旧版本号」—— 下一拍会再发一次,无害。
+
+- **握手补齐(catch_up)失败后,这条连接会被巡检永远跳过。** 巡检把
+  `sent_config_rev == None` 当成「补齐还没跑完,别抢」;而失败路径以前什么都不记。
+  于是一个节点缺参数 → 组装失败 → 管理员修好(revision 又加一)→ 巡检照样跳过,
+  直到 agent 进程重启。禁用名单那条路同理:握手时 `user.state` 超时一次,配额停用
+  就再也到不了那台机器。现在失败时记下 agent 握手报的版本,巡检一比就知道落后。
+
+- **RPC 应答不校验来源。** 请求 id 是 `r0`、`r1` 这样可预测的序号,pending 表全局
+  一张;任何一台已认证的 agent 发一条 `{"kind":"resp","id":"r17"}` 就能替别的 agent
+  把 `config.apply` / `user.state` 应答成成功,受害那台从此收不到配置或禁用名单。
+  一台被攻破的 VPS 不该能对其余机器做这件事。现在 resp 必须来自该 pending 所属的
+  agent,否则原样留着并记 warn。
+
+- **被驱逐的旧连接还在记账。** 驱逐只丢发送端,读循环要等 socket 关掉才结束。两个
+  进程拿着同一份 token(克隆的镜像、复制过去的 agent.toml)轮流驱逐对方时,两边都在
+  上报,每一条都是「epoch 变了」→ delta = 整个累计值 —— 每 30 秒把全量再记一遍。
+  现在读循环一发现自己已不是登记在册的那条连接就退出。
+
+- **`BEGIN IMMEDIATE` 从来没生效过。** `pool.begin()` 自己已经发了 `BEGIN`(DEFERRED),
+  再执行 `BEGIN IMMEDIATE` 只会报「事务里不能再开事务」,错误被 `.ok()` 吞掉。
+  于是上报入库一直是 DEFERRED 事务:先读快照、UPSERT 时再升级写锁,TUI 恰好在中间提交
+  就得到 `SQLITE_BUSY_SNAPSHOT`(busy_timeout 对它不生效),整条上报失败等下一轮。
+  改用 sqlx 的 `begin_with("BEGIN IMMEDIATE")`。
+
+- **快速重连时在线机器被标成 offline。** 旧连接的清理先注销、再写 `mark_offline`;
+  新连接可能正好在这两步之间握手成功并 `mark_online`,随后被旧连接的那句 UPDATE 盖掉。
+  TUI 只会把 online 翻成 offline,不会反过来,于是一直错到下次重连。
+  现在每次心跳(PONG)都重申 online,错位最多存在一个心跳周期。
+
+- **负数计数器会凭空记出流量。** agent 报 `up = -X` 时 delta 算 0 是对的,但 `last_up`
+  原样存了负数,下一次报 0 就算出 `0 - (-X) = X`。入库前钳到 0。
+
+- **`agent_events` 无限增长。** `auth_failed` 这一种是**未认证**连接就能写的,对外暴露
+  的 `/ws` 被扫描就一路涨。巡检里加 90 天保留期。
+
+- **agent 冷启动按 last-applied.json 起 box 失败后,主控不会重发。** 握手报的 revision
+  和主控一致时 catch_up 什么都不发,而冷启动失败最常见的原因(端口还被上一个进程占着、
+  证书所在的卷还没挂上)恰恰不改 revision。于是 agent 在线、上报正常、什么都不服务,
+  `box.restart` 也救不了(它只认成功 Apply 过的配置)。现在失败时把**内存里**的
+  revision 清零(不落盘),主控把当前配置再发一遍,第二次多半就成了。
+
+- **`agent.upgrade` 在主控侧只等 30 秒。** agent 要先把新二进制下载完、校验完、替换掉
+  才应答(它的 HTTP 超时是 10 分钟),慢一点的 VPS 一两分钟很正常。主控超时后记成
+  「Timeout」,agent 随后照样换掉二进制退出 —— 界面上是一条假失败。现在升级单独开一个
+  任务等 10.5 分钟,不挂在巡检循环上,结果照样写回那一行。
+
+- **Telegram bot_token 会进日志。** `reqwest::Error` 的 Display 带请求 URL,而 URL 里就是
+  token;超时、DNS 抖动这类最常见的错误全走这条路,再被 `error = %e` 写进 journald。
+  用 `without_url()` 剥掉,并加了一条测试:连一个没人听的本机端口制造错误,断言
+  错误文本不含 token。
+
+- **Clash YAML 里两台 agent 同名的 tag 会让 mihomo 拒掉整份配置。** tag 只在 agent 内
+  唯一(`UNIQUE(agent_id, tag)`),proxy `name` 却要全局唯一。重名时给每一个同名节点
+  都带上 `[agent 名]`。
+
+- **空订阅的 Clash YAML 其实不合法。** `自动选择` 是一个没有任何 proxies 的 url-test 组,
+  mihomo 报错 —— 而这正是「空订阅也要结构合法」那条测试想避免的事(客户端报错会把
+  上一次能用的配置一起丢掉)。没有节点时不写这个组,`节点选择` 里只留 DIRECT。
+  那条测试现在真的钉住了这件事。
+
+- **YAML 里会被当成 null / 布尔 / 数字的 tag 没加引号。** `01` 变成 1,`null` 让 name
+  成为 nil。`yaml_str` 对这类形态也加引号;IPv4 这种不是数字的照旧不加。
+
+- **AnyTLS 分享链接只写了 `allowInsecure`。** anytls-go 的 URI 规范是 `insecure=1`,
+  照规范实现的客户端会开着校验去握自签证书。两个参数都给。
+
+- **自定义片段的守卫分大小写,sing-box 的解码器不分。** `"log": {"Output": …}`、
+  `"experimental": {"Clash_API": …}`、`"Tag": "direct"` 都能原样存盘、下发,然后在 agent
+  上做出它们本来要拦的事。现在所有嵌套检查都在键名折小写的副本上做,存的还是原文。
+
+- **`/bind@BotName CODE` 永远「无效」。** 群里 Telegram 会给命令附上 `@BotName`,
+  以前 `strip_prefix("/bind")` 把 `@BotName CODE` 整个当成了绑定码;`/bindfoo` 也会被
+  当成 `/bind`。命令现在按空白切开、剥掉 `@` 后缀。
+
+- **中转/`public_base` 的域名超过 64 字符时链接静默退回 agent 裸 IP。** DNS 名字的上限
+  是 253;那个 64 是拍的。看起来正常、实际绕开了中转,是最难发现的那种错。
+
+- **TUI:动作之后的刷新失败会把整个 TUI 退到 shell。** 定时刷新那条路早就是「显示错误、
+  继续跑」,动作之后那条却是 `?` 直接返回 —— 按了一下 `[d]` 程序没了,而删除其实成功了。
+  两条路现在一样。
+
+- **TUI:光标能移到看不见的行上。** 三张表没有滚动视口,列表一长光标就跑到框外,
+  `[t]` / `[o]` 这类不带确认的动作照样作用在那一行上;仪表盘两栏同理,而且删掉最后
+  一个用户后 Enter 会报「这一栏还没有节点」。表格改用 `TableState` 渲染(ratatui 自己把
+  选中行滚进来),仪表盘自己算窗口,`refresh` 也把仪表盘的光标一起夹取。
+
+- **TUI:进入备用屏失败时 raw mode 不会关。** panic hook 和循环之后的 restore 都盖不到
+  那两行;人回到 shell 敲什么都不回显。
+
+- **TUI:表单里 Ctrl-C 会输入一个 `c`。** 组合键不是要输入那个字母;表单开着时全局的
+  Ctrl-C 退出也到不了那里。带 Ctrl/Alt 的字符键现在被忽略。
+
+- **TUI:emoji 按一列算宽。** 名字里带一个旗帜就让右边每一列错一格 —— §13.4 想防的正是
+  这种静默错位。补上 emoji 与杂项符号的区间。
+
+- **主控 `config.toml` 经设置页保存后权限变成 0644。** 临时文件按 umask 新建,rename
+  之后权限跟着它走;里面有 bot_token,管理员特意 chmod 的 0600 就这样没了。
+  现在先把原文件的权限复制到临时文件上。
+
+- **agent 配了 fingerprint 却用明文 `ws://`。** 没有 TLS 就没有证书可比,指纹根本不会被
+  看一眼,而写了指纹的人以为自己是钉住了的。这种自相矛盾的配置现在拒绝启动;单纯的
+  明文部署(主控 `cluster.tls = false`)照旧允许,拨号时打一条警告。WebSocket 读也加了
+  8 MiB 的单帧上限。
+
+- **订阅响应加 `Cache-Control: no-store, private`。** 响应体里是密码/uuid,统计页还内嵌
+  sub_token;前面若有默认会缓存的 nginx/CDN,一个用户的订阅可能被喂给另一次请求。
+
+### 改
+
+- **新迁移 013:给 `user_nodes` / `user_traffic` 的 `node_id`、`agent_commands` /
+  `user_nic_bindings` 的 `agent_id` 建索引。** 节点页每秒一次、每个节点两条按 node_id
+  的相关子查询,以前只能全表扫;`DELETE FROM nodes` 的级联也一样。几十行无所谓,
+  几百行是 O(节点数 × 行数),而且在 TUI 的渲染路径上。
+
+- **CI 加了一个 `-race` 探针。** 只跑 boxctl 里一个起真 box 的测试、带 `-race`、永不让
+  CI 变红:现在它必然失败(上游 v1.14.0 的 `NetworkManager.started` 竞态,见 v0.4.33),
+  失败时什么都不说;哪天它过了,就抛一条 warning 提醒把两步 `go test` 合回一条。
+  没有它,「上游修好后合回去」只能靠人记着。顺带核实了一遍:上游 `testing` 分支到
+  今天为止那三行代码没变,竞态仍在。
+
 ## v0.4.34
 
 ### 改

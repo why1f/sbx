@@ -133,6 +133,8 @@ fn char_cols(c: char) -> usize {
         || (0xFE30..=0xFE6F).contains(&u)          // CJK 兼容形式
         || (0xFF00..=0xFF60).contains(&u)          // 全角 ASCII
         || (0xFFE0..=0xFFE6).contains(&u)          // 全角符号
+        || (0x2600..=0x27BF).contains(&u)          // 杂项符号(☀ ✅ 之类,多数终端按两列画)
+        || (0x1F300..=0x1FAFF).contains(&u)        // emoji(含旗帜的区域指示符)
         || (0x20000..=0x3FFFD).contains(&u); // CJK 扩展
     if wide {
         2

@@ -38,6 +38,21 @@ fn header(cols: &[&str]) -> Row<'static> {
     )
 }
 
+/// 让选中行一定落在可视区里。
+///
+/// 表格不用 `render_stateful_widget` 的话没有滚动视口:列表一长,光标移到框外
+/// 之后人看不到自己选了谁,而 `[t]` / `[o]` 这类不带确认的动作照样作用在那一行上。
+/// `TableState` 带着 selected 渲染时 ratatui 会自己算 offset 把它滚进来。
+fn render_table(f: &mut Frame, table: Table<'_>, area: Rect, selected: usize) {
+    let mut st = ratatui::widgets::TableState::default().with_selected(Some(selected));
+    f.render_stateful_widget(table, area, &mut st);
+}
+
+/// 仪表盘两栏没有表格组件,自己算窗口:选中行超出可见行数时整体往上卷。
+fn dash_window(sel: Option<usize>, rows: usize) -> usize {
+    sel.map_or(0, |s| s.saturating_sub(rows.saturating_sub(1)))
+}
+
 fn row_style(selected: bool) -> Style {
     if selected {
         Style::default().bg(theme::ROW_BG).add_modifier(Modifier::BOLD)
@@ -395,7 +410,8 @@ fn top_users(f: &mut Frame, area: Rect, users: &[UserRow], now: i64, sel: Option
             Style::default().fg(theme::DIM),
         )));
     }
-    for (i, u) in top.into_iter().take(rows).enumerate() {
+    let skip = dash_window(sel, rows);
+    for (i, u) in top.into_iter().enumerate().skip(skip).take(rows) {
         let picked = sel == Some(i);
         let mut spans = vec![Span::raw(if picked { "▸ " } else { "  " })];
         // 倍率标记紧跟名字。摆在这里而不是行尾:这两栏上下行是**乘过倍率的**,
@@ -493,7 +509,8 @@ fn top_nodes(f: &mut Frame, area: Rect, nodes: &[NodeRow], has_agents: bool, sel
             Style::default().fg(theme::DIM),
         )));
     }
-    for (i, n) in top.into_iter().take(rows).enumerate() {
+    let skip = dash_window(sel, rows);
+    for (i, n) in top.into_iter().enumerate().skip(skip).take(rows) {
         let picked = sel == Some(i);
         let used = n.cycle_up.saturating_add(n.cycle_down);
         let share = if total > 0 { used as f64 / total as f64 } else { 0.0 };
@@ -1051,11 +1068,13 @@ pub fn agents(f: &mut Frame, area: Rect, rows: &[AgentRow], selected: usize, now
     constraints.push(Constraint::Min(0));
     titles.push("");
 
-    f.render_widget(
+    render_table(
+        f,
         Table::new(table_rows, constraints)
             .header(header(&titles))
             .block(Block::default().borders(Borders::ALL).title(" 服务管理 ")),
         area,
+        selected,
     );
 }
 
@@ -1239,11 +1258,13 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
     let titles: Vec<&str> =
         cols.iter().map(|c| ncol_title(*c)).chain(std::iter::once("")).collect();
 
-    f.render_widget(
+    render_table(
+        f,
         Table::new(table_rows, constraints)
             .header(header(&titles))
             .block(Block::default().borders(Borders::ALL).title(" 节点 ")),
         c[0],
+        selected,
     );
 }
 
@@ -1453,11 +1474,13 @@ pub fn users(
     let titles: Vec<&str> =
         cols.iter().map(|c| ucol_title(*c)).chain(std::iter::once("")).collect();
 
-    f.render_widget(
+    render_table(
+        f,
         Table::new(table_rows, constraints)
             .header(header(&titles))
             .block(Block::default().borders(Borders::ALL).title(" 用户 ")),
         c[0],
+        selected,
     );
 }
 
