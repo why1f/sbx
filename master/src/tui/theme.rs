@@ -180,9 +180,18 @@ pub fn truncate(s: &str, max: usize) -> String {
 ///
 /// `Paragraph` 里手工排的列要用它,不能用 `{:<w}` —— 见 `char_cols` 的说明。
 pub fn pad(s: &str, w: usize) -> String {
-    let t = truncate(s, w);
-    let mut out = t;
-    for _ in cols(&out)..w {
+    ljust(&truncate(s, w), w)
+}
+
+/// 用空格补齐到 `w` 列,**不截断**。
+///
+/// CLI 列表(`agent-list` / `node-list` / `user-list`)用它:那里的名字是要被
+/// 复制走的,截掉一截就少了字;超宽的那一行把后面的列往右推,只歪一行,不丢内容。
+/// 与 `{:<w}` 的区别同 `pad`:`{:<w}` 补的是字符数,「面包云」3 个字符 6 列,
+/// 后面的状态列就往左缩 3 格 —— 只在名字里有中文的那几行歪,最容易被当成偶发。
+pub fn ljust(s: &str, w: usize) -> String {
+    let mut out = s.to_string();
+    for _ in cols(s)..w {
         out.push(' ');
     }
     out
@@ -318,6 +327,17 @@ mod tests {
         assert_eq!(cols(&pad("从未连接的机器", 12)), 12, "超宽的要被截到正好 12 列");
         assert_eq!(pad("", 3), "   ");
         assert_eq!(cols(&pad("x", 0)), 0);
+    }
+
+    /// `ljust` 按显示列宽补、从不截断:CLI 列表里的名字要能原样复制走。
+    #[test]
+    fn ljust_pads_by_display_width_and_never_truncates() {
+        assert_eq!(cols(&ljust("azure", 20)), 20);
+        assert_eq!(cols(&ljust("面包云", 20)), 20, "3 个汉字 6 列,补 14 个空格而不是 17 个");
+        assert_eq!(ljust("面包云", 20).len(), "面包云".len() + 14);
+        let long = "一个比二十列还要宽的机器名字";
+        assert_eq!(ljust(long, 20), long, "超宽不截、不补");
+        assert_eq!(ljust("", 3), "   ");
     }
 
     /// 折行的每一行都不能超宽 —— 超了 `Paragraph` 会再折一次,

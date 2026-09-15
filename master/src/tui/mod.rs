@@ -319,9 +319,12 @@ impl App {
             Page::Nodes => match self.selected_node() {
                 Some(n) => {
                     let p = crate::model::node::Protocol::parse(&n.protocol);
+                    // id 写在这里而不是表里:表的第一列是行号(§10 之后列表按人排的
+                    // 顺序走,id 摆在那儿就是一串乱序的数字)。它只有配 CLI 命令
+                    // (`node-move` / `user-assign`)时才用得到,标上 `id:` 免得和行号混。
                     let mut first = format!(
-                        "  选中: {}  机器: {}  {}:{}  在用: {} 人",
-                        n.tag, n.agent_name, n.protocol, n.listen_port, n.user_count
+                        "  选中: {}  id: {}  机器: {}  {}:{}  在用: {} 人",
+                        n.tag, n.id, n.agent_name, n.protocol, n.listen_port, n.user_count
                     );
                     if forms::uses_sni(p) {
                         first.push_str(&format!(
@@ -1410,7 +1413,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                     app.modal = Some(Modal::confirm(
                         "删除节点",
                         vec![
-                            format!("将删除节点 #{id} {tag}。"),
+                            format!("将删除节点 {tag}(id {id})。"),
                             format!("{users} 个用户对它的分配会一并清除。"),
                         ],
                         Action::DeleteNode { id, tag },
@@ -1961,7 +1964,7 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             let (id, _rev) =
                 node_repo::add_node(&app.pool, d.agent_id, &d.tag, d.protocol, d.port, &params)
                     .await?;
-            Ok(format!("已新增节点 #{id} {},在线的机器约 1s 后重建 box", d.tag))
+            Ok(format!("已新增节点 {}(id {id}),在线的机器约 1s 后重建 box", d.tag))
         }
 
         Action::EditNode { id, draft } => {
@@ -1971,7 +1974,7 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
                 .nodes
                 .iter()
                 .find(|n| n.id == *id)
-                .ok_or_else(|| anyhow::anyhow!("节点 #{id} 已经不在了(是不是刚被删掉?)"))?;
+                .ok_or_else(|| anyhow::anyhow!("节点(id {id})已经不在了(是不是刚被删掉?)"))?;
             let mut params = node.params.clone();
             params.server_name = draft.server_name.clone();
             params.path = draft.path.clone();
@@ -4270,5 +4273,24 @@ mod tests {
 
         // 顺序不进 sing-box 配置:两台的 revision 一个都没动。
         assert_eq!(revs(&pool).await, before, "挪顺序不该推进任何 revision");
+    }
+
+    /// 表里第一列改成行号之后,库里的 id 必须还能在界面上找到 ——
+    /// CLI 的 `node-move` / `user-assign` 认的是它。它在摘要行和删除确认框里,
+    /// 而且标着 `id`,不能再写成 `#`(那会和行号读混,`node-remove 1` 就删错节点)。
+    #[tokio::test]
+    async fn the_database_id_stays_visible_in_the_summary_and_the_delete_confirm() {
+        let mut a = app();
+        a.page = Page::Nodes;
+        a.nodes = vec![stub_node(7, "n7")];
+        let ops = a.ops_lines().join("\n");
+        assert!(ops.contains("id: 7"), "摘要行要带 id:\n{ops}");
+        assert!(!ops.contains("#7"), "不能再用 # 表示 id:\n{ops}");
+
+        on_key(&mut a, key('d'));
+        let Some(Modal::Confirm { body, .. }) = &a.modal else { panic!("该弹确认框") };
+        let text = body.join("\n");
+        assert!(text.contains("id 7"), "确认框要带 id:\n{text}");
+        assert!(!text.contains("#7"), "{text}");
     }
 }

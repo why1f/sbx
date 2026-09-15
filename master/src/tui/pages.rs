@@ -1093,7 +1093,10 @@ fn reset_text(day: Option<i64>) -> String {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NCol {
-    Id,
+    /// 当前顺序里的第几行,表头仍是 `#`。**不是库里的 id**:列表按人排的顺序走(§10)
+    /// 之后,id 在表里就是一串乱序的数字,看起来像排序坏了。id 只有配 CLI 命令时才
+    /// 用得到,它在底部摘要行和删除确认框里,标着 `id:`,和这一列不会混。
+    Seq,
     Agent,
     Tag,
     Proto,
@@ -1106,7 +1109,7 @@ enum NCol {
 
 fn ncol_width(c: NCol) -> u16 {
     match c {
-        NCol::Id => 4,
+        NCol::Seq => 4,
         NCol::Agent => 14,
         NCol::Tag => 18,
         NCol::Proto => 14,
@@ -1175,7 +1178,7 @@ fn ncol_widths(cols: &[NCol], total: u16, relay_want: u16, param_want: u16) -> V
 
 fn ncol_title(c: NCol) -> &'static str {
     match c {
-        NCol::Id => "#",
+        NCol::Seq => "#",
         NCol::Agent => "所属服务器",
         NCol::Tag => "Tag",
         NCol::Proto => "协议",
@@ -1189,7 +1192,7 @@ fn ncol_title(c: NCol) -> &'static str {
 
 /// 砍列顺序:先砍图形化/次要的,`Tag` 和协议永远留着 —— 没有它们这张表就没用了。
 const NCOL_ALL: [NCol; 9] = [
-    NCol::Id,
+    NCol::Seq,
     NCol::Agent,
     NCol::Tag,
     NCol::Proto,
@@ -1199,7 +1202,7 @@ const NCOL_ALL: [NCol; 9] = [
     NCol::Relay,
     NCol::Export,
 ];
-const NCOL_DROP: [NCol; 5] = [NCol::Export, NCol::Relay, NCol::Param, NCol::Id, NCol::Agent];
+const NCOL_DROP: [NCol; 5] = [NCol::Export, NCol::Relay, NCol::Param, NCol::Seq, NCol::Agent];
 
 pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
     // **没有单独的「详情」面板。** 它显示的东西(tag / 协议 / 端口 / 所属机器)
@@ -1222,7 +1225,7 @@ pub fn nodes(f: &mut Frame, area: Rect, rows: &[NodeRow], selected: usize) {
             let cells: Vec<Cell> = cols
                 .iter()
                 .map(|col| match col {
-                    NCol::Id => Cell::from(n.id.to_string()),
+                    NCol::Seq => Cell::from((i + 1).to_string()),
                     NCol::Agent => Cell::from(theme::truncate(&n.agent_name, 13)),
                     NCol::Tag => Cell::from(theme::truncate(&n.tag, 17)),
                     NCol::Proto => Cell::from(n.protocol.clone()),
@@ -3442,5 +3445,25 @@ mod tests {
                 NOW
             ))
         );
+    }
+
+    /// 第一列是**当前顺序里的行号**,不是库里的 id。
+    ///
+    /// 列表按人排的顺序走之后(§10),id 在表里就是一串乱序的数字 ——
+    /// 第一次调完顺序看到的就是「3 4 1 2 5 6」,像排序坏了。
+    #[test]
+    fn the_first_column_counts_rows_in_display_order() {
+        let rows: Vec<NodeRow> = [30, 10, 20]
+            .into_iter()
+            .map(|id| NodeRow { id, tag: format!("n{id}"), ..node() })
+            .collect();
+        let out = draw_to_string(120, 8, |f| nodes(f, f.area(), &rows, 0));
+        let body: Vec<&str> = out.lines().filter(|l| l.contains("vless-reality")).collect();
+        assert_eq!(body.len(), 3, "{out}");
+        for (i, line) in body.iter().enumerate() {
+            let first = line.trim_start_matches('│').split_whitespace().next().unwrap_or("");
+            assert_eq!(first, (i + 1).to_string(), "第 {} 行的序号不对:\n{out}", i + 1);
+        }
+        assert!(out.contains("#"), "表头仍用 #,简洁:\n{out}");
     }
 }

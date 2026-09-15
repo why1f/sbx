@@ -182,6 +182,40 @@ fn parse_move(s: &str) -> Result<db::Move> {
     db::Move::parse(s).ok_or_else(|| anyhow::anyhow!("方向只能是 up 或 down,不是 {s}"))
 }
 
+// ── 三张 CLI 列表的行 ──────────────────────────────────────────────────────
+//
+// 列宽按**显示列**补(`theme::ljust`),不能写 `{:<20}`:那补的是字符数,
+// 「面包云」3 个字符占 6 列,后面的状态列就往左缩 3 格。只在名字里有中文的
+// 那几行歪,看起来像偶发的。`doctor` 的标签列同一个坑(`doctor.rs`)。
+// 不截断:这里的名字是要被复制走的,截了就少字。
+//
+// 抽成函数只是为了能测对齐;每个都是纯字符串拼接。
+
+fn agent_row(id: i64, name: &str, status: &str, token_prefix: &str, ipv4: Option<&str>) -> String {
+    use tui::theme::ljust;
+    format!(
+        "{id:>4}  {} {} token={token_prefix}…  {}",
+        ljust(name, 20),
+        ljust(status, 8),
+        ipv4.unwrap_or("-")
+    )
+}
+
+fn node_row(id: i64, agent_id: i64, tag: &str, protocol: &str, port: u16) -> String {
+    use tui::theme::ljust;
+    format!("{id:>4}  agent={agent_id:<4} {} {} :{port}", ljust(tag, 16), ljust(protocol, 14))
+}
+
+fn user_row(id: i64, name: &str, enabled: bool, used: &str, quota: &str) -> String {
+    use tui::theme::ljust;
+    // 「启用」/「停用」都是 2 个汉字 4 列,补到 8 列后与 ASCII 状态词一样宽。
+    format!(
+        "{id:>4}  {} {} {used} / {quota}",
+        ljust(name, 20),
+        ljust(if enabled { "启用" } else { "停用" }, 8)
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -241,12 +275,8 @@ async fn main() -> Result<()> {
             }
             for a in agents {
                 println!(
-                    "{:>4}  {:<20} {:<8} token={}…  {}",
-                    a.id,
-                    a.name,
-                    a.status,
-                    a.token_prefix,
-                    a.ipv4.as_deref().unwrap_or("-")
+                    "{}",
+                    agent_row(a.id, &a.name, &a.status, &a.token_prefix, a.ipv4.as_deref())
                 );
             }
         }
@@ -358,8 +388,8 @@ async fn main() -> Result<()> {
             }
             for n in nodes {
                 println!(
-                    "{:>4}  agent={:<4} {:<16} {:<14} :{}",
-                    n.id, n.agent_id, n.tag, n.protocol, n.listen_port
+                    "{}",
+                    node_row(n.id, n.agent_id, &n.tag, n.protocol.as_str(), n.listen_port)
                 );
             }
         }
@@ -445,14 +475,7 @@ async fn main() -> Result<()> {
                         u.quota_used_percent(&usage)
                     )
                 };
-                println!(
-                    "{:>4}  {:<20} {:<8} {} / {}",
-                    u.id,
-                    u.name,
-                    if u.enabled { "启用" } else { "停用" },
-                    used,
-                    quota
-                );
+                println!("{}", user_row(u.id, &u.name, u.enabled, &used, &quota));
             }
         }
         Cmd::UserAdd { name, quota_gb } => {
@@ -737,5 +760,52 @@ fn load_config(path: &str) -> Result<config::Config> {
             Ok(config::Config::default())
         }
         Err(e) => Err(anyhow::Error::new(e).context(format!("读取配置 {path} 失败"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tui::theme::cols;
+
+    /// 名字里有中文时,后面的列**不能**往左缩 —— 状态、token、地址在每一行
+    /// 都得从同一列开始。这是 `agent-list` 上真看到过的:「面包云」那一行的
+    /// `online` 比别的行早 3 格。
+    #[test]
+    fn cjk_names_keep_the_columns_aligned() {
+        let ascii = agent_row(3, "azure", "online", "Pl7cu8Vy", Some("52.140.196.158"));
+        let cjk = agent_row(6, "面包云", "online", "ZVvo1ej0", Some("76.9.111.80"));
+        assert_eq!(
+            cols(&ascii[..ascii.find("online").unwrap()]),
+            cols(&cjk[..cjk.find("online").unwrap()]),
+            "状态列起点不齐:\n{ascii}\n{cjk}"
+        );
+        assert_eq!(
+            cols(&ascii[..ascii.find("token=").unwrap()]),
+            cols(&cjk[..cjk.find("token=").unwrap()])
+        );
+
+        let ascii = node_row(1, 3, "azure", "vless-reality", 443);
+        let cjk = node_row(3, 6, "Dmit-面包云", "vless-reality", 30652);
+        assert_eq!(
+            cols(&ascii[..ascii.find("vless").unwrap()]),
+            cols(&cjk[..cjk.find("vless").unwrap()]),
+            "协议列起点不齐:\n{ascii}\n{cjk}"
+        );
+
+        let ascii = user_row(1, "alice", true, "1.00 GB", "不限");
+        let cjk = user_row(2, "小明", false, "1.00 GB", "不限");
+        assert_eq!(
+            cols(&ascii[..ascii.find(" / ").unwrap()]),
+            cols(&cjk[..cjk.find(" / ").unwrap()]),
+            "用量列起点不齐:\n{ascii}\n{cjk}"
+        );
+    }
+
+    /// 超宽的名字不截断 —— 列表里的名字是要被复制走的。
+    #[test]
+    fn long_names_are_not_truncated() {
+        let name = "a-name-that-is-longer-than-twenty-columns";
+        assert!(agent_row(1, name, "online", "t", None).contains(name));
     }
 }
