@@ -594,7 +594,7 @@ pub async fn load_agents(
                 (SELECT COUNT(*) FROM nodes n WHERE n.agent_id = a.id) AS node_count
            FROM agents a
            LEFT JOIN agent_nic_traffic t ON t.agent_id = a.id
-          ORDER BY a.id",
+          ORDER BY a.sort_order, a.id",
     )
     .fetch_all(pool)
     .await?;
@@ -680,7 +680,7 @@ pub async fn load_nodes(pool: &SqlitePool) -> Result<Vec<NodeRow>> {
                            WHERE t.node_id = n.id), 0),
                 n.params_json
            FROM nodes n JOIN agents a ON a.id = n.agent_id
-          ORDER BY n.agent_id, n.id",
+          ORDER BY a.sort_order, a.id, n.sort_order, n.id",
     )
     .fetch_all(pool)
     .await?;

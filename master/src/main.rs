@@ -97,6 +97,15 @@ enum Cmd {
         yes: bool,
     },
 
+    /// 把被控服务器在列表里上移/下移一格。它名下的节点在订阅里整块跟着挪;
+    /// 不改机器上的配置。
+    AgentMove {
+        id: i64,
+        /// up 或 down。
+        #[arg(value_parser = ["up", "down"])]
+        direction: String,
+    },
+
     /// 列出全部节点。
     NodeList,
     /// 在某台被控服务器上新增节点。
@@ -119,6 +128,14 @@ enum Cmd {
     },
     /// 删除节点。
     NodeRemove { id: i64 },
+    /// 把节点在它所在机器的列表里上移/下移一格,订阅里的顺序随之改变;
+    /// 不改机器上的配置。跨机器的先后用 agent-move。
+    NodeMove {
+        id: i64,
+        /// up 或 down。
+        #[arg(value_parser = ["up", "down"])]
+        direction: String,
+    },
 
     /// 列出全部用户及其用量(跨 agent 求和)。
     UserList,
@@ -157,6 +174,12 @@ enum Cmd {
     UserTgBind { name: String },
     /// 解除某用户的 Telegram 绑定。
     UserTgUnbind { name: String },
+}
+
+/// `agent-move` / `node-move` 的方向参数。clap 已把取值限在 up / down,
+/// 这里只是换成枚举 —— 兜底那句错误不该走到。
+fn parse_move(s: &str) -> Result<db::Move> {
+    db::Move::parse(s).ok_or_else(|| anyhow::anyhow!("方向只能是 up 或 down,不是 {s}"))
 }
 
 #[tokio::main]
@@ -312,6 +335,22 @@ async fn main() -> Result<()> {
             println!("已删除 #{id} {}(影响 {affected} 个用户)。", agent.name);
         }
 
+        Cmd::AgentMove { id, direction } => {
+            let dir = parse_move(&direction)?;
+            let Some(agent) = db::agent_repo::get(&pool, id).await? else {
+                anyhow::bail!("没有 id 为 {id} 的被控服务器");
+            };
+            if db::agent_repo::move_agent(&pool, id, dir).await? {
+                println!(
+                    "已{} #{id} {};订阅里它的节点整块跟着挪,不改机器上的配置。",
+                    dir.label(),
+                    agent.name
+                );
+            } else {
+                println!("#{id} {} 已经在列表{}了,没有动。", agent.name, dir.edge());
+            }
+        }
+
         Cmd::NodeList => {
             let nodes = db::node_repo::list_nodes(&pool).await?;
             if nodes.is_empty() {
@@ -357,6 +396,27 @@ async fn main() -> Result<()> {
         Cmd::NodeRemove { id } => {
             let (agent_id, rev) = db::node_repo::delete_node(&pool, id).await?;
             println!("已删除节点 #{id}(agent #{agent_id} 的 config_revision → {rev})");
+        }
+        Cmd::NodeMove { id, direction } => {
+            let dir = parse_move(&direction)?;
+            let nodes = db::node_repo::list_nodes(&pool).await?;
+            let Some(n) = nodes.iter().find(|n| n.id == id) else {
+                anyhow::bail!("没有 id 为 {id} 的节点");
+            };
+            if db::node_repo::move_node(&pool, id, dir).await? {
+                println!(
+                    "已{}节点 #{id} {};订阅里的顺序随之改变,不改机器上的配置。",
+                    dir.label(),
+                    n.tag
+                );
+            } else {
+                println!(
+                    "节点 #{id} {} 已经在 agent #{} 的{}了,没有动;跨机器的先后用 agent-move。",
+                    n.tag,
+                    n.agent_id,
+                    dir.edge()
+                );
+            }
         }
 
         Cmd::UserList => {

@@ -35,6 +35,7 @@ use sqlx::SqlitePool;
 use std::time::Duration;
 
 use crate::config::Config;
+use crate::db::Move;
 use crate::install;
 use data::SpeedTracker;
 use modal::{Action, Modal, Outcome};
@@ -406,9 +407,9 @@ impl App {
         match self.page {
             Page::Dashboard => "  [←/→]换栏  [↑↓/jk]选择  [Enter]用量明细",
             Page::Agents => {
-                "  [a]新增  [E]编辑  [Enter]网卡明细  [c]看配置  [C]改自定义  [K]校验  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除"
+                "  [a]新增  [E]编辑  [Enter]网卡明细  [c]看配置  [C]改自定义  [K]校验  [o]出站策略  [i]接入命令  [u]升级  [r]轮换token  [d]删除  [<>]调顺序"
             }
-            Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除",
+            Page::Nodes => "  [a]新增  [E]编辑  [Enter]用量明细  [d]删除  [<>]调顺序",
             Page::Users => {
                 "  [a]新增  [E]编辑  [Enter]明细  [n]分配节点  [b]绑网卡  [T]token  [r]重置流量  [t]启/停  [s]订阅  [d]删除"
             }
@@ -1072,6 +1073,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 }
 
+/// `<` 往上、`>` 往下。只在两个列表页匹配过这两个键之后调用。
+///
+/// 选这一对而不是 `J`/`K`:`K` 在服务管理页已经是「校验」;
+/// 而不是 Shift+↑/↓:tmux 与部分终端不把 Shift 和方向键一起报上来,
+/// 那种「在我机器上好用」的绑定最难排查。
+fn move_dir(code: KeyCode) -> Move {
+    if code == KeyCode::Char('<') {
+        Move::Up
+    } else {
+        Move::Down
+    }
+}
+
 /// 处理一次按键。返回 `Some(action)` 表示要执行一个写操作。
 fn on_key(app: &mut App, k: KeyEvent) -> Option<Action> {
     // 弹窗打开时吃掉全部按键 —— 否则「输入名字」会顺带触发页面快捷键。
@@ -1321,6 +1335,18 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                     app.fail("没有选中任何被控服务器");
                 }
             }
+            // 挪一格。机器挪了,订阅里它名下的节点整块跟着挪(§10)。
+            // 不需要确认:挪错了按反方向那个键就回来了,库里也不会因此推进 revision。
+            KeyCode::Char('<') | KeyCode::Char('>') => match app.selected_agent() {
+                Some(a) => {
+                    return Some(Action::MoveAgent {
+                        id: a.id,
+                        name: a.name.clone(),
+                        dir: move_dir(k.code),
+                    })
+                }
+                None => app.fail("没有选中任何被控服务器"),
+            },
             KeyCode::Char('d') => {
                 if let Some(a) = app.selected_agent() {
                     let (id, name, nodes) = (a.id, a.name.clone(), a.node_count);
@@ -1361,6 +1387,19 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                         id: n.id,
                         tag: n.tag.clone(),
                         agent: n.agent_name.clone(),
+                    })
+                }
+                None => app.fail("没有选中任何节点"),
+            },
+            // 挪一格。只在它所在机器的组内挪 —— 订阅本来就是按机器拼的(§10);
+            // 撞到组的边界时 perform 会把人指向服务管理页。
+            KeyCode::Char('<') | KeyCode::Char('>') => match app.selected_node() {
+                Some(n) => {
+                    return Some(Action::MoveNode {
+                        id: n.id,
+                        tag: n.tag.clone(),
+                        agent: n.agent_name.clone(),
+                        dir: move_dir(k.code),
                     })
                 }
                 None => app.fail("没有选中任何节点"),
@@ -1954,6 +1993,36 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         Action::DeleteNode { id, tag } => {
             let (_agent_id, _rev) = node_repo::delete_node(&app.pool, *id).await?;
             Ok(format!("已删除节点 {tag},已下发生效"))
+        }
+
+        Action::MoveNode { id, tag, agent, dir } => {
+            if !node_repo::move_node(&app.pool, *id, *dir).await? {
+                return Ok(format!(
+                    "{tag} 已经在 {agent} 的{}了;要让整台机器的节点一起挪,去「服务管理」页(按 2)",
+                    dir.edge()
+                ));
+            }
+            // 光标跟着那一行走:连按几下才能挪到位,光标留在原处的话第二下挪的
+            // 就是别的节点。这里刷新失败不算这次操作失败 —— 库已经写了,
+            // 主循环那一拍会再刷一次并报错。
+            if app.refresh().await.is_ok() {
+                if let Some(i) = app.nodes.iter().position(|n| n.id == *id) {
+                    app.sel[Page::Nodes as usize] = i;
+                }
+            }
+            Ok(format!("已{} {tag};订阅里的顺序随之改变,不重建 box", dir.label()))
+        }
+
+        Action::MoveAgent { id, name, dir } => {
+            if !agent_repo::move_agent(&app.pool, *id, *dir).await? {
+                return Ok(format!("{name} 已经在列表{}了", dir.edge()));
+            }
+            if app.refresh().await.is_ok() {
+                if let Some(i) = app.agents.iter().position(|a| a.id == *id) {
+                    app.sel[Page::Agents as usize] = i;
+                }
+            }
+            Ok(format!("已{} {name};订阅里它的节点整块跟着挪,不重建 box", dir.label()))
         }
 
         Action::AddUser { name, quota_gb, multiplier, expire, reset_day } => {
@@ -4086,5 +4155,120 @@ mod tests {
         // 还没画过第一帧时(测试里构造的 App、或第一次按键早于第一帧)
         // 退回 20 行:宁可少翻也不能多翻,多翻会跳过没看过的内容。
         assert_eq!(app().overlay_view_h(), 20, "没有高度信息时该退回保守值");
+    }
+
+    /// `<` / `>` 在两个列表页上产生挪动动作;空表只给一句提示;
+    /// 用户页没有顺序这回事 —— 不产生动作,也不弹任何框。
+    #[tokio::test]
+    async fn the_angle_brackets_move_the_selected_row() {
+        let mut a = app();
+        a.page = Page::Nodes;
+        a.nodes = vec![stub_node(7, "n7"), stub_node(8, "n8")];
+        a.sel[Page::Nodes as usize] = 1;
+        assert!(matches!(
+            on_key(&mut a, key('<')),
+            Some(Action::MoveNode { id: 8, dir: Move::Up, .. })
+        ));
+        assert!(matches!(
+            on_key(&mut a, key('>')),
+            Some(Action::MoveNode { id: 8, dir: Move::Down, .. })
+        ));
+        assert!(a.ops_keys().contains("[<>]"), "页脚要写出这两个键:{}", a.ops_keys());
+
+        a.page = Page::Agents;
+        a.agents = vec![stub_agent(3)];
+        assert!(matches!(
+            on_key(&mut a, key('>')),
+            Some(Action::MoveAgent { id: 3, dir: Move::Down, .. })
+        ));
+        assert!(a.ops_keys().contains("[<>]"), "{}", a.ops_keys());
+
+        a.agents.clear();
+        assert!(on_key(&mut a, key('<')).is_none());
+        assert!(a.status_is_error, "空表该给一句提示");
+
+        a.page = Page::Users;
+        a.users = vec![stub_user(true)];
+        assert!(on_key(&mut a, key('<')).is_none());
+        assert!(a.modal.is_none());
+    }
+
+    /// 挪完之后光标要跟着那一行走,订阅顺序也要跟着变;撞到机器边界时只给一句
+    /// 指向服务管理页的提示,什么都不动 —— 跨机器的先后由那一页决定(§10)。
+    #[tokio::test]
+    async fn moving_a_row_follows_it_and_reorders_the_subscription() {
+        use crate::model::node::{NodeParams, Protocol};
+        let path = std::env::temp_dir().join(format!("sbx-tui-move-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
+        let (tokyo, _) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        let (osaka, _) = crate::db::agent_repo::create(&pool, "osaka", 0).await.unwrap();
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let uid = crate::db::node_repo::add_user(&pool, "alice", 0, 0).await.unwrap();
+        let mut ids = Vec::new();
+        for (agent, tag) in [(tokyo, "t1"), (tokyo, "t2"), (osaka, "o1")] {
+            let (id, _) = crate::db::node_repo::add_node(
+                &pool,
+                agent,
+                tag,
+                Protocol::VlessReality,
+                443,
+                &params,
+            )
+            .await
+            .unwrap();
+            crate::db::node_repo::assign_node(&pool, uid, id).await.unwrap();
+            ids.push(id);
+        }
+        async fn revs(p: &SqlitePool) -> Vec<(i64, i64)> {
+            sqlx::query_as("SELECT config_revision, user_state_revision FROM agents ORDER BY id")
+                .fetch_all(p)
+                .await
+                .unwrap()
+        }
+        async fn export(p: &SqlitePool, uid: i64) -> Vec<String> {
+            crate::sub::export_nodes(p, uid).await.unwrap().into_iter().map(|n| n.tag).collect()
+        }
+        fn tags(app: &App) -> Vec<String> {
+            app.nodes.iter().map(|n| n.tag.clone()).collect()
+        }
+        let before = revs(&pool).await;
+
+        let mut app = App::new(pool.clone(), Config::default(), "sbx-test.toml".into());
+        app.refresh().await.unwrap();
+        app.page = Page::Nodes;
+        assert_eq!(tags(&app), ["t1", "t2", "o1"]);
+
+        // t1 往下:与 t2 换位,光标跟着到第 2 行。
+        let mv =
+            |dir| Action::MoveNode { id: ids[0], tag: "t1".into(), agent: "tokyo".into(), dir };
+        let msg = perform_inner(&mut app, &mv(Move::Down)).await.unwrap();
+        assert!(msg.contains("下移"), "{msg}");
+        assert_eq!(tags(&app), ["t2", "t1", "o1"]);
+        assert_eq!(app.sel[Page::Nodes as usize], 1, "光标要跟着挪过去");
+        assert_eq!(export(&pool, uid).await, ["t2", "t1", "o1"], "订阅要跟着列表走");
+
+        // 再往下就撞上机器边界:不动,并把人指向服务管理页。
+        let msg = perform_inner(&mut app, &mv(Move::Down)).await.unwrap();
+        assert!(msg.contains("服务管理"), "{msg}");
+        app.refresh().await.unwrap();
+        assert_eq!(tags(&app), ["t2", "t1", "o1"]);
+        assert_eq!(app.sel[Page::Nodes as usize], 1);
+
+        // 挪机器:osaka 提到最前,它的节点在列表和订阅里都整块跟着。
+        let msg = perform_inner(
+            &mut app,
+            &Action::MoveAgent { id: osaka, name: "osaka".into(), dir: Move::Up },
+        )
+        .await
+        .unwrap();
+        assert!(msg.contains("上移"), "{msg}");
+        assert_eq!(app.agents[0].name, "osaka");
+        assert_eq!(app.sel[Page::Agents as usize], 0);
+        assert_eq!(tags(&app), ["o1", "t2", "t1"]);
+        assert_eq!(export(&pool, uid).await, ["o1", "t2", "t1"]);
+
+        // 顺序不进 sing-box 配置:两台的 revision 一个都没动。
+        assert_eq!(revs(&pool).await, before, "挪顺序不该推进任何 revision");
     }
 }

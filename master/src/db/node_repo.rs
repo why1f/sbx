@@ -15,10 +15,13 @@ use sqlx::SqlitePool;
 
 // ─────────────────────────── nodes ───────────────────────────
 
+/// 顺序与订阅、TUI 节点页同一份:机器顺序 × 机器内节点顺序(§10)。
+/// `a.id` / `n.id` 是并列时的定序 —— 手改过的库里两行 `sort_order` 相等也不能乱跳。
 pub async fn list_nodes(pool: &SqlitePool) -> Result<Vec<InboundNode>> {
     let rows: Vec<(i64, i64, String, String, i64, String)> = sqlx::query_as(
-        "SELECT id, agent_id, tag, protocol, listen_port, params_json
-           FROM nodes ORDER BY agent_id, id",
+        "SELECT n.id, n.agent_id, n.tag, n.protocol, n.listen_port, n.params_json
+           FROM nodes n JOIN agents a ON a.id = n.agent_id
+          ORDER BY a.sort_order, a.id, n.sort_order, n.id",
     )
     .fetch_all(pool)
     .await?;
@@ -54,15 +57,20 @@ pub async fn add_node(
     }
     let mut tx = pool.begin().await?;
 
+    // 新节点落在**这台机器**列表的末尾(§10):取的是同一 agent 内的 max+1,
+    // 而不是全表的 —— 顺序只在机器内有意义,跨机器的先后由 agents.sort_order 定。
     let node_id: i64 = sqlx::query_scalar(
-        "INSERT INTO nodes (agent_id, tag, protocol, listen_port, params_json)
-         VALUES (?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO nodes (agent_id, tag, protocol, listen_port, params_json, sort_order)
+         VALUES (?, ?, ?, ?, ?,
+                 (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM nodes WHERE agent_id = ?))
+         RETURNING id",
     )
     .bind(agent_id)
     .bind(tag)
     .bind(protocol.as_str())
     .bind(listen_port as i64)
     .bind(serde_json::to_string(params)?)
+    .bind(agent_id)
     .fetch_one(&mut *tx)
     .await
     .with_context(|| format!("新增节点 {tag} 失败(tag 在同一 agent 内必须唯一)"))?;
@@ -123,6 +131,44 @@ pub async fn update_node(
 }
 
 /// 删除节点并推进 `config_revision`。返回该节点所属的 agent 与新 revision。
+/// 把节点在**它所在机器**的列表里往上/往下挪一格(§10)。
+///
+/// 返回 `Ok(false)` 表示它已经在那一头了,什么都没写。
+///
+/// 只在机器内挪,不跨机器:订阅本来就是按机器拼的,tag 也只在机器内唯一;
+/// 要让一批节点整块前后移,挪的是机器(`agent_repo::move_agent`)。
+///
+/// **不推进 `config_revision`。** 顺序不进 sing-box 配置(`build_agent_config`
+/// 的 inbounds 按 id 排),为它重建一次 box 只会让正在用的连接断一下。
+///
+/// `BEGIN IMMEDIATE`:先读整份次序再写回,daemon 恰好在中间提交上报的话,
+/// DEFERRED 事务升级写锁时会得到 `SQLITE_BUSY_SNAPSHOT`(理由同 `ingest_stats`)。
+pub async fn move_node(pool: &SqlitePool, node_id: i64, dir: crate::db::Move) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let agent_id: i64 = sqlx::query_scalar("SELECT agent_id FROM nodes WHERE id = ?")
+        .bind(node_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("没有 id 为 {node_id} 的节点"))?;
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM nodes WHERE agent_id = ? ORDER BY sort_order, id")
+            .bind(agent_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let Some(order) = crate::db::shifted(&ids, node_id, dir) else {
+        return Ok(false);
+    };
+    for (pos, id) in order.iter().enumerate() {
+        sqlx::query("UPDATE nodes SET sort_order = ? WHERE id = ?")
+            .bind(pos as i64 + 1)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub async fn delete_node(pool: &SqlitePool, node_id: i64) -> Result<(i64, i64)> {
     let mut tx = pool.begin().await?;
 
@@ -1099,5 +1145,83 @@ mod tests {
         assert_eq!(nodes[0].listen_port, 8443);
         assert_eq!(nodes[0].params.server_name.as_deref(), Some("www.example.com"));
         assert!(nodes[0].params.ipv6);
+    }
+
+    // ── 顺序(§10)────────────────────────────────────────────────────────
+
+    async fn node(p: &SqlitePool, agent: i64, tag: &str) -> i64 {
+        add_node(p, agent, tag, Protocol::VlessReality, 443, &NodeParams::default())
+            .await
+            .unwrap()
+            .0
+    }
+    async fn order(p: &SqlitePool) -> Vec<String> {
+        list_nodes(p).await.unwrap().into_iter().map(|n| n.tag).collect()
+    }
+
+    /// 新节点落在它那台机器的末尾;挪动只在机器内换位,撞到两头时不动、不报错。
+    #[tokio::test]
+    async fn a_node_moves_within_its_machine_and_stops_at_the_edges() {
+        use crate::db::Move;
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let (b, _) = crate::db::agent_repo::create(&p, "b", 0).await.unwrap();
+        let a1 = node(&p, a, "a1").await;
+        let b1 = node(&p, b, "b1").await;
+        let a2 = node(&p, a, "a2").await;
+        // 先按机器分组,组内按加入先后 —— a2 虽然最后建,仍在 b1 前面。
+        assert_eq!(order(&p).await, ["a1", "a2", "b1"]);
+
+        assert!(move_node(&p, a2, Move::Up).await.unwrap());
+        assert_eq!(order(&p).await, ["a2", "a1", "b1"]);
+        // a1 已是 a 的末尾:往下不会跑到 b 的组里去。
+        assert!(!move_node(&p, a1, Move::Down).await.unwrap());
+        assert!(!move_node(&p, a2, Move::Up).await.unwrap());
+        assert!(!move_node(&p, b1, Move::Up).await.unwrap(), "b1 是 b 上唯一的节点,两头都是边");
+        assert!(!move_node(&p, b1, Move::Down).await.unwrap());
+        assert_eq!(order(&p).await, ["a2", "a1", "b1"]);
+
+        // 之后新建的仍落在自己机器的末尾,不是全表末尾。
+        node(&p, a, "a3").await;
+        assert_eq!(order(&p).await, ["a2", "a1", "a3", "b1"]);
+    }
+
+    /// 顺序不进 sing-box 配置,所以挪动**不推进任何 revision**。
+    #[tokio::test]
+    async fn moving_a_node_touches_no_revision() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        let n1 = node(&p, a, "n1").await;
+        node(&p, a, "n2").await;
+        let before = rev(&p, a).await;
+        assert!(move_node(&p, n1, crate::db::Move::Down).await.unwrap());
+        assert_eq!(rev(&p, a).await, before);
+    }
+
+    /// 手改过的库里两行 `sort_order` 相等时,挪一下要能收敛 ——
+    /// 只交换两个相等的数是空操作,看起来像按键坏了。
+    #[tokio::test]
+    async fn a_move_heals_equal_sort_orders() {
+        let p = pool().await;
+        let (a, _) = crate::db::agent_repo::create(&p, "a", 0).await.unwrap();
+        node(&p, a, "n1").await;
+        let n2 = node(&p, a, "n2").await;
+        node(&p, a, "n3").await;
+        sqlx::query("UPDATE nodes SET sort_order = 0").execute(&p).await.unwrap();
+        assert_eq!(order(&p).await, ["n1", "n2", "n3"], "相等时按 id 定序");
+
+        assert!(move_node(&p, n2, crate::db::Move::Up).await.unwrap());
+        assert_eq!(order(&p).await, ["n2", "n1", "n3"]);
+        let so: Vec<i64> = sqlx::query_scalar("SELECT sort_order FROM nodes ORDER BY sort_order")
+            .fetch_all(&p)
+            .await
+            .unwrap();
+        assert_eq!(so, [1, 2, 3], "整组重编,不再有相等的值");
+    }
+
+    #[tokio::test]
+    async fn moving_a_missing_node_errors() {
+        let p = pool().await;
+        assert!(move_node(&p, 999, crate::db::Move::Up).await.is_err());
     }
 }

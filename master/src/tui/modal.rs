@@ -136,6 +136,19 @@ pub enum Action {
         id: i64,
         tag: String,
     },
+    /// 把节点在它所在机器的列表里挪一格(§10)。`tag` / `agent` 只用来写回执。
+    MoveNode {
+        id: i64,
+        tag: String,
+        agent: String,
+        dir: crate::db::Move,
+    },
+    /// 把机器在列表里挪一格;它名下的节点在订阅里整块跟着挪。
+    MoveAgent {
+        id: i64,
+        name: String,
+        dir: crate::db::Move,
+    },
     AddUser {
         name: String,
         quota_gb: String,

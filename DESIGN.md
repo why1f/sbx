@@ -1058,6 +1058,14 @@ IPv6 必须按输出上下文处理:
 
 一个用户的订阅 = 它在 `user_nodes` 里的**全部节点,跨 agent 拼在一起**。
 
+先后 = **机器的顺序 × 机器内节点的顺序**(`agents.sort_order` / `nodes.sort_order`,迁移 014;
+老库按 id 回填,升级前后顺序不变;新建的落在末尾)。两个列表页都用 `[<]` / `[>]` 挪一格,
+CLI 是 `agent-move` / `node-move`。节点只在自己那台机器的组内挪:订阅本来就是按机器拼的,
+tag 也只在机器内唯一;要让一批节点整块前后移,挪的是机器。代价是不能把两台机器的节点
+交错排;换来的是「服务管理」页的顺序有实际含义。**顺序不进 sing-box 配置,也不推进任何
+revision**:`build_agent_config` 的 inbounds 仍按 id 排,挪一下顺序不会让哪台机器重建 box。
+挪动把整组 `sort_order` 从 1 重编而不是交换两个值 —— 手改过的库里两行相等时交换是空操作。
+
 订阅 HTTP 监听(旧 `sub_server.rs`)是 §2「不做 Web 面板」的**唯一例外**:
 它只吐订阅内容与 `stats_html`,不提供任何管理能力。
 
@@ -1299,5 +1307,7 @@ Reality 需要 `with_utls`,Hysteria2/TUIC 需要 `with_quic`;编译期哨兵阻�
   所以组装前要过 `service::strip_jsonc`。存剥过的版本等于每存一次丢一次注释。
 - 改记账、下发或握手路径后,`e2e/run.sh` 里的字节常量要与 §13.2/§13.3 同步改 ——
   它们是同一份数字的两份拷贝,而 CI 会拿它们对现实。
+- 列表顺序(`agents.sort_order` / `nodes.sort_order`)只影响订阅与界面;`build_agent_config` 的
+  inbounds 按 id 排,挪顺序**不得**推进 revision。节点只在机器内挪,跨机器的先后挪机器(§10)。
 - Rust 侧格式由根目录 `rustfmt.toml` 定住;`cargo fmt --check` 已是硬门,不再是提醒。
 - 发布前 tag、Cargo 版本、CHANGELOG 标题必须一致,并等待 CI 全绿。

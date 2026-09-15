@@ -33,11 +33,69 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/011_agent_reset_timezone.sql"),
     include_str!("migrations/012_agent_custom_config.sql"),
     include_str!("migrations/013_node_agent_indexes.sql"),
+    include_str!("migrations/014_sort_order.sql"),
 ];
 
 /// 当前程序期望的 schema 版本(= 迁移脚本数量),供 doctor 比对实际库版本。
 pub fn schema_version() -> i64 {
     MIGRATIONS.len() as i64
+}
+
+/// 在列表里往哪边挪一格(`agents.sort_order` / `nodes.sort_order`,迁移 014)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Up,
+    Down,
+}
+
+impl Move {
+    /// CLI 用:`up` / `down`。
+    pub fn parse(s: &str) -> Option<Move> {
+        match s {
+            "up" => Some(Move::Up),
+            "down" => Some(Move::Down),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Move::Up => "上移",
+            Move::Down => "下移",
+        }
+    }
+
+    /// 挪不动时它撞到的是哪一头。
+    pub fn edge(self) -> &'static str {
+        match self {
+            Move::Up => "顶端",
+            Move::Down => "末尾",
+        }
+    }
+}
+
+/// 把 `id` 在 `ids`(已按当前顺序排好)里往 `dir` 挪一格,返回挪完的整份次序。
+///
+/// 已经在那一头、或 `id` 根本不在列表里,返回 `None` —— 调用方据此回一句
+/// 「已经在顶端了」而不是静默写一遍原样。
+///
+/// 返回**整份次序**而不是「和谁交换」,是让调用方把 `sort_order` 从 1 重编一遍:
+/// 老库回填的是 id、手改过的库可能有两行相等,只交换两个值在相等时是空操作,
+/// 重编则对任何起始状态都收敛。列表是一台机器上的节点数量级,多写几行不算什么。
+pub fn shifted(ids: &[i64], id: i64, dir: Move) -> Option<Vec<i64>> {
+    let i = ids.iter().position(|x| *x == id)?;
+    let j = match dir {
+        Move::Up => i.checked_sub(1)?,
+        Move::Down => {
+            if i + 1 >= ids.len() {
+                return None;
+            }
+            i + 1
+        }
+    };
+    let mut out = ids.to_vec();
+    out.swap(i, j);
+    Some(out)
 }
 
 pub async fn init_pool(db_path: &str) -> Result<SqlitePool> {
@@ -689,5 +747,68 @@ mod tests {
             .unwrap()
             .get(0);
         assert_eq!(n, 0, "新 agent 不该继承上一台的流量");
+    }
+
+    #[test]
+    fn shifted_swaps_with_the_neighbour_and_refuses_at_the_edges() {
+        assert_eq!(shifted(&[1, 2, 3], 2, Move::Up), Some(vec![2, 1, 3]));
+        assert_eq!(shifted(&[1, 2, 3], 2, Move::Down), Some(vec![1, 3, 2]));
+        assert_eq!(shifted(&[1, 2, 3], 1, Move::Up), None);
+        assert_eq!(shifted(&[1, 2, 3], 3, Move::Down), None);
+        assert_eq!(shifted(&[1, 2, 3], 9, Move::Up), None, "不在列表里");
+        assert_eq!(shifted(&[], 1, Move::Down), None);
+        assert_eq!(Move::parse("up"), Some(Move::Up));
+        assert_eq!(Move::parse("down"), Some(Move::Down));
+        assert_eq!(Move::parse("sideways"), None);
+    }
+
+    /// 014:老库升级时 `sort_order` 回填成 id,升级前后看到的顺序一个字不变;
+    /// 之后新建的一行仍落在末尾,而不是插到所有老行前面(回填成 0 就会那样)。
+    #[tokio::test]
+    async fn sort_order_backfills_from_id_so_an_upgrade_keeps_the_old_order() {
+        let path = tmp_db();
+        let url = format!("sqlite://{}?mode=rwc", path);
+        let (a, b) = {
+            let pool = init_pool(&path).await.unwrap();
+            let (a, _) = agent_repo::create(&pool, "a", 0).await.unwrap();
+            let (b, _) = agent_repo::create(&pool, "b", 0).await.unwrap();
+            for (agent, tag) in [(a, "a1"), (b, "b1"), (a, "a2")] {
+                sqlx::query(
+                    "INSERT INTO nodes (agent_id, tag, protocol, listen_port, params_json)
+                     VALUES (?, ?, 'vless-reality', 443, '{}')",
+                )
+                .bind(agent)
+                .bind(tag)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            // 退回 014 之前的形状:列删掉、版本改回 13。
+            sqlx::query("ALTER TABLE agents DROP COLUMN sort_order").execute(&pool).await.unwrap();
+            sqlx::query("ALTER TABLE nodes DROP COLUMN sort_order").execute(&pool).await.unwrap();
+            sqlx::query("PRAGMA user_version = 13").execute(&pool).await.unwrap();
+            pool.close().await;
+            (a, b)
+        };
+
+        migrate(&url).await.unwrap();
+
+        let pool = init_pool(&path).await.unwrap();
+        for table in ["agents", "nodes"] {
+            let rows: Vec<(i64, i64)> =
+                sqlx::query_as(&format!("SELECT id, sort_order FROM {table}"))
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert!(!rows.is_empty());
+            assert!(rows.iter().all(|(id, so)| id == so), "{table} 该回填成 id:{rows:?}");
+        }
+        let (c, _) = agent_repo::create(&pool, "c", 0).await.unwrap();
+        let ids: Vec<i64> =
+            agent_repo::list(&pool).await.unwrap().into_iter().map(|a| a.id).collect();
+        assert_eq!(ids, [a, b, c], "老机器按原顺序,新机器在末尾");
+        let tags: Vec<String> =
+            node_repo::list_nodes(&pool).await.unwrap().into_iter().map(|n| n.tag).collect();
+        assert_eq!(tags, ["a1", "a2", "b1"], "节点仍按机器分组、组内按 id");
     }
 }

@@ -6,9 +6,12 @@ use crate::model::agent::Agent;
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 
-/// 取全部 agent,按名字排序(TUI 列表用,需要稳定顺序)。
+/// 取全部 agent,按人排的顺序(`sort_order`,§10);CLI 的 `agent-list` 用,
+/// 与 TUI 服务管理页(`tui::data::load_agents`)同一份次序。
 pub async fn list(pool: &SqlitePool) -> Result<Vec<Agent>> {
-    Ok(sqlx::query_as::<_, Agent>("SELECT * FROM agents ORDER BY name").fetch_all(pool).await?)
+    Ok(sqlx::query_as::<_, Agent>("SELECT * FROM agents ORDER BY sort_order, id")
+        .fetch_all(pool)
+        .await?)
 }
 
 pub async fn get(pool: &SqlitePool, id: i64) -> Result<Option<Agent>> {
@@ -42,9 +45,10 @@ pub async fn find_by_token(pool: &SqlitePool, token: &str) -> Result<Option<Agen
 /// 之后库里只有 hash 与 prefix(§8.1)。调用方负责显示给用户,不要落日志。
 pub async fn create(pool: &SqlitePool, name: &str, now: i64) -> Result<(i64, String)> {
     let token = crate::cluster::token::generate();
+    // 新机器落在列表末尾(§10)。
     let id = sqlx::query(
-        "INSERT INTO agents (name, token_hash, token_prefix, status, created_at)
-         VALUES (?, ?, ?, 'never', ?)",
+        "INSERT INTO agents (name, token_hash, token_prefix, status, created_at, sort_order)
+         VALUES (?, ?, ?, 'never', ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agents))",
     )
     .bind(name)
     .bind(crate::cluster::token::hash(&token))
@@ -54,6 +58,32 @@ pub async fn create(pool: &SqlitePool, name: &str, now: i64) -> Result<(i64, Str
     .await?
     .last_insert_rowid();
     Ok((id, token))
+}
+
+/// 把这台机器在列表里往上/往下挪一格(§10)。它名下的节点在订阅里**整块**跟着挪。
+///
+/// 返回 `Ok(false)` 表示已经在那一头了,什么都没写。
+/// 不推进任何 revision —— 顺序不进 sing-box 配置;事务与重编的理由见 `node_repo::move_node`。
+pub async fn move_agent(pool: &SqlitePool, id: i64, dir: crate::db::Move) -> Result<bool> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM agents ORDER BY sort_order, id")
+        .fetch_all(&mut *tx)
+        .await?;
+    if !ids.contains(&id) {
+        anyhow::bail!("没有 id 为 {id} 的被控服务器");
+    }
+    let Some(order) = crate::db::shifted(&ids, id, dir) else {
+        return Ok(false);
+    };
+    for (pos, id) in order.iter().enumerate() {
+        sqlx::query("UPDATE agents SET sort_order = ? WHERE id = ?")
+            .bind(pos as i64 + 1)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// 轮换 token。新 token 使旧的立即失效;**在线连接不立刻踢**,下次重连时生效(§8.1)。
@@ -459,5 +489,37 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    async fn names(p: &SqlitePool) -> Vec<String> {
+        list(p).await.unwrap().into_iter().map(|a| a.name).collect()
+    }
+
+    /// 新机器落在列表末尾;挪动换位,撞到两头时不动、不报错;不推进任何 revision(§10)。
+    #[tokio::test]
+    async fn an_agent_moves_in_the_list_and_stops_at_the_edges() {
+        use crate::db::Move;
+        let p = pool().await;
+        let (a, _) = create(&p, "a", 0).await.unwrap();
+        let (b, _) = create(&p, "b", 0).await.unwrap();
+        let (c, _) = create(&p, "c", 0).await.unwrap();
+        assert_eq!(names(&p).await, ["a", "b", "c"]);
+
+        assert!(move_agent(&p, c, Move::Up).await.unwrap());
+        assert_eq!(names(&p).await, ["a", "c", "b"]);
+        assert!(!move_agent(&p, a, Move::Up).await.unwrap());
+        assert!(!move_agent(&p, b, Move::Down).await.unwrap());
+        assert_eq!(names(&p).await, ["a", "c", "b"]);
+
+        let revs: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT config_revision, user_state_revision FROM agents")
+                .fetch_all(&p)
+                .await
+                .unwrap();
+        assert!(revs.iter().all(|r| *r == (0, 0)), "挪顺序不该推进 revision:{revs:?}");
+
+        create(&p, "d", 0).await.unwrap();
+        assert_eq!(names(&p).await, ["a", "c", "b", "d"], "新机器落在末尾");
+        assert!(move_agent(&p, 999, Move::Up).await.is_err());
     }
 }

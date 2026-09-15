@@ -104,6 +104,10 @@ sbx --config /etc/sbx/config.toml user-add alice --quota-gb 100
 sbx --config /etc/sbx/config.toml user-assign alice 1
 sbx --config /etc/sbx/config.toml user-sub alice
 
+# 调顺序：节点在自己机器内上下移，机器整块上下移；订阅里的先后跟着变
+sbx --config /etc/sbx/config.toml node-move 1 up
+sbx --config /etc/sbx/config.toml agent-move 2 down
+
 # 给某台被控加一份自定义 sing-box 片段（出站 / 路由 / DNS），或清掉它
 sbx --config /etc/sbx/config.toml agent-config-set 1 custom.jsonc
 sbx --config /etc/sbx/config.toml agent-config-clear 1
@@ -121,8 +125,8 @@ sbx --config /etc/sbx/config.toml tui
 | 页 | 主要操作 |
 |---|---|
 | 仪表盘 | 集群概况、网速曲线、用户/节点用量排行；`←/→` 换栏，`Enter` 看明细 |
-| 服务管理 | `a` 新增、`E` 编辑（含记账口径与重置时区）、`Enter` 网卡明细、`c` 查看完整 sing-box 配置、`C` 改自定义片段、`K` 让它自己的 sing-box 校验配置、`o` 出站策略、`i` 接入命令、`u` 升级 agent、`r` 轮换 token、`d` 删除 |
-| 节点 | `a` 新增、`E` 编辑、`Enter` 用户明细、`d` 删除 |
+| 服务管理 | `a` 新增、`E` 编辑（含记账口径与重置时区）、`Enter` 网卡明细、`c` 查看完整 sing-box 配置、`C` 改自定义片段、`K` 让它自己的 sing-box 校验配置、`o` 出站策略、`i` 接入命令、`u` 升级 agent、`r` 轮换 token、`<` / `>` 上下移（订阅里它的节点整块跟着挪）、`d` 删除 |
+| 节点 | `a` 新增、`E` 编辑、`Enter` 用户明细、`<` / `>` 上下移（只在同一台机器内，订阅顺序随之变）、`d` 删除 |
 | 用户 | `a` 新增、`E` 编辑、`n` 分配节点、`b` 绑定网卡用量、`T` token、`r` 重置、`t` 启停、`s` 订阅、`d` 删除 |
 | 设置 | `Enter` 修改配置文件；修改后重启 daemon |
 
@@ -165,6 +169,9 @@ GET /sub/<token>?type=stats   浏览器流量页
 
 这是唯一的 HTTP 界面，而且只读，不提供管理 API。
 
+节点在订阅里的先后 = 服务管理页的机器顺序 × 节点页里机器内的节点顺序，两页都用 `<` / `>` 挪。
+顺序不进 sing-box 配置，挪动不会重建任何机器的 box。
+
 IPv6 输出规则：
 
 - URI authority 必须带方括号：`vless://uuid@[2001:db8::1]:443`
@@ -187,6 +194,8 @@ IPv6 输出规则：
   它存在**主控库里**而不是 agent 上，配置权威不变；组装时先并入自定义，再叠出站策略。
   `inbounds` 不开放修改 —— 记账键是（用户, inbound tag）。
 - agent 不开放管理端口；管理面只有 agent 主动连接主控的 WebSocket。
+- 列表与订阅的顺序存在 `agents.sort_order` / `nodes.sort_order`，只影响展示与订阅；
+  `build_agent_config` 的 inbounds 仍按 id 排，挪顺序不推进任何 revision。
 
 ## 构建与测试
 

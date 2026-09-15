@@ -75,6 +75,9 @@ pub struct ExportOptions<'a> {
 type NodeRow = (String, String, i64, String, Option<String>, Option<String>, String);
 
 /// 查出某用户可导出的全部节点(跨 agent)。
+///
+/// 先后 = **机器的顺序 × 机器内节点的顺序**(§10):两页里按 `[<]` / `[>]` 挪出来的
+/// `sort_order`,在这里变成客户端列表里的位置。`a.id` / `n.id` 只是并列时的定序。
 pub async fn export_nodes(pool: &SqlitePool, user_id: i64) -> Result<Vec<ExportNode>> {
     let rows: Vec<NodeRow> = sqlx::query_as(
         "SELECT n.tag, n.protocol, n.listen_port, n.params_json, a.ipv4, a.ipv6, a.name
@@ -82,7 +85,7 @@ pub async fn export_nodes(pool: &SqlitePool, user_id: i64) -> Result<Vec<ExportN
            JOIN user_nodes un ON un.node_id = n.id
            JOIN agents a ON a.id = n.agent_id
           WHERE un.user_id = ?
-          ORDER BY n.agent_id, n.id",
+          ORDER BY a.sort_order, a.id, n.sort_order, n.id",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -1298,5 +1301,43 @@ mod tests {
         let (_, u) = find_by_sub_token(&p, &token).await.unwrap().expect("应当找到");
         assert_eq!(u.name, "alice");
         assert!(find_by_sub_token(&p, "no-such-token").await.unwrap().is_none());
+    }
+
+    /// 订阅里的先后 = 机器顺序 × 机器内节点顺序(§10):两页里挪出来的次序原样到客户端。
+    #[tokio::test]
+    async fn export_follows_machine_order_then_node_order() {
+        use crate::db::Move;
+        let p = pool().await;
+        let mut params = NodeParams::default();
+        crate::secrets::fill(Protocol::VlessReality, &mut params).unwrap();
+        let (tokyo, _) = crate::db::agent_repo::create(&p, "tokyo", 0).await.unwrap();
+        let (osaka, _) = crate::db::agent_repo::create(&p, "osaka", 0).await.unwrap();
+        let uid = crate::db::node_repo::add_user(&p, "alice", 0, 0).await.unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for (agent, tag) in [(tokyo, "t1"), (osaka, "o1"), (tokyo, "t2")] {
+            let (id, _) = crate::db::node_repo::add_node(
+                &p,
+                agent,
+                tag,
+                Protocol::VlessReality,
+                443,
+                &params,
+            )
+            .await
+            .unwrap();
+            crate::db::node_repo::assign_node(&p, uid, id).await.unwrap();
+            ids.insert(tag, id);
+        }
+        async fn tags(p: &SqlitePool, uid: i64) -> Vec<String> {
+            export_nodes(p, uid).await.unwrap().into_iter().map(|n| n.tag).collect()
+        }
+        // 按机器分组,组内按加入先后:t2 建得最晚,仍排在 o1 前面。
+        assert_eq!(tags(&p, uid).await, ["t1", "t2", "o1"]);
+
+        crate::db::node_repo::move_node(&p, ids["t2"], Move::Up).await.unwrap();
+        assert_eq!(tags(&p, uid).await, ["t2", "t1", "o1"]);
+
+        crate::db::agent_repo::move_agent(&p, osaka, Move::Up).await.unwrap();
+        assert_eq!(tags(&p, uid).await, ["o1", "t2", "t1"]);
     }
 }
