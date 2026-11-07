@@ -102,7 +102,10 @@ pub async fn rotate_token(pool: &SqlitePool, id: i64) -> Result<String> {
 ///
 /// **调用前应提示会影响的用户数**(§8.1),那是 UI 的职责,不在这里。
 pub async fn delete(pool: &SqlitePool, id: i64) -> Result<()> {
-    sqlx::query("DELETE FROM agents WHERE id = ?").bind(id).execute(pool).await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    super::node_repo::archive_traffic(&mut tx, id, None).await?;
+    sqlx::query("DELETE FROM agents WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 

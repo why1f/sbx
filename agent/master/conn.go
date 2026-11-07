@@ -70,21 +70,35 @@ const (
 	ipProbeBudget = 5 * time.Second
 )
 
+// The connection owns synchronization/persistence; the controller owns box lifecycle.
+type boxController interface {
+	Apply(json.RawMessage) error
+	Check(json.RawMessage) error
+	Matches(json.RawMessage) bool
+	Restart() error
+	Running() (bool, int64)
+}
+
 type Conn struct {
 	cfg     *config.Config
 	tracker *tracker.Tracker
-	box     *boxctl.Controller
+	box     boxController
 	sys     *sysinfo.Collector
 
 	// counterEpoch 是 agent **进程**级的 UUID,由 main 生成后传进来。
 	// 它不跟 box 重建走 —— 计数器活在 tracker 里,box 重建不清零(§5.2)。
-	counterEpoch string
+	counterEpoch   string
+	networkChanges func(context.Context) <-chan struct{}
 
 	mu sync.Mutex
 	st *state.LastApplied
+	// Retry progress belongs to the cached IP query, not to a WebSocket session.
+	ipRetryAttempt int
 
 	wsMu sync.Mutex
 	ws   *websocket.Conn
+	// Preserve address publication order between cached sysinfo and immediate events.
+	reportMu sync.Mutex
 
 	shutdown     chan struct{}
 	shutdownOnce sync.Once
@@ -98,13 +112,14 @@ func NewConn(
 	counterEpoch string,
 ) *Conn {
 	return &Conn{
-		cfg:          cfg,
-		tracker:      tr,
-		box:          bc,
-		sys:          sysinfo.NewCollector(),
-		counterEpoch: counterEpoch,
-		st:           st,
-		shutdown:     make(chan struct{}),
+		cfg:            cfg,
+		tracker:        tr,
+		box:            bc,
+		sys:            sysinfo.NewCollector(),
+		counterEpoch:   counterEpoch,
+		networkChanges: sysinfo.WatchNetworkChanges,
+		st:             st,
+		shutdown:       make(chan struct{}),
 	}
 }
 
@@ -118,12 +133,16 @@ func (c *Conn) triggerShutdown() {
 
 // Run 是连接主循环:握手 → 收发 → 断线重连。ctx 取消时返回 nil。
 func (c *Conn) Run(ctx context.Context) error {
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	defer stopWatch()
+	// Subscribe before the first IP snapshot; keep events buffered across reconnects.
+	changes := c.networkChanges(watchCtx)
 	backoff := backoffMin
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
-		handshaked, err := c.session(ctx)
+		handshaked, err := c.session(ctx, changes)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -153,7 +172,7 @@ func (c *Conn) Run(ctx context.Context) error {
 // ─────────────────────────── 一次会话 ───────────────────────────
 
 // session 跑完整的一次连接。第一个返回值表示**是否完成过握手**,只用来决定退避。
-func (c *Conn) session(parent context.Context) (bool, error) {
+func (c *Conn) session(parent context.Context, changes <-chan struct{}) (bool, error) {
 	tlsCfg, err := c.tlsConfig()
 	if err != nil {
 		return false, err
@@ -162,8 +181,14 @@ func (c *Conn) session(parent context.Context) (bool, error) {
 	// 从连上那一刻开始计时,把一次可能超时的外部 HTTP 请求排在连上之后,
 	// 会让没有出网权限的节点永远卡在握手超时上 —— 而那种节点恰恰最需要连上来报错。
 	probeCtx, cancelProbe := context.WithTimeout(parent, ipProbeBudget)
+	beforeProbe := c.sys.AddressSnapshot()
 	v4, v6 := c.sys.PublicIPs(probeCtx)
 	cancelProbe()
+	if c.sys.AddressSnapshot() != beforeProbe {
+		c.mu.Lock()
+		c.ipRetryAttempt = 0 // A real new handshake query grants a fresh budget.
+		c.mu.Unlock()
+	}
 
 	dialer := &websocket.Dialer{
 		TLSClientConfig:  tlsCfg,
@@ -214,7 +239,15 @@ func (c *Conn) session(parent context.Context) (bool, error) {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	wg.Add(1)
+	ipInterval, _ := ack.ipQueryInterval() // Validated by handshake; explicit 0 stays disabled.
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := c.watchAddresses(ctx, ipInterval, changes); err != nil {
+			log.Printf("IP 变化上报失败: %v", err)
+			_ = ws.Close()
+		}
+	}()
 	go func() {
 		defer wg.Done()
 		c.timers(ctx, ws, ack)
@@ -290,6 +323,9 @@ func (c *Conn) handshake(ws *websocket.Conn, v4, v6 *string) (*AgentHelloAck, er
 		}
 		if ack.ReportIntervalSecs == 0 {
 			ack.ReportIntervalSecs = 30
+		}
+		if _, err := ack.ipQueryInterval(); err != nil {
+			return nil, err
 		}
 		return &ack, nil
 	}
@@ -380,6 +416,8 @@ func (c *Conn) timers(ctx context.Context, ws *websocket.Conn, ack *AgentHelloAc
 }
 
 func (c *Conn) sendReports() error {
+	c.reportMu.Lock()
+	defer c.reportMu.Unlock()
 	if err := c.send(event(MethodStatsReport, StatsReport{
 		CounterEpoch: c.counterEpoch,
 		Users:        c.tracker.Snapshot(),
@@ -496,23 +534,26 @@ func (c *Conn) invoke(env *Envelope) (any, error) {
 }
 
 func (c *Conn) applyConfig(p ConfigApply) (any, error) {
-	if err := c.box.Apply(p.Options); err != nil {
-		c.emitBoxEvent("failed", err.Error())
-		// 主控收到 error 就不推进 revision(§4.1),下次会重发同一份配置。
-		return nil, err
+	if !c.box.Matches(p.Options) {
+		if err := c.box.Apply(p.Options); err != nil {
+			c.emitBoxEvent("failed", err.Error())
+			// 主控收到 error 就不推进 revision(§4.1),下次会重发同一份配置。
+			return nil, err
+		}
 	}
 	c.mu.Lock()
-	c.st.ConfigRevision = p.Revision
-	c.st.Options = p.Options
 	snap := *c.st
 	c.mu.Unlock()
+	snap.ConfigRevision = p.Revision
+	snap.Options = p.Options
 
-	// 落盘失败**不回错误**:box 已经在跑新配置了,回错误会让主控保留旧 revision
-	// 并立刻重发,于是磁盘满的机器会陷入「重建 box → 落盘失败 → 重发」的循环。
-	// 报 ok 的代价只是重启后按旧 revision 握手、主控补发一次 —— 自愈的那条路。
+	// 握手只声明已持久化的 revision。失败后主控重试,Matches 避免再次重建 box。
 	if err := state.Save(c.cfg.StateDir, &snap); err != nil {
-		log.Printf("警告:last-applied.json 落盘失败(配置已生效,重启后会退回旧配置): %v", err)
+		return nil, fmt.Errorf("配置已运行,保存失败: %w", err)
 	}
+	c.mu.Lock()
+	*c.st = snap
+	c.mu.Unlock()
 	c.emitBoxEvent("running", fmt.Sprintf("config revision %d", p.Revision))
 	return okPayload{}, nil
 }
@@ -522,14 +563,17 @@ func (c *Conn) applyUserState(p UserState) (any, error) {
 	c.tracker.SetDisabled(p.Disabled)
 
 	c.mu.Lock()
-	c.st.UserStateRevision = p.UserStateRevision
-	c.st.Disabled = p.Disabled
 	snap := *c.st
 	c.mu.Unlock()
+	snap.UserStateRevision = p.UserStateRevision
+	snap.Disabled = p.Disabled
 
 	if err := state.Save(c.cfg.StateDir, &snap); err != nil {
-		log.Printf("警告:last-applied.json 落盘失败(禁用名单已生效): %v", err)
+		return nil, fmt.Errorf("禁用名单已生效,保存失败: %w", err)
 	}
+	c.mu.Lock()
+	*c.st = snap
+	c.mu.Unlock()
 	return okPayload{}, nil
 }
 

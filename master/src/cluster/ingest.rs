@@ -60,7 +60,7 @@ pub async fn ingest_stats(
                FROM users u
                JOIN user_nodes un ON un.user_id = u.id
                JOIN nodes n       ON n.id = un.node_id
-              WHERE u.name = ? AND n.tag = ? AND n.agent_id = ?",
+              WHERE COALESCE(u.traffic_name, u.name) = ? AND n.tag = ? AND n.agent_id = ?",
         )
         .bind(&u.name)
         .bind(&u.tag)
@@ -74,7 +74,7 @@ pub async fn ingest_stats(
             continue;
         };
 
-        let prev: Option<(Option<String>, i64, i64)> = sqlx::query_as(
+        let mut prev: Option<(Option<String>, i64, i64)> = sqlx::query_as(
             "SELECT counter_epoch, last_up, last_down FROM user_traffic
               WHERE user_id = ? AND node_id = ?",
         )
@@ -82,6 +82,18 @@ pub async fn ingest_stats(
         .bind(node_id)
         .fetch_optional(&mut *tx)
         .await?;
+        if prev.is_none() {
+            // 同名 tag 的 tracker 计数延续;仅建基线时查询归档。
+            prev = sqlx::query_as(
+                "SELECT counter_epoch, last_up, last_down FROM retired_user_traffic
+                  WHERE user_id = ? AND agent_id = ? AND node_tag = ?",
+            )
+            .bind(user_id)
+            .bind(agent_id)
+            .bind(&u.tag)
+            .fetch_optional(&mut *tx)
+            .await?;
+        }
 
         let (last_epoch, last_up, last_down) = match &prev {
             Some((e, up, down)) => (e.as_deref(), *up, *down),
@@ -251,8 +263,70 @@ pub async fn ingest_sysinfo(
     .execute(&mut *tx)
     .await?;
 
+    if let Some(addresses) = &r.addresses {
+        update_addresses(&mut tx, agent_id, addresses).await?;
+    }
+
     tx.commit().await?;
     Ok(SysinfoOutcome { epoch_changed: d.epoch_changed, rx_delta: d.up, tx_delta: d.down })
+}
+
+/// 独立的地址事件只更新地址,不改网卡/CPU 采样及任何配置 revision。
+pub async fn ingest_addresses(
+    pool: &SqlitePool,
+    agent_id: i64,
+    addresses: &sbx_shared::AgentAddresses,
+) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    update_addresses(&mut tx, agent_id, addresses).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn update_addresses(
+    conn: &mut sqlx::SqliteConnection,
+    agent_id: i64,
+    addresses: &sbx_shared::AgentAddresses,
+) -> Result<()> {
+    let (old4, old6): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT ipv4, ipv6 FROM agents WHERE id = ?")
+            .bind(agent_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    let (v4, v6) = refreshed_addresses(old4, old6, addresses);
+    sqlx::query("UPDATE agents SET ipv4 = ?, ipv6 = ? WHERE id = ?")
+        .bind(v4)
+        .bind(v6)
+        .bind(agent_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+fn refreshed_addresses(
+    old4: Option<String>,
+    old6: Option<String>,
+    update: &sbx_shared::AgentAddresses,
+) -> (Option<String>, Option<String>) {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    let v4 = match update.ipv4.as_deref() {
+        Some("") => None,
+        Some(s) => s.parse::<Ipv4Addr>().ok().map(|ip| ip.to_string()).or(old4),
+        None => old4,
+    };
+    let local = update.ipv6_local.as_ref().and_then(|list| {
+        list.iter().map(|s| s.parse::<Ipv6Addr>().ok()).collect::<Option<Vec<_>>>()
+    });
+    let found = update.ipv6.as_deref().and_then(|s| s.parse::<Ipv6Addr>().ok());
+    let v6 = if let Some(ip) = found {
+        Some(ip.to_string())
+    } else if let (Some(old), Some(local)) = (old6.as_deref(), local.as_ref()) {
+        // 枚举成功且旧地址已不在本机,才清除;没有默认路由或 HTTP 超时本身不算删除。
+        old.parse::<Ipv6Addr>().ok().filter(|ip| local.contains(ip)).map(|ip| ip.to_string())
+    } else {
+        old6
+    };
+    (v4, v6)
 }
 
 #[cfg(test)]
@@ -492,6 +566,7 @@ mod tests {
             mem_total: 4 << 30,
             load1: 0.4,
             uptime_secs: 3600,
+            addresses: None,
         }
     }
 

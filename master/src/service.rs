@@ -37,7 +37,7 @@ pub async fn build_agent_config(pool: &SqlitePool, agent_id: i64) -> Result<serd
     let mut inbounds = Vec::with_capacity(nodes.len());
     for (node_id, tag, proto, port, params_json) in nodes {
         let users: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT u.name, u.uuid, u.password
+            "SELECT COALESCE(u.traffic_name, u.name), u.uuid, u.password
                FROM users u JOIN user_nodes un ON un.user_id = u.id
               WHERE un.node_id = ? ORDER BY u.id",
         )
@@ -319,9 +319,11 @@ fn tls_block(
 /// (tracker 只在 `md.User` 命中时才查这个集合),而按 agent 过滤要多一次 JOIN
 /// 且会在「用户刚被分配到新 agent」的瞬间产生一个不一致窗口。
 pub async fn disabled_users(pool: &SqlitePool) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar("SELECT name FROM users WHERE enabled = 0 ORDER BY name")
-        .fetch_all(pool)
-        .await?)
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(traffic_name, name) FROM users WHERE enabled = 0 ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 // ── 自定义配置片段(§1.2 / 迁移 012)─────────────────────────────

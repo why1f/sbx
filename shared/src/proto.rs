@@ -129,6 +129,7 @@ pub mod method {
     // agent → 主控
     pub const STATS_REPORT: &str = "stats.report";
     pub const SYSINFO_REPORT: &str = "sysinfo.report";
+    pub const ADDRESSES_REPORT: &str = "addresses.report";
     pub const BOX_EVENT: &str = "box.event";
     pub const LOG: &str = "log";
     pub const PONG: &str = "pong";
@@ -177,11 +178,18 @@ pub struct AgentHelloAck {
     pub server_time: i64,
     pub heartbeat_secs: u64,
     pub report_interval_secs: u64,
+    /// 定时公网 IP 查询间隔;0 仅关闭定时查询,启动查询和网络事件仍生效。
+    #[serde(default = "default_ip_query_interval_secs")]
+    pub ip_query_interval_secs: u64,
     pub config_revision: i64,
     pub user_state_revision: i64,
 }
 
 // ─────────────────────────── 主控 → agent(§4.2)───────────────────────────
+
+fn default_ip_query_interval_secs() -> u64 {
+    600
+}
 
 /// `config.apply` —— `options` 是完整的 sing-box 配置。
 ///
@@ -236,6 +244,7 @@ pub struct Ok {}
 /// `(user_id, node_id)`,填不进去(§4.3 / §7.1)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserCounter {
+    /// sing-box 的用户记账身份(新用户为 users.traffic_name,老用户沿用显示名)。
     pub name: String,
     /// 承载该用户的 inbound tag。对应 `nodes.tag`。
     pub tag: String,
@@ -270,6 +279,19 @@ pub struct SysinfoReport {
     pub mem_total: i64,
     pub load1: f64,
     pub uptime_secs: i64,
+    /// 缺省表示老 agent;探测失败不覆盖旧值,可靠的本机列表可确认 IPv6 已删除。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addresses: Option<AgentAddresses>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentAddresses {
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv6_local: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

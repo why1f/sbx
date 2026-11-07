@@ -69,6 +69,9 @@ func TestApplyStartsAndStops(t *testing.T) {
 	if err := c.Apply(configOn(port)); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
+	if !c.Matches(configOn(port)) || c.Matches(configOn(0)) {
+		t.Fatal("Matches must identify only the running configuration")
+	}
 	running, since := c.Running()
 	if !running || since == 0 {
 		t.Errorf("Running() = (%v, %d)", running, since)

@@ -24,13 +24,14 @@ import (
 
 // Report 是一次采集的结果,字段与 proto.rs 的 SysinfoReport 一一对应。
 type Report struct {
-	BootID     string  `json:"boot_id"`
-	NIC        NIC     `json:"nic"`
-	CPUPct     float64 `json:"cpu_pct"`
-	MemUsed    int64   `json:"mem_used"`
-	MemTotal   int64   `json:"mem_total"`
-	Load1      float64 `json:"load1"`
-	UptimeSecs int64   `json:"uptime_secs"`
+	BootID     string     `json:"boot_id"`
+	NIC        NIC        `json:"nic"`
+	CPUPct     float64    `json:"cpu_pct"`
+	MemUsed    int64      `json:"mem_used"`
+	MemTotal   int64      `json:"mem_total"`
+	Load1      float64    `json:"load1"`
+	UptimeSecs int64      `json:"uptime_secs"`
+	Addresses  *Addresses `json:"addresses,omitempty"`
 }
 
 // NIC 是全部物理网卡的累计收发字节数。
@@ -68,11 +69,16 @@ type Collector struct {
 	lastIdle int64
 	lastAll  int64
 
-	ipMu      sync.Mutex
-	ipv4      *string
-	ipv6      *string
-	ipFetched time.Time
-	ipTTL     time.Duration
+	ipMu           sync.Mutex
+	probeMu        sync.Mutex
+	ipv4           *string
+	ipv6           *string
+	ipFetched      time.Time
+	ipTTL          time.Duration
+	ipRetry        bool
+	addresses      *Addresses
+	interfaceAddrs func() ([]net.Addr, error)
+	sourceIP       func(string) *string
 	// v4Endpoints / v6Endpoints 是自探要打的地址,按顺序试,第一个成功的即采用。
 	// 留成字段而不是写死,有两个用处:单测把它清空就不碰网络(否则 WS 客户端的
 	// 测试会依赖外网可达,在受限的 CI runner 上随机超时);受限网络里的部署
@@ -83,6 +89,8 @@ type Collector struct {
 
 func NewCollector() *Collector {
 	return &Collector{
+		interfaceAddrs: net.InterfaceAddrs,
+		sourceIP:       localSourceIP,
 		// 顺序就是优先级,第一个成功的即采用。ip.sb 排前面是实测的结果:
 		// 同一台机器上 ipify 要等好几秒(v6 到那家的路由绕),ip.sb 立刻就回。
 		// **两个就够了** —— 这一步在拨号之前跑,每多一个 endpoint 就多 3 秒
@@ -95,12 +103,15 @@ func NewCollector() *Collector {
 // SetEndpoints 覆盖自探地址。传 nil 表示**不探测那一路**,直接报 nil ——
 // 连本机源地址那条路也一并关掉(单测靠这个完全不碰网络栈)。
 func (c *Collector) SetEndpoints(v4, v6 []string) {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
 	c.ipMu.Lock()
 	defer c.ipMu.Unlock()
 	c.v4Endpoints = v4
 	c.v6Endpoints = v6
 	// 换了地址就作废缓存,否则改完还得等 TTL 到期才生效。
 	c.ipFetched = time.Time{}
+	c.addresses = nil
 }
 
 // Collect 采一次。任何单项失败都只让那一项留零值,不影响其余字段 ——
@@ -116,6 +127,7 @@ func (c *Collector) Collect() Report {
 		MemTotal:   memTotal,
 		Load1:      readLoad1(),
 		UptimeSecs: readUptime(),
+		Addresses:  c.AddressSnapshot(),
 	}
 }
 
@@ -384,49 +396,18 @@ const (
 // 把探测排在连上之后会让没有出网的节点永远握手超时。
 func (c *Collector) PublicIPs(ctx context.Context) (*string, *string) {
 	c.ipMu.Lock()
+	fresh := !c.ipFetched.IsZero() && time.Since(c.ipFetched) < c.ipTTL
+	c.ipMu.Unlock()
+	if !fresh {
+		c.RefreshIPs(ctx)
+	}
+	c.ipMu.Lock()
 	defer c.ipMu.Unlock()
-	if !c.ipFetched.IsZero() && time.Since(c.ipFetched) < c.ipTTL {
-		return c.ipv4, c.ipv6
+	v4 := c.ipv4
+	if v4 != nil && *v4 == "" {
+		v4 = nil // hello uses the legacy non-empty address contract.
 	}
-	// 两路并行:串行的话 v6 探测要排在 v4 的超时之后,最坏耗时翻倍。
-	var wg sync.WaitGroup
-	var v4, v6 *string
-	v4eps, v6eps := c.v4Endpoints, c.v6Endpoints
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		v4 = probe(ctx, "tcp4", v4eps)
-		// v4 只在 HTTP 探测**全部失败**时才看本机源地址,而且必须是公网地址。
-		// NAT 后面选出来的是 10.x,那个值写进订阅是死地址 —— 所以顺序不能反。
-		if v4 == nil && len(v4eps) > 0 {
-			v4 = localSourceIP("udp4")
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		// **v6 先问内核。** 没有 NAT,内核为出网选的源地址就是这台机器的公网身份,
-		// 而且这一步是瞬时的、不依赖任何外部服务。
-		//
-		// 原先只有 HTTP 探测那一条路,超时 3 秒:碰上 api6.ipify.org 响应慢的
-		// 机器(线路绕、v6 到那家的路由差),两个 endpoint 连着超时,
-		// 于是一台**明明有全球 IPv6、也能出网**的机器在界面上一直是空的。
-		if len(v6eps) > 0 {
-			v6 = localSourceIP("udp6")
-		}
-		// 内核给不出全球地址时(没有 v6 默认路由、或者只有 ULA)再去问外面。
-		if v6 == nil {
-			v6 = probe(ctx, "tcp6", v6eps)
-		}
-	}()
-	wg.Wait()
-
-	c.ipv4, c.ipv6, c.ipFetched = v4, v6, time.Now()
-	if v4 != nil || v6 != nil {
-		c.ipTTL = ipCacheTTL
-	} else {
-		c.ipTTL = ipFailTTL
-	}
-	return v4, v6
+	return v4, c.ipv6
 }
 
 // probe 依次试每个 endpoint,第一个成功的即返回。空列表 = 不探测。

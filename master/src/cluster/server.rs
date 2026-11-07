@@ -49,6 +49,7 @@ pub struct ServerState {
     pub speed: Arc<Mutex<std::collections::HashMap<i64, SpeedSample>>>,
     pub heartbeat_secs: u64,
     pub report_interval_secs: u64,
+    pub ip_query_interval_secs: u64,
     /// 一条连接最长可以多久不出声。超过就判成半开、断开并 `mark_offline`。
     ///
     /// 由 `idle_limit(heartbeat_secs)` 在启动时算好存下来,而不是每次现算:
@@ -179,6 +180,7 @@ async fn serve_registered(
         server_time: now,
         heartbeat_secs: state.heartbeat_secs,
         report_interval_secs: state.report_interval_secs,
+        ip_query_interval_secs: state.ip_query_interval_secs,
         config_revision: db_state.config_revision,
         user_state_revision: db_state.user_state_revision,
     };
@@ -327,7 +329,10 @@ async fn catch_up(
                             now,
                         )
                         .await;
-                        state.registry.lock().await.mark_config_sent(agent_id, agent_config_rev);
+                        state.registry.lock().await.mark_config_sent(
+                            agent_id,
+                            agent_config_rev.min(master.config_revision.saturating_sub(1)),
+                        );
                     }
                 }
             }
@@ -343,7 +348,10 @@ async fn catch_up(
                     now,
                 )
                 .await;
-                state.registry.lock().await.mark_config_sent(agent_id, agent_config_rev);
+                state.registry.lock().await.mark_config_sent(
+                    agent_id,
+                    agent_config_rev.min(master.config_revision.saturating_sub(1)),
+                );
             }
         }
     }
@@ -353,7 +361,9 @@ async fn catch_up(
     // 以前失败时什么都不记,`sent_config_rev` 留在 `None`,而巡检把 `None` 当作
     // 「catch_up 还没跑完、别抢」直接跳过,于是这条连接活多久就多久收不到配置。
 
-    if agent_user_rev == master.user_state_revision {
+    // 0 表示从未拿到过名单,不能推断成「禁用名单为空」。新 agent 建立之前
+    // 就可能已有停用用户,而那些变更没有机会推进这台机器的 revision。
+    if agent_user_rev == master.user_state_revision && agent_user_rev != 0 {
         // 已经一致,记在连接上,免得巡检把它当成「没下发过」白发一次(理由同上)。
         state.registry.lock().await.mark_user_sent(agent_id, agent_user_rev);
     } else {
@@ -389,13 +399,19 @@ async fn catch_up(
                     }
                     Err(e) => {
                         tracing::error!(agent_id, error = %e, "user.state 失败");
-                        state.registry.lock().await.mark_user_sent(agent_id, agent_user_rev);
+                        state.registry.lock().await.mark_user_sent(
+                            agent_id,
+                            agent_user_rev.min(master.user_state_revision.saturating_sub(1)),
+                        );
                     }
                 }
             }
             Err(e) => {
                 tracing::error!(agent_id, error = %e, "查询禁用名单失败");
-                state.registry.lock().await.mark_user_sent(agent_id, agent_user_rev);
+                state.registry.lock().await.mark_user_sent(
+                    agent_id,
+                    agent_user_rev.min(master.user_state_revision.saturating_sub(1)),
+                );
             }
         }
     }
@@ -547,8 +563,10 @@ async fn recv_loop(
         //
         // 只在**上报**这一步查,不是每条消息都查:上报按固定间隔来(默认 30s),
         // 一次主键命中的开销可以忽略;resp / log 这些消息不该为此多查一次库。
-        if matches!(env.method.as_str(), method::STATS_REPORT | method::SYSINFO_REPORT)
-            && !agent_exists(&state.pool, agent_id).await
+        if matches!(
+            env.method.as_str(),
+            method::STATS_REPORT | method::SYSINFO_REPORT | method::ADDRESSES_REPORT
+        ) && !agent_exists(&state.pool, agent_id).await
         {
             anyhow::bail!("agent 已从库里删除,断开这条连接");
         }
@@ -594,6 +612,17 @@ async fn dispatch(env: Envelope, agent_id: i64, state: &ServerState) {
         method::SYSINFO_REPORT => match serde_json::from_value(env.payload) {
             Ok(r) => ingest_sysinfo(agent_id, state, &r, now).await,
             Err(e) => tracing::warn!(agent_id, error = %e, "sysinfo.report payload 不合法"),
+        },
+        method::ADDRESSES_REPORT => match serde_json::from_value(env.payload) {
+            Ok(addresses) => {
+                if let Err(e) =
+                    crate::cluster::ingest::ingest_addresses(&state.pool, agent_id, &addresses)
+                        .await
+                {
+                    tracing::warn!(agent_id, error = %e, "更新 agent 地址失败");
+                }
+            }
+            Err(e) => tracing::warn!(agent_id, error = %e, "addresses.report payload 不合法"),
         },
         method::BOX_EVENT => {
             let state_str = env.payload.get("state").and_then(|v| v.as_str()).unwrap_or("?");
@@ -776,6 +805,49 @@ async fn mark_offline(pool: &SqlitePool, agent_id: i64, now: i64) -> Result<()> 
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn disabled_ip_queries_are_sent_as_zero_in_handshake() {
+        let p = pool().await;
+        let (_, token) = crate::db::agent_repo::create(&p, "ip-query", 0).await.unwrap();
+        let mut state = state_with(p);
+        state.ip_query_interval_secs = 0;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let mut ws = connect(&url).await;
+        let resp = do_hello(&mut ws, &hello(&token)).await;
+        assert_eq!(resp.payload.get("ip_query_interval_secs"), Some(&serde_json::json!(0)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn address_event_updates_ips_without_waiting_for_sysinfo() {
+        let (url, p) = spawn_server().await;
+        let (id, token) = crate::db::agent_repo::create(&p, "ip-event", 0).await.unwrap();
+        let mut ws = connect(&url).await;
+        assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
+        let update = Envelope::event(
+            method::ADDRESSES_REPORT,
+            serde_json::json!({"ipv4":"198.51.100.10", "ipv6":"2a06:9801::1", "ipv6_local":["2a06:9801::1"]}),
+        );
+        ws.send(tungstenite::Message::Text(serde_json::to_string(&update).unwrap())).await.unwrap();
+        wait_for("IP event stored", || async {
+            crate::db::agent_repo::get(&p, id).await.unwrap().unwrap().ipv6.as_deref()
+                == Some("2a06:9801::1")
+        })
+        .await;
+        let a = crate::db::agent_repo::get(&p, id).await.unwrap().unwrap();
+        assert_eq!(a.ipv4.as_deref(), Some("198.51.100.10"));
+        assert_eq!(a.config_revision, 0);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_nic_traffic")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "address events must not create or alter traffic snapshots");
+    }
+
     async fn pool() -> SqlitePool {
         let path = std::env::temp_dir().join(format!("sbx-server-{}.db", uuid::Uuid::new_v4()));
         crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap()
@@ -790,6 +862,7 @@ mod tests {
             speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
             heartbeat_secs: 10,
             report_interval_secs: 30,
+            ip_query_interval_secs: 600,
             idle_limit: idle_limit(10),
         }
     }
@@ -1151,6 +1224,7 @@ mod tests {
             speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
             heartbeat_secs: 10,
             report_interval_secs: 30,
+            ip_query_interval_secs: 600,
             idle_limit: idle,
         };
         // 端口 0 = 让内核分配一个空闲端口,避免测试并发时抢端口。
@@ -1393,22 +1467,34 @@ mod tests {
         assert_eq!(inbounds.len(), 1);
         assert_eq!(inbounds[0]["tag"], "vless-in");
         // 被禁用的用户仍然在 inbound 里(§7.5)
-        assert_eq!(inbounds[0]["users"][0]["name"], "banned");
+        let identity: String = sqlx::query_scalar("SELECT traffic_name FROM users WHERE id = ?")
+            .bind(uid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(inbounds[0]["users"][0]["name"], identity);
 
         assert_eq!(got[1].0, method::USER_STATE, "再下发 user.state");
         assert_eq!(got[1].1["user_state_revision"], 1);
-        assert_eq!(got[1].1["disabled"][0], "banned", "禁用名单应含该用户");
+        assert_eq!(got[1].1["disabled"][0], identity, "禁用名单应含该用户");
     }
 
     /// revision 一致时**不该**下发任何东西 —— 否则每次重连都白重建一次 box。
     #[tokio::test]
     async fn up_to_date_agent_receives_nothing() {
         let (url, pool) = spawn_server().await;
-        let (_, token) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
+        let (id, token) = crate::db::agent_repo::create(&pool, "tokyo", 0).await.unwrap();
 
-        // 主控与 agent 都是 revision 0
+        // 已确认过名单的非零版本一致时无需重复下发。
+        sqlx::query("UPDATE agents SET user_state_revision = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut h = hello(&token);
+        h.user_state_revision = 1;
         let mut ws = connect(&url).await;
-        assert!(do_hello(&mut ws, &hello(&token)).await.is_ok());
+        assert!(do_hello(&mut ws, &h).await.is_ok());
 
         // 等一小会儿,确认没有后续消息
         let next = tokio::time::timeout(std::time::Duration::from_millis(400), ws.next()).await;
@@ -1519,6 +1605,7 @@ mod tests {
             speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
             heartbeat_secs: 10,
             report_interval_secs: 30,
+            ip_query_interval_secs: 600,
             idle_limit: idle_limit(10),
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1556,5 +1643,137 @@ mod tests {
         let a = crate::db::agent_repo::get(&pool, id).await.unwrap().unwrap();
         assert!(!a.is_online(), "断开后应标 offline");
         assert!(a.last_seen.is_some());
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn new_agent_must_receive_existing_disabled_users() {
+        for reject_first in [false, true] {
+            let path = std::env::temp_dir()
+                .join(format!("sbx-review-new-agent-{}.db", uuid::Uuid::new_v4()));
+            let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+            let u = crate::db::node_repo::add_user(&pool, "alice", 0, 0).await.unwrap();
+            crate::db::node_repo::set_user_enabled(&pool, "alice", false).await.unwrap();
+            let (a, _) = crate::db::agent_repo::create(&pool, "new", 0).await.unwrap();
+            let mut params = crate::model::node::NodeParams::default();
+            crate::secrets::fill(crate::model::node::Protocol::VlessWs, &mut params).unwrap();
+            let (n, _) = crate::db::node_repo::add_node(
+                &pool,
+                a,
+                "ws",
+                crate::model::node::Protocol::VlessWs,
+                10001,
+                &params,
+            )
+            .await
+            .unwrap();
+            crate::db::node_repo::assign_node(&pool, u, n).await.unwrap();
+            let identity: String =
+                sqlx::query_scalar("SELECT traffic_name FROM users WHERE id = ?")
+                    .bind(u)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let state = ServerState {
+                pool: pool.clone(),
+                registry: Arc::new(Mutex::new(Registry::new())),
+                rpc: Arc::new(crate::cluster::Rpc::new()),
+                speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                heartbeat_secs: 10,
+                report_interval_secs: 30,
+                ip_query_interval_secs: 600,
+                idle_limit: idle_limit(10),
+            };
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+            let epoch = state.registry.lock().await.register(a, tx).epoch;
+            let rpc = state.rpc.clone();
+            let responder = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut rejected = false;
+                while let Some(env) = rx.recv().await {
+                    seen.push(env.clone());
+                    if reject_first && !rejected && env.method == method::USER_STATE {
+                        rejected = true;
+                        rpc.resolve(a, Envelope::resp_err(env.id.unwrap(), env.method, "retry me"))
+                            .await;
+                        continue;
+                    }
+                    rpc.resolve(
+                        a,
+                        Envelope::resp_ok(env.id.unwrap(), env.method, serde_json::json!({})),
+                    )
+                    .await;
+                }
+                seen
+            });
+            catch_up(a, &state, 0, 0, load_revisions(&pool, a).await.unwrap()).await;
+            assert_eq!(
+                state.registry.lock().await.sent_user_rev(a),
+                Some(if reject_first { -1 } else { 0 })
+            );
+            crate::supervisor::tick(&pool, &state.registry, &state.rpc, 100).await.unwrap();
+            state.registry.lock().await.unregister(a, epoch);
+            let seen = responder.await.unwrap();
+            assert_eq!(
+                seen.iter().filter(|e| e.method == method::USER_STATE).count(),
+                if reject_first { 2 } else { 1 }
+            );
+            assert!(seen.iter().any(|e| e.method == method::CONFIG_APPLY
+                && e.payload["options"]["inbounds"][0]["users"][0]["name"] == identity));
+            assert!(seen.iter().any(|e| e.method == method::USER_STATE && e.payload["disabled"].as_array().unwrap().iter().any(|u| u.as_str() == Some(identity.as_str()))), "config contains disabled alice, but catch_up and next tick sent no disabled list: {seen:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_config_probes {
+    use super::*;
+    #[tokio::test]
+    async fn recovery_downgraded_master_revision_must_retry_failed_config() {
+        let path =
+            std::env::temp_dir().join(format!("sbx-revision-review-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let (a, _) = crate::db::agent_repo::create(&pool, "a", 0).await.unwrap();
+        sqlx::query("UPDATE agents SET config_revision=2,user_state_revision=1 WHERE id=?")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = ServerState {
+            pool: pool.clone(),
+            registry: Arc::new(Mutex::new(Registry::new())),
+            rpc: Arc::new(crate::cluster::Rpc::new()),
+            speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            heartbeat_secs: 10,
+            report_interval_secs: 30,
+            ip_query_interval_secs: 600,
+            idle_limit: idle_limit(10),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+        let epoch = state.registry.lock().await.register(a, tx).epoch;
+        let rpc = state.rpc.clone();
+        let task = tokio::spawn(async move {
+            let mut attempts = 0;
+            while let Some(env) = rx.recv().await {
+                if env.method == method::CONFIG_APPLY {
+                    attempts += 1;
+                }
+                let response = if attempts == 1 {
+                    Envelope::resp_err(env.id.unwrap(), env.method, "temporary failure")
+                } else {
+                    Envelope::resp_ok(env.id.unwrap(), env.method, serde_json::json!({}))
+                };
+                rpc.resolve(a, response).await;
+            }
+            attempts
+        });
+        catch_up(a, &state, 5, 1, load_revisions(&pool, a).await.unwrap()).await;
+        crate::supervisor::tick(&pool, &state.registry, &state.rpc, 100).await.unwrap();
+        state.registry.lock().await.unregister(a, epoch);
+        assert_eq!(task.await.unwrap(),2,"failed config rollback is never retried when agent revision is newer than restored database");
     }
 }

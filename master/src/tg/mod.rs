@@ -29,6 +29,8 @@ mod api;
 // 解析同一种 `±HH:MM` 写法。宁可把这个模块开放给 crate 内部,也不要为了「模块边界好看」
 // 复制一份解析器 —— 两份解析器迟早会在某个边角上分叉,而那种分叉查起来很痛。
 pub(crate) mod fmt;
+#[cfg(test)]
+mod recovery_tests;
 mod repo;
 mod ui;
 
@@ -94,45 +96,34 @@ impl Ctx {
     }
 }
 
-/// 启动 bot。
-///
-/// * `Ok(None)` —— 另一个进程已经在跑 bot,本次主动跳过。**这不是错误。**
-/// * `Ok(Some(tx))` —— 拿到租约,把 tx 交给 supervisor 用于推送配额告警。
+/// Bot 拥有固定大小事件通道;等待旧租约过期时后台重试,不阻塞 daemon 启动。
+pub struct Bot {
+    pub events: mpsc::Sender<Event>,
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Bot {
+    pub async fn stop(self) {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
+    }
+}
+
 pub async fn start(
     pool: SqlitePool,
     cfg: TelegramConfig,
     public_base: String,
     mode: &str,
-) -> Result<Option<mpsc::Sender<Event>>> {
-    if !cfg.enabled {
-        return Err(anyhow!("telegram.enabled = false"));
+) -> Result<Bot> {
+    if !cfg.enabled || cfg.bot_token.trim().is_empty() {
+        return Err(anyhow!("Telegram 未启用或 bot_token 为空"));
     }
-    if cfg.bot_token.trim().is_empty() {
-        return Err(anyhow!("telegram.bot_token 为空"));
-    }
-
-    let lease_owner = format!("{}@{mode}", std::process::id());
-    let now = Utc::now().timestamp();
-    if !repo::try_acquire_lease(&pool, &lease_owner, LEASE_STALE_SECS, now).await? {
-        let holder =
-            repo::lease_holder(&pool).await.ok().flatten().unwrap_or_else(|| "未知进程".into());
-        tracing::info!(
-            %holder,
-            "另一个进程已在运行 Telegram Bot,本进程跳过(同一 bot_token 只能有一个长轮询)"
-        );
-        return Ok(None);
-    }
-
     let api = api::Api::new(&cfg.bot_token, cfg.request_timeout_secs)?;
     let offset = fmt::parse_timezone(&cfg.timezone).unwrap_or_else(|| {
-        tracing::warn!(
-            timezone = %cfg.timezone,
-            "无法解析时区,回落到 +08:00。支持 ±HH:MM 与**不走夏令时**的 IANA 别名;\
-             会 DST 的时区(Europe/London、America/* 等)请填显式偏移"
-        );
-        FixedOffset::east_opt(8 * 3600).expect("8 小时偏移恒定有效")
+        tracing::warn!(timezone = %cfg.timezone, "无法解析时区,回落到 +08:00");
+        FixedOffset::east_opt(8 * 3600).unwrap()
     });
-
     let ctx = Ctx {
         pool,
         cfg: Arc::new(cfg),
@@ -140,11 +131,9 @@ pub async fn start(
         api,
         offset,
         pending: Arc::new(Mutex::new(HashMap::new())),
-        lease_owner,
-        active: Arc::new(AtomicBool::new(true)),
+        lease_owner: format!("{}@{mode}@{}", std::process::id(), uuid::Uuid::new_v4()),
+        active: Arc::new(AtomicBool::new(false)),
     };
-
-    // 管理员偏好行按需建。INSERT OR IGNORE,不会覆盖管理员自己改过的设置。
     let admin_times = serde_json::to_string(&ctx.default_admin_times())?;
     for id in &ctx.cfg.admin_chat_ids {
         repo::ensure_admin_prefs(
@@ -156,23 +145,59 @@ pub async fn start(
         )
         .await?;
     }
-    // 命令菜单注册失败不致命:没有 / 下拉提示,命令本身照样能用。
-    if let Err(e) = ctx.api.register_commands().await {
-        tracing::warn!(error = %e, "注册 Telegram 命令菜单失败(不致命)");
-    }
+    Ok(launch(ctx, Duration::from_secs(5)))
+}
 
-    let (tx, rx) = mpsc::channel::<Event>(64);
-    tokio::spawn(event_loop(ctx.clone(), rx));
-    tokio::spawn(poll_loop(ctx.clone()));
-    tokio::spawn(schedule_loop(ctx.clone()));
-    tokio::spawn(lease_loop(ctx));
-
-    tracing::info!("Telegram Bot 已启动");
-    Ok(Some(tx))
+fn launch(ctx: Ctx, retry: Duration) -> Bot {
+    let (events, rx) = mpsc::channel(64);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(retry);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = stopped.changed() => return,
+                _ = interval.tick() => {
+                    match repo::try_acquire_lease(&ctx.pool, &ctx.lease_owner,
+                        LEASE_STALE_SECS, Utc::now().timestamp()).await {
+                        Ok(true) => break,
+                        Ok(false) => {},
+                        Err(e) => tracing::warn!(error = %e, "获取 Telegram 租约失败,稍后重试"),
+                    }
+                }
+            }
+        }
+        ctx.active.store(true, Ordering::Relaxed);
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(lease_loop(ctx.clone()));
+        let running = async {
+            if let Err(e) = ctx.api.register_commands().await {
+                tracing::warn!(error = %e, "注册 Telegram 命令菜单失败");
+            }
+            workers.spawn(event_loop(ctx.clone(), rx));
+            workers.spawn(poll_loop(ctx.clone()));
+            workers.spawn(schedule_loop(ctx.clone()));
+            tracing::info!("Telegram Bot 已启动");
+            // 任一循环因丢失租约/冲突停止时,一起停止其余循环。
+            workers.join_next().await;
+        };
+        tokio::select! {
+            _ = stopped.changed() => {},
+            _ = running => {},
+        }
+        ctx.active.store(false, Ordering::Relaxed);
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+        if let Err(e) = repo::release_lease(&ctx.pool, &ctx.lease_owner).await {
+            tracing::warn!(error = %e, "释放 Telegram 租约失败,将等待过期接管");
+        }
+    });
+    Bot { events, stop, task }
 }
 
 async fn lease_loop(ctx: Ctx) {
     let mut iv = tokio::time::interval(LEASE_HEARTBEAT);
+    let mut last_renewed = tokio::time::Instant::now();
     iv.tick().await;
     loop {
         iv.tick().await;
@@ -180,14 +205,20 @@ async fn lease_loop(ctx: Ctx) {
             return;
         }
         match repo::renew_lease(&ctx.pool, &ctx.lease_owner, Utc::now().timestamp()).await {
-            Ok(true) => {}
+            Ok(true) => last_renewed = tokio::time::Instant::now(),
             Ok(false) => {
                 tracing::warn!(owner = %ctx.lease_owner, "Telegram Bot 租约被接管,本实例停止");
                 ctx.active.store(false, Ordering::Relaxed);
                 return;
             }
             // 续租失败多半是 DB 临时忙。保持活跃等下一轮 —— 租约过期前还有余量。
-            Err(e) => tracing::warn!(error = %e, "续租 Telegram Bot 失败,稍后重试"),
+            Err(e) => {
+                tracing::warn!(error = %e, "续租 Telegram Bot 失败,稍后重试");
+                if last_renewed.elapsed() >= Duration::from_secs(LEASE_STALE_SECS as u64) {
+                    ctx.active.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
         }
     }
 }
@@ -214,12 +245,14 @@ async fn poll_loop(ctx: Ctx) {
     // 并发处理 update,但设上限:一次 getUpdates 可能返回上百条,
     // 无限 spawn 会把数据库连接池打满。
     let slots = Arc::new(Semaphore::new(8));
+    let mut handlers = tokio::task::JoinSet::new();
 
     loop {
         if !ctx.alive() {
             tracing::info!("Telegram Bot 已失去租约,停止轮询");
             return;
         }
+        while handlers.try_join_next().is_some() {}
         match ctx.api.get_updates(offset).await {
             Ok(updates) => {
                 backoff = 1;
@@ -228,7 +261,7 @@ async fn poll_loop(ctx: Ctx) {
                     offset = update.update_id + 1;
                     let ctx = ctx.clone();
                     let slots = slots.clone();
-                    tokio::spawn(async move {
+                    handlers.spawn(async move {
                         let Ok(_permit) = slots.acquire_owned().await else { return };
                         let id = update.update_id;
                         // 单条 update 卡住不能拖垮整个 bot。
@@ -291,8 +324,11 @@ async fn handle_message(ctx: &Ctx, chat_id: i64, text: &str) -> Result<()> {
     // 命令永远打断「等输入」状态 —— 否则用户在填时间的中途想 /start 就卡住了。
     if text.starts_with('/') {
         ctx.pending.lock().await.remove(&chat_id);
-    } else if let Some(p) = ctx.pending.lock().await.remove(&chat_id) {
-        return handle_pending(ctx, chat_id, text, p).await;
+    } else {
+        let pending = ctx.pending.lock().await.remove(&chat_id);
+        if let Some(p) = pending {
+            return handle_pending(ctx, chat_id, text, p).await;
+        }
     }
 
     // 命令按空白切开,并剥掉群里 Telegram 会附上的 `@BotName` 后缀。
@@ -639,32 +675,62 @@ async fn handle_quota_alert(ctx: &Ctx, username: &str, percent: f64) -> Result<(
         return Ok(()); // 这一档已经通知过了
     }
 
+    let mut delivered = true;
     if u.is_bound() && u.threshold_enabled(level) {
-        // 用户侧发送失败(被拉黑、注销)不能吞掉管理员通知,也不能阻止档位落库 ——
-        // 否则每 30 秒重试一次,永远推不成也永远不停。
-        if let Err(e) = ctx
-            .api
-            .send_html(u.chat_id, &ui::quota_alert_text(&u, level), Some(ui::user_back_keyboard()))
-            .await
-        {
-            tracing::warn!(user = %u.name, error = %e, "配额告警推给用户失败");
-        }
+        delivered &= send_quota_alert(ctx, &u, u.chat_id, level, false).await?;
     }
-
     for admin in repo::list_admin_prefs(&ctx.pool, &ctx.cfg.admin_chat_ids)
         .await?
         .into_iter()
         .filter(|a| a.notify_quota)
     {
-        if let Err(e) =
-            ctx.api.send_html(admin.chat_id, &ui::admin_quota_alert_text(&u, level), None).await
-        {
-            tracing::warn!(chat_id = admin.chat_id, error = %e, "配额告警推给管理员失败");
+        delivered &= send_quota_alert(ctx, &u, admin.chat_id, level, true).await?;
+    }
+    if delivered {
+        repo::set_last_quota_level(&ctx.pool, &u.name, i64::from(level)).await?;
+    }
+    Ok(())
+}
+
+async fn send_quota_alert(
+    ctx: &Ctx,
+    u: &repo::TgUser,
+    chat: i64,
+    level: u8,
+    admin: bool,
+) -> Result<bool> {
+    let (sent, retry_at, attempts) = repo::quota_delivery(&ctx.pool, u.id, chat).await?;
+    if sent >= i64::from(level) {
+        return Ok(true);
+    }
+    let now = Utc::now().timestamp();
+    if retry_at > now {
+        return Ok(false);
+    }
+    let body =
+        if admin { ui::admin_quota_alert_text(u, level) } else { ui::quota_alert_text(u, level) };
+    let keyboard = if admin { None } else { Some(ui::user_back_keyboard()) };
+    match ctx.api.send_html(chat, &body, keyboard).await {
+        Ok(()) => {
+            repo::record_quota_delivery(&ctx.pool, u.id, chat, i64::from(level), 0, 0).await?;
+            Ok(true)
+        }
+        Err(e) => {
+            // 后续巡检负责重试,最多退避到一小时,不增加后台计时器。
+            let delay = (30i64 << attempts.clamp(0, 7)).min(3600);
+            repo::record_quota_delivery(
+                &ctx.pool,
+                u.id,
+                chat,
+                sent,
+                now + delay,
+                attempts.saturating_add(1),
+            )
+            .await?;
+            tracing::warn!(chat_id = chat, error = %e, "配额告警失败,稍后重试");
+            Ok(false)
         }
     }
-
-    repo::set_last_quota_level(&ctx.pool, &u.name, i64::from(level)).await?;
-    Ok(())
 }
 
 async fn schedule_loop(ctx: Ctx) {
@@ -688,8 +754,19 @@ async fn schedule_loop(ctx: Ctx) {
 /// 没有这一步,一个到过 100% 的用户在重置之后**永远不会再收到告警** ——
 /// 因为 `last_quota_level` 一直卡在 100。
 async fn reset_fallen_levels(ctx: &Ctx) -> Result<()> {
+    let delivered: HashMap<_, _> = repo::quota_delivery_levels(&ctx.pool)
+        .await?
+        .into_iter()
+        .map(|(user, level, retry)| (user, (level, retry)))
+        .collect();
     for u in repo::list_users(&ctx.pool).await? {
         let current = i64::from(fmt::quota_level(u.percent()));
+        if delivered
+            .get(&u.id)
+            .is_some_and(|(level, retry)| *level > current || (current == 0 && *retry))
+        {
+            repo::reset_quota_deliveries(&ctx.pool, u.id, current).await?;
+        }
         if current < u.last_quota_level {
             repo::set_last_quota_level(&ctx.pool, &u.name, current).await?;
         }
@@ -908,5 +985,51 @@ mod tests {
 
         handle_quota_alert(&c, "alice", 100.0).await.unwrap();
         assert_eq!(repo::get_user(&p, "alice").await.unwrap().unwrap().last_quota_level, 100);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_schedule_must_not_deadlock_all_pending_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(|| async {
+                    serde_json::json!({"ok": true, "result": {}}).to_string()
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let ctx = Ctx {
+            pool: SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+            cfg: Arc::new(TelegramConfig::default()),
+            public_base: String::new(),
+            api: api::Api::with_base(base),
+            offset: FixedOffset::east_opt(0).unwrap(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            lease_owner: "review".into(),
+            active: Arc::new(AtomicBool::new(true)),
+        };
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_pending(&ctx, 42, "not-a-time", Pending::UserSchedule),
+        )
+        .await
+        .expect("control: local HTTP mock must respond promptly")
+        .unwrap();
+        ctx.pending.lock().await.insert(42, Pending::UserSchedule);
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_message(&ctx, 42, "not-a-time"),
+        )
+        .await;
+        task.abort();
+        assert!(result.is_ok(), "invalid schedule deadlocks while reacquiring the pending mutex");
     }
 }

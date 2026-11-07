@@ -179,6 +179,7 @@ pub async fn delete_node(pool: &SqlitePool, node_id: i64) -> Result<(i64, i64)> 
         .ok_or_else(|| anyhow::anyhow!("没有 id 为 {node_id} 的节点"))?;
 
     // user_nodes / user_traffic 靠外键级联清理(§6.1)。
+    archive_traffic(&mut tx, agent_id, Some(node_id)).await?;
     sqlx::query("DELETE FROM nodes WHERE id = ?").bind(node_id).execute(&mut *tx).await?;
 
     let rev: i64 = sqlx::query_scalar(
@@ -229,9 +230,12 @@ pub async fn add_user(pool: &SqlitePool, name: &str, quota_bytes: i64, now: i64)
     let password = crate::cluster::token::generate();
     let sub_token = crate::cluster::token::generate();
 
+    // 显示名可以在删除后复用,tracker 的计数却活到 agent 进程结束。
+    // 独立且持久的身份用于 inbound 用户名、禁用名单和上报匹配,不改变客户端凭据。
+
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO users (name, uuid, password, quota_bytes, traffic_multiplier, sub_token, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (name, uuid, password, quota_bytes, traffic_multiplier, sub_token, created_at, traffic_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(name)
     .bind(&uuid)
@@ -240,6 +244,7 @@ pub async fn add_user(pool: &SqlitePool, name: &str, quota_bytes: i64, now: i64)
     .bind(DEFAULT_TRAFFIC_MULTIPLIER)
     .bind(&sub_token)
     .bind(now)
+    .bind(format!("{name}@{uuid}"))
     .fetch_one(pool)
     .await
     .with_context(|| format!("新增用户 {name} 失败(名字必须唯一)"))?;
@@ -411,23 +416,61 @@ pub async fn set_user_nodes(
 ///
 /// **不推进任何 revision**:这是个纯计费数字,agent 不需要知道它。
 pub async fn reset_user_traffic(pool: &SqlitePool, user_id: i64) -> Result<()> {
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     // 与 supervisor::reset_user_cycles 的逻辑一致:cycle_* 清零,
     // total_* 不动(终身累计),last_up / last_down **也不能动**(它们是
     // delta 计算的基线,清零会让下一次上报被当成新纪元重复计一遍)。
     sqlx::query("UPDATE user_traffic SET cycle_up = 0, cycle_down = 0 WHERE user_id = ?")
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE retired_user_traffic SET cycle_up = 0, cycle_down = 0 WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&mut *tx)
         .await?;
     // 这个用户在所有节点上都还没产生过流量时影响 0 行也是正常的
     // (他还没跑过任何流量)。只要 user 存在,清零就算成功。
     let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM users WHERE id = ?")
         .bind(user_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?
         .is_some();
     if !exists {
         anyhow::bail!("没有 id 为 {user_id} 的用户");
     }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 与删除共用事务;同一用户/agent/tag 多次删除合并一行,不按上报次数增长。
+pub(super) async fn archive_traffic(
+    conn: &mut sqlx::SqliteConnection,
+    agent_id: i64,
+    node_id: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO retired_user_traffic
+            (user_id, agent_id, node_tag, agent_name, counter_epoch, last_up, last_down,
+             cycle_up, cycle_down, total_up, total_down, updated_at)
+         SELECT t.user_id, n.agent_id, n.tag, a.name, t.counter_epoch, t.last_up, t.last_down,
+                t.cycle_up, t.cycle_down, t.total_up, t.total_down, t.updated_at
+           FROM user_traffic t JOIN nodes n ON n.id = t.node_id
+           JOIN agents a ON a.id = n.agent_id
+          WHERE n.agent_id = ? AND (? IS NULL OR n.id = ?)
+         ON CONFLICT(user_id, agent_id, node_tag) DO UPDATE SET
+            agent_name = excluded.agent_name, counter_epoch = excluded.counter_epoch,
+            last_up = excluded.last_up, last_down = excluded.last_down,
+            cycle_up = retired_user_traffic.cycle_up + excluded.cycle_up,
+            cycle_down = retired_user_traffic.cycle_down + excluded.cycle_down,
+            total_up = retired_user_traffic.total_up + excluded.total_up,
+            total_down = retired_user_traffic.total_down + excluded.total_down,
+            updated_at = excluded.updated_at",
+    )
+    .bind(agent_id)
+    .bind(node_id)
+    .bind(node_id)
+    .execute(conn)
+    .await?;
     Ok(())
 }
 

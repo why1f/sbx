@@ -47,6 +47,8 @@ pub struct ClusterConfig {
     pub key_path: String,
     pub heartbeat_secs: u64,
     pub report_interval_secs: u64,
+    /// 低频公网 IP 查询间隔。0 关闭定时查询,不影响启动、网络事件和失败重试。
+    pub ip_query_interval_secs: u64,
 }
 
 impl Default for ClusterConfig {
@@ -59,6 +61,7 @@ impl Default for ClusterConfig {
             key_path: "/etc/sbx/tls/key.pem".into(),
             heartbeat_secs: 10,
             report_interval_secs: 30,
+            ip_query_interval_secs: 600,
         }
     }
 }
@@ -88,7 +91,12 @@ impl Default for SubscriptionConfig {
 impl Config {
     /// 从 TOML 文本解析。文件不存在时调用方应当用 `Config::default()`。
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let cfg: Self = toml::from_str(text)?;
+        // agent 的 time.Duration 是 int64 纳秒,避免秒数转换溢出。
+        if cfg.cluster.ip_query_interval_secs > i64::MAX as u64 / 1_000_000_000 {
+            anyhow::bail!("cluster.ip_query_interval_secs 太大;0 表示关闭低频查询");
+        }
+        Ok(cfg)
     }
 }
 
@@ -162,7 +170,8 @@ pub fn set_value(path: &str, section: &str, key: &str, value: &str) -> anyhow::R
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(anyhow::Error::new(e).context(format!("读取配置 {path} 失败"))),
     };
-    let updated = replace_in_toml(&text, section, key, value);
+    let updated = replace_in_toml(&text, section, key, value)?;
+    Config::parse(&updated).context("修改后的配置无效,未写入文件")?;
 
     // 先写临时文件再 rename:写到一半断电/磁盘满,留下的是旧配置而不是半个配置。
     // 半个配置的表现是 daemon 起不来,而那时人已经不记得刚才改了什么。
@@ -183,61 +192,35 @@ pub fn set_value(path: &str, section: &str, key: &str, value: &str) -> anyhow::R
 }
 
 /// `set_value` 的纯函数内核。分出来是为了能测 —— 文件 IO 那一层没什么可测的。
-pub fn replace_in_toml(text: &str, section: &str, key: &str, value: &str) -> String {
-    let want_header = format!("[{section}]");
-    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-
-    // 定位目标节的范围:从它的头部行到下一个 `[` 开头的行(或文件末尾)。
-    let start = lines.iter().position(|l| l.trim() == want_header);
-    let Some(start) = start else {
-        // 整节都没有:补在末尾。
-        if !lines.is_empty() && !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
-            lines.push(String::new());
-        }
-        lines.push(want_header);
-        lines.push(format!("{key} = {value}"));
-        return finish(lines);
-    };
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .map(|i| start + 1 + i)
-        .unwrap_or(lines.len());
-
-    // 在这一节里找 `key =`。**跳过被注释掉的行** —— 示例配置里到处是
-    // `# public_base = "..."` 这样的注释样例,改到那上面等于什么都没改。
-    let found = lines[start + 1..end].iter().position(|l| {
-        let t = l.trim_start();
-        !t.starts_with('#')
-            && t.strip_prefix(key).map(|rest| rest.trim_start().starts_with('=')).unwrap_or(false)
-    });
-
-    match found {
-        Some(i) => {
-            let idx = start + 1 + i;
-            // 保留原有缩进。
-            let indent: String = lines[idx].chars().take_while(|c| c.is_whitespace()).collect();
-            lines[idx] = format!("{indent}{key} = {value}");
-        }
-        None => {
-            // 节里没有这个 key:插在节内最后一个非空行之后,别插到下一节头上。
-            let mut at = end;
-            while at > start + 1 && lines[at - 1].trim().is_empty() {
-                at -= 1;
-            }
-            lines.insert(at, format!("{key} = {value}"));
-        }
+pub fn replace_in_toml(
+    text: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>().context("解析原配置失败")?;
+    let mut replacement = format!("value = {value}")
+        .parse::<toml_edit::DocumentMut>()
+        .context("设置值不是合法 TOML")?;
+    let mut item = replacement.remove("value").context("缺少设置值")?;
+    let table = doc
+        .entry(section)
+        .or_insert(toml_edit::table())
+        .as_table_like_mut()
+        .context("配置节不是表")?;
+    if let (Some(old), Some(new)) = (table.get(key).and_then(|v| v.as_value()), item.as_value_mut())
+    {
+        *new.decor_mut() = old.decor().clone();
     }
-    finish(lines)
+    if let Some(slot) = table.get_mut(key) {
+        *slot = item; // 保留 key 上的缩进和前置注释。
+    } else {
+        table.insert(key, item);
+    }
+    Ok(doc.to_string())
 }
 
-fn finish(mut lines: Vec<String>) -> String {
-    // TOML 文件按惯例以换行结尾;少了它有些工具会把最后一行当成没写完。
-    lines.push(String::new());
-    lines.join("\n")
-}
-
-/// 把一个字符串转成 TOML 的基本字符串字面量。
+/// 将字符串编码成 TOML 字面值。
 pub fn toml_string(s: &str) -> String {
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -246,6 +229,20 @@ pub fn toml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_query_interval_defaults_and_disabled_value() {
+        assert_eq!(Config::parse("").unwrap().cluster.ip_query_interval_secs, 600);
+        assert_eq!(
+            Config::parse("[cluster]\nip_query_interval_secs = 0\n")
+                .unwrap()
+                .cluster
+                .ip_query_interval_secs,
+            0
+        );
+        assert!(Config::parse("[cluster]\nip_query_interval_secs = -1\n").is_err());
+        assert!(Config::parse("[cluster]\nip_query_interval_secs = 9223372037\n").is_err());
+    }
 
     /// 空配置文件必须能解析成全默认值,而不是报错。
     #[test]
@@ -303,7 +300,7 @@ listen = "127.0.0.1:18081"
     /// 说明「这个端口为什么不能对外」的地方。
     #[test]
     fn editing_preserves_comments_and_layout() {
-        let out = replace_in_toml(SAMPLE, "cluster", "listen", "\"0.0.0.0:19443\"");
+        let out = replace_in_toml(SAMPLE, "cluster", "listen", "\"0.0.0.0:19443\"").unwrap();
         assert!(out.contains("# 顶部说明"));
         assert!(out.contains("# 这个端口 agent 要能连到,必须对外"));
         assert!(out.contains("listen = \"0.0.0.0:19443\""));
@@ -316,7 +313,7 @@ listen = "127.0.0.1:18081"
     /// 同名 key 在两个节里都有(`listen`)—— 只能改指定的那一节。
     #[test]
     fn editing_only_touches_the_named_section() {
-        let out = replace_in_toml(SAMPLE, "subscription", "listen", "\"0.0.0.0:8080\"");
+        let out = replace_in_toml(SAMPLE, "subscription", "listen", "\"0.0.0.0:8080\"").unwrap();
         assert!(out.contains("listen = \"0.0.0.0:18443\""), "cluster 那个不该被改:\n{out}");
         assert!(out.contains("listen = \"0.0.0.0:8080\""));
     }
@@ -325,7 +322,8 @@ listen = "127.0.0.1:18081"
     /// 改到那上面等于什么都没改,而界面会显示「已保存」。
     #[test]
     fn a_commented_out_sample_is_not_the_key() {
-        let out = replace_in_toml(SAMPLE, "subscription", "public_base", "\"https://x.example\"");
+        let out = replace_in_toml(SAMPLE, "subscription", "public_base", "\"https://x.example\"")
+            .unwrap();
         assert!(
             out.contains("# public_base = \"https://sub.example.com\""),
             "注释行要留着:\n{out}"
@@ -338,7 +336,8 @@ listen = "127.0.0.1:18081"
 
     #[test]
     fn a_missing_section_is_appended() {
-        let out = replace_in_toml("[cluster]\ntls = true\n", "telegram", "enabled", "true");
+        let out =
+            replace_in_toml("[cluster]\ntls = true\n", "telegram", "enabled", "true").unwrap();
         assert!(out.contains("[telegram]"));
         assert!(out.contains("enabled = true"));
         assert!(Config::parse(&out).is_ok(), "补出来的东西必须还能解析:\n{out}");
@@ -347,7 +346,8 @@ listen = "127.0.0.1:18081"
     /// 改完之后必须还是合法的 TOML,而且值真的变了 —— 这一条把上面几个串起来。
     #[test]
     fn the_result_still_parses_with_the_new_value() {
-        let out = replace_in_toml(SAMPLE, "subscription", "public_base", "\"https://x.example\"");
+        let out = replace_in_toml(SAMPLE, "subscription", "public_base", "\"https://x.example\"")
+            .unwrap();
         let c = Config::parse(&out).expect("改完还得能解析");
         assert_eq!(c.subscription.public_base, "https://x.example");
         assert_eq!(c.cluster.listen, "0.0.0.0:18443");
@@ -355,7 +355,7 @@ listen = "127.0.0.1:18081"
 
     #[test]
     fn empty_file_gets_a_section_and_a_key() {
-        let out = replace_in_toml("", "cluster", "tls", "false");
+        let out = replace_in_toml("", "cluster", "tls", "false").unwrap();
         let c = Config::parse(&out).unwrap();
         assert!(!c.cluster.tls);
     }
@@ -363,7 +363,8 @@ listen = "127.0.0.1:18081"
     /// 缩进要保留 —— 有人喜欢缩进写 TOML,改一次就被拉平会让 diff 里全是噪音。
     #[test]
     fn indentation_is_preserved() {
-        let out = replace_in_toml("[cluster]\n    tls = true\n", "cluster", "tls", "false");
+        let out =
+            replace_in_toml("[cluster]\n    tls = true\n", "cluster", "tls", "false").unwrap();
         assert!(out.contains("    tls = false"), "{out}");
     }
 
@@ -373,7 +374,7 @@ listen = "127.0.0.1:18081"
         assert_eq!(toml_string("a\"b"), "\"a\\\"b\"");
         assert_eq!(toml_string("C:\\x"), "\"C:\\\\x\"");
         // 转义之后必须还能被 TOML 解析回原文。
-        let out = replace_in_toml("[db]\n", "db", "path", &toml_string("C:\\a\"b"));
+        let out = replace_in_toml("[db]\n", "db", "path", &toml_string("C:\\a\"b")).unwrap();
         assert_eq!(Config::parse(&out).unwrap().db.path, "C:\\a\"b");
     }
 
@@ -396,7 +397,7 @@ listen = "127.0.0.1:18081"
             ("telegram", "enabled", "true"),
             ("telegram", "admin_chat_ids", "[123, 456]"),
         ] {
-            out = replace_in_toml(&out, section, key, value);
+            out = replace_in_toml(&out, section, key, value).unwrap();
         }
 
         let comments_after = out.lines().filter(|l| l.trim_start().starts_with('#')).count();

@@ -43,7 +43,16 @@ pub async fn enqueue(
 /// 标记和读取在同一个事务里:分开做的话,两轮巡检挨得近就会把同一条指令
 /// 下发两遍 —— 而「升级」下发两遍意味着那台机器连着重启两次。
 pub async fn take_pending(pool: &SqlitePool, now: i64) -> Result<Vec<Pending>> {
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // 高于最长升级 RPC 的 630 秒预算;中断的任务标为结果未知,绝不自动重放升级。
+    sqlx::query(
+        "UPDATE agent_commands SET done_at = ?, error = '执行中断或超时,结果未知;请检查目标状态'
+          WHERE done_at IS NULL AND taken_at IS NOT NULL AND taken_at <= ?",
+    )
+    .bind(now)
+    .bind(now.saturating_sub(900))
+    .execute(&mut *tx)
+    .await?;
     let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
         "SELECT id, agent_id, kind, payload_json FROM agent_commands
           WHERE taken_at IS NULL ORDER BY id",

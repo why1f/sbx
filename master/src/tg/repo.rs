@@ -233,6 +233,56 @@ pub async fn set_last_quota_level(pool: &SqlitePool, name: &str, level: i64) -> 
     Ok(())
 }
 
+pub async fn quota_delivery(pool: &SqlitePool, user: i64, chat: i64) -> Result<(i64, i64, i64)> {
+    Ok(sqlx::query_as("SELECT level, retry_at, attempts FROM tg_quota_deliveries WHERE user_id = ? AND chat_id = ?")
+        .bind(user).bind(chat).fetch_optional(pool).await?.unwrap_or((0, 0, 0)))
+}
+
+pub async fn record_quota_delivery(
+    pool: &SqlitePool,
+    user: i64,
+    chat: i64,
+    level: i64,
+    retry_at: i64,
+    attempts: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tg_quota_deliveries (user_id, chat_id, level, retry_at, attempts)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, chat_id) DO UPDATE SET
+        level = excluded.level, retry_at = excluded.retry_at, attempts = excluded.attempts",
+    )
+    .bind(user)
+    .bind(chat)
+    .bind(level)
+    .bind(retry_at)
+    .bind(attempts)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn reset_quota_deliveries(pool: &SqlitePool, user: i64, level: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE tg_quota_deliveries SET level = MIN(level, ?), retry_at = 0, attempts = 0
+        WHERE user_id = ? AND (level > ? OR (? = 0 AND retry_at != 0))",
+    )
+    .bind(level)
+    .bind(user)
+    .bind(level)
+    .bind(level)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn quota_delivery_levels(pool: &SqlitePool) -> Result<Vec<(i64, i64, bool)>> {
+    Ok(sqlx::query_as(
+        "SELECT user_id, MAX(level), MAX(retry_at) > 0 FROM tg_quota_deliveries GROUP BY user_id",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn set_last_schedule_dates(pool: &SqlitePool, name: &str, json: &str) -> Result<()> {
     sqlx::query("UPDATE users SET tg_last_schedule_dates = ? WHERE name = ?")
         .bind(json)
@@ -364,7 +414,16 @@ pub async fn renew_lease(pool: &SqlitePool, owner: &str, now: i64) -> Result<boo
     Ok(affected > 0)
 }
 
-pub async fn lease_holder(pool: &SqlitePool) -> Result<Option<String>> {
+pub async fn release_lease(pool: &SqlitePool, owner: &str) -> Result<()> {
+    sqlx::query("DELETE FROM tg_bot_lease WHERE id = 1 AND owner = ?")
+        .bind(owner)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+async fn lease_holder(pool: &SqlitePool) -> Result<Option<String>> {
     Ok(sqlx::query_scalar("SELECT owner FROM tg_bot_lease WHERE id = 1")
         .fetch_optional(pool)
         .await?)

@@ -508,14 +508,26 @@ fn clash_names(nodes: &[ExportNode]) -> Vec<String> {
     for n in nodes {
         *count.entry(n.tag.as_str()).or_default() += 1;
     }
+    let mut used: std::collections::HashSet<String> =
+        ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", "节点选择", "自动选择"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
     nodes
         .iter()
         .map(|n| {
-            if count[n.tag.as_str()] > 1 && !n.agent_name.is_empty() {
+            let base = if count[n.tag.as_str()] > 1 && !n.agent_name.is_empty() {
                 format!("{} [{}]", n.tag, n.agent_name)
             } else {
                 n.tag.clone()
+            };
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while !used.insert(name.clone()) {
+                name = format!("{base} ({suffix})");
+                suffix += 1;
             }
+            name
         })
         .collect()
 }

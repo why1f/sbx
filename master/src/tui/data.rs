@@ -311,7 +311,7 @@ pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<Break
     .bind(user_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    let mut out: Vec<_> = rows
         .into_iter()
         .map(|(tag, agent, proto, port, mult, cu, cd, tu, td)| BreakdownRow {
             // tag 在不同机器上可以重名,所以标签里必须带机器名 ——
@@ -325,7 +325,26 @@ pub async fn user_breakdown(pool: &SqlitePool, user_id: i64) -> Result<Vec<Break
             total_up: billed(tu, mult),
             total_down: billed(td, mult),
         })
-        .collect())
+        .collect();
+    let retired: Vec<(String, String, f64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT t.node_tag, t.agent_name, u.traffic_multiplier,
+                t.cycle_up, t.cycle_down, t.total_up, t.total_down
+           FROM retired_user_traffic t JOIN users u ON u.id = t.user_id
+          WHERE t.user_id = ? ORDER BY t.agent_id, t.node_tag",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    out.extend(retired.into_iter().map(|(tag, agent, mult, cu, cd, tu, td)| BreakdownRow {
+        label: format!("{tag} @ {agent}(已删除)"),
+        mult: None,
+        note: "保留的历史用量".into(),
+        cycle_up: billed(cu, mult),
+        cycle_down: billed(cd, mult),
+        total_up: billed(tu, mult),
+        total_down: billed(td, mult),
+    }));
+    Ok(out)
 }
 
 /// `nodes` × `user_traffic` 聚合后的一行。

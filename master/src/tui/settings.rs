@@ -2,9 +2,7 @@
 //!
 //! 目的很直接:常改的那几项不该逼人去 ssh 里编辑 `/etc/sbx/config.toml`。
 //!
-//! **写回是行级替换**(`config::set_value`),不是「反序列化 → 改 → 写回」——
-//! 后者一次保存就把配置文件里那几十行解释性注释全抹掉,而那些注释是唯一
-//! 说明「这个端口为什么只听本地」的地方。
+//! `config::set_value` 使用保留格式的 TOML 编辑器,保留配置里的注释。
 //!
 //! **这里改的东西 daemon 不会热加载。** 它在启动时读一次配置,之后不再看。
 //! 所以每一项都必须说清「什么时候生效」,页面顶上也常驻一句提醒 ——
@@ -172,6 +170,14 @@ pub fn all(cfg: &Config) -> Vec<Setting> {
             "agent 多久上报一次流量与主机指标。调小会放大 DB 写入,握手时下发给 agent",
         ),
         s(
+            "cluster",
+            "ip_query_interval_secs",
+            "IP 低频查询间隔(秒)",
+            cfg.cluster.ip_query_interval_secs.to_string(),
+            Kind::Int,
+            "默认 600 秒(10 分钟)。0 = 关闭低频查询;启动查询和网络变化触发照常。失败最多重试 3 轮(5/10/20 秒)。重启主控后自动下发",
+        ),
+        s(
             "telegram",
             "enabled",
             "Telegram 机器人",
@@ -218,6 +224,31 @@ fn on_off(b: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_query_setting_saves_zero_and_explains_startup_queries() {
+        let cfg = Config::default();
+        let setting = all(&cfg).into_iter().find(|s| s.key == "ip_query_interval_secs").unwrap();
+        assert_eq!(setting.edit_value(), "600");
+        assert_eq!(setting.to_toml("0").unwrap(), "0");
+        assert!(setting.note.contains("启动查询"));
+        assert!(setting.note.contains("0 = 关闭"));
+        let path = std::env::temp_dir().join(format!("sbx-ip-query-{}.toml", uuid::Uuid::new_v4()));
+        config::set_value(
+            path.to_str().unwrap(),
+            setting.section,
+            setting.key,
+            &setting.to_toml("0").unwrap(),
+        )
+        .unwrap();
+        let saved = Config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.cluster.ip_query_interval_secs, 0);
+        assert_eq!(
+            all(&saved).into_iter().find(|s| s.key == setting.key).unwrap().edit_value(),
+            "0"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn every_setting_says_when_it_takes_effect() {
@@ -286,11 +317,12 @@ mod tests {
                 Kind::IntList => s.to_toml("7").unwrap(),
                 Kind::Text | Kind::Secret => s.to_toml("x").unwrap(),
             };
-            text = config::replace_in_toml(&text, s.section, s.key, &v);
+            text = config::replace_in_toml(&text, s.section, s.key, &v).unwrap();
         }
         let back = Config::parse(&text).expect("写回去的东西必须还能解析");
         assert!(!back.cluster.tls, "布尔应当被翻转了");
         assert_eq!(back.cluster.heartbeat_secs, 42);
+        assert_eq!(back.cluster.ip_query_interval_secs, 42);
         assert_eq!(back.telegram.admin_chat_ids, vec![7]);
         assert_eq!(back.subscription.public_base, "x");
         assert_eq!(back.telegram.bot_token, "x");

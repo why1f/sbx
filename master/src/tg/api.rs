@@ -52,6 +52,12 @@ pub struct Api {
 }
 
 impl Api {
+    #[cfg(test)]
+    pub(super) fn with_base(base: String) -> Self {
+        let mut api = Self::new("test:token", 3).unwrap();
+        api.base = base;
+        api
+    }
     pub fn new(token: &str, request_timeout_secs: u64) -> Result<Self> {
         let timeout = Duration::from_secs(request_timeout_secs.max(3));
         let client = reqwest::Client::builder()

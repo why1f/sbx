@@ -314,6 +314,13 @@ epoch 相同 且 new >= last   →   delta = new - last
 ```
 
 - **用户流量**的 epoch 是 `counter_epoch`:**agent 进程启动时生成一个 UUID,进程存活期间不变**。
+- 用户计数键中的身份来自 `COALESCE(users.traffic_name, users.name)`。新用户创建时分配
+  `显示名@UUID` 并持久化,配置生成、禁用名单、上报入库使用同一标识。旧用户的 NULL
+  保留原有 wire name 与 delta 基线;删除后重建同名用户会换身份,旧快照不再归到新人。
+- 删除节点/agent 前,同一事务把其用户用量移入 `retired_user_traffic`。按
+  `(user_id, agent_id, node_tag)` 合并历史与基线,同名节点再次出现时从该基线接着做差。
+  `user_traffic_total` 包含活动与归档记录,删除节点不退还额度;归档只在删除时写入,
+  不随上报次数增长。用户周期重置同步清零两张表的 cycle 字段,保留 total 与计数基线。
 - **网卡流量**的 epoch 是 `boot_id`:取自 `/proc/sys/kernel/random/boot_id`。
 
 > **为什么 `counter_epoch` 不跟着 `box.New()` 走**(这是 §0.2 的直接收益,别改回去):
@@ -645,9 +652,25 @@ b.Start()
 - CPU:采样 `/proc/stat`,相邻两次差分算占用百分比
 - 内存:`/proc/meminfo`
 - `boot_id`:`/proc/sys/kernel/random/boot_id`(§5.2 的网卡 epoch)
-- 公网 IP 自探:把旧项目 `node_service.rs::get_server_ips()` 那套搬到 agent 侧——
-  `api4.ipify.org` / `api6.ipify.org` 并发探测、3s 超时、`ifconfig.me` 兜底、600s 缓存。
-  结果随 `agent.hello` 上报,主控写入 `agents.ipv4/ipv6`,**并允许手工覆盖**。
+- 公网 IP 自探:IPv4 优先 HTTP 回显(兼容 NAT),IPv6 优先内核源地址选择,HTTP 兜底。
+  启动前建立 Linux netlink 订阅,监听地址、网卡、路由和策略路由变化;跨重连保留
+  合并后的事件。事件约 1s 合并一次,绕过缓存探测,预算 5s,与心跳分开运行。
+  变化通过 `addresses.report` 立即更新主控,不等系统上报周期;后续
+  `sysinfo.report.addresses` 携带缓存结果,丢失的事件可随正常上报补齐。两条发送路径
+  共用发布锁,避免旧快照晚到把新地址盖回去;地址事件不参与 NIC 增量计算。
+  监听失败/溢出时重建订阅并重查,不做定时本地巡检。每轮探测失败后最多额外重试
+  3 轮,分别等待 5/10/20s;启动查询在握手前已经做过,之后只补这 3 轮。
+  成功或耗尽即停止重试定时器;新的网络事件或低频查询开启新一轮。耗尽时清掉缓存
+  上的待重试标记,防止普通缓存重连再次发放重试次数,地址快照与缓存本身保留。
+  尚未耗尽时重试进度保存在 Conn,缓存重连只补剩余次数;实际新探测才重置预算。
+  查询开始前合并已排队的触发,结束后丢弃查询期间积压的周期 tick,避免连续重复查询。
+  握手保留 600s 缓存以减轻连续重连;低频查询由主控设置
+  `cluster.ip_query_interval_secs` 经 hello_ack 下发,默认 600s,0 关闭该定时器,
+  不影响启动查询、事件触发和失败重试。设置沿用重启 daemon 生效的规则。
+  老 agent 缺少 addresses 时不改地址。探测失败的 null 保留旧值;可靠枚举的
+  `ipv6_local` 不包含旧 IPv6 时才清除它。IPv4 只有确认没有可用 IPv4 接口时才报空串
+  请求清除,私网接口可能经过 NAT,不能因为 HTTP 暂时失败就清掉公网 IPv4。
+  地址变化只影响展示与订阅,不推进 config_revision、不重建 box。
 - 当前 UTC 偏移:`time.Time.Zone()`(`sysinfo.UTCOffsetSecs`),随 `agent.hello` 上报,
   主控写入 `agents.reported_utc_offset_secs`,用作网卡月重置边界的**默认**时区,
   **并允许手工覆盖**(§6.4)。故意不做进程级缓存 —— 夏令时会变,而它每次握手只调一次。
@@ -669,6 +692,9 @@ box.New(新配置)                       ← 构造期校验,不绑端口。这�
 ```
 
 `counter_epoch` **不在这里生成**——它在 agent 进程启动时生成一次(§5.2)。
+
+配置/名单保存失败会回 error,握手继续声明磁盘上的 revision。配置已在运行时,
+相同 options 的持久化重试复用当前 box;不因磁盘故障反复关闭连接。
 
 `Close()` 有幂等保护,第二次调用返回 `os.ErrClosed`。
 

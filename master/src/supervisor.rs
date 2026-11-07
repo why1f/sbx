@@ -21,6 +21,7 @@
 use crate::cluster::{Registry, Rpc};
 use anyhow::Result;
 use chrono::{Datelike, TimeZone};
+use futures_util::StreamExt;
 use sbx_shared::method;
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -56,6 +57,8 @@ pub async fn tick(
     now: i64,
 ) -> Result<TickSummary> {
     let mut sum = TickSummary::default();
+    // 状态与 revision 一起提交,并锁住判定快照,避免覆盖同时发生的手动停用。
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     // 时间戳转本地日期。转不出来(时间戳损坏)时跳过重置但仍做配额判定——
     // 宁可少做一件事,也不要 panic 掉整个巡检循环。
@@ -66,28 +69,25 @@ pub async fn tick(
     if let Some(date) = local_date(now) {
         let ym = format!("{:04}-{:02}", date.year(), date.month());
         let last_day = last_day_of_month(date);
-        sum.users_reset = reset_user_cycles(pool, date.day(), last_day, &ym, now).await?;
+        sum.users_reset = reset_user_cycles(&mut tx, date.day(), last_day, &ym, now).await?;
     } else {
         tracing::warn!(now, "无法解析时间戳,本轮跳过用户周期重置");
     }
-    sum.nics_reset = reset_nic_cycles(pool, now).await?;
 
-    let (disabled, reenabled) = evaluate_quotas(pool, now).await?;
+    let (disabled, reenabled) = evaluate_quotas(&mut tx, now).await?;
     sum.disabled = disabled;
     sum.reenabled = reenabled;
 
-    // 审计表的保留期。`auth_failed` 这一种是**未认证**连接就能写的:对外暴露的
-    // `/ws` 会被扫描,没有上限的话库文件只会一路涨。90 天足够回溯一次事故。
-    // 失败不影响巡检其余部分 —— 少删一轮没有任何后果。
+    if sum.changed() {
+        sqlx::query("UPDATE agents SET user_state_revision = user_state_revision + 1")
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    sum.nics_reset = reset_nic_cycles(pool, now).await?;
+
     if let Err(e) = prune_events(pool, now).await {
         tracing::warn!(error = %e, "清理过期 agent_events 失败");
-    }
-
-    if sum.changed() {
-        // 一轮里所有变化共用一次 revision 推进,这样各 agent 拿到的是同一个值。
-        sqlx::query("UPDATE agents SET user_state_revision = user_state_revision + 1")
-            .execute(pool)
-            .await?;
     }
 
     // 下发**无条件跑**,不看 `sum.changed()`。那个标志只反映本轮配额巡检的结果,
@@ -141,7 +141,7 @@ fn last_day_of_month(date: chrono::NaiveDate) -> u32 {
 ///
 /// 顺带把因超额被自动禁用的用户放出来——但**过期的不放**(放了下一步又会关回去)。
 async fn reset_user_cycles(
-    pool: &SqlitePool,
+    conn: &mut sqlx::SqliteConnection,
     day: u32,
     last_day: u32,
     ym: &str,
@@ -156,22 +156,27 @@ async fn reset_user_cycles(
     .bind(day as i64)
     .bind(last_day as i64)
     .bind(ym)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     if candidates.is_empty() {
         return Ok(0);
     }
 
-    let mut tx = pool.begin().await?;
     for (user_id, name) in &candidates {
         // cycle_* 清零,total_* 不动(它是终身累计)。
         // last_up / last_down **也不能动**:它们是 delta 计算的基线(§5.2),
         // 清零会让下一次上报被当成新纪元,把一整个周期的量重复计一次。
         sqlx::query("UPDATE user_traffic SET cycle_up = 0, cycle_down = 0 WHERE user_id = ?")
             .bind(user_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
+        sqlx::query(
+            "UPDATE retired_user_traffic SET cycle_up = 0, cycle_down = 0 WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await?;
 
         // 只放系统自己关的(auto_disabled = 1),且没过期的。
         sqlx::query(
@@ -189,7 +194,7 @@ async fn reset_user_cycles(
         .bind(now)
         .bind(now)
         .bind(user_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -198,10 +203,9 @@ async fn reset_user_cycles(
         .bind("user_cycle_reset")
         .bind(format!("用户 {name} 的流量周期已重置({ym})"))
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
 
     Ok(candidates.len())
 }
@@ -289,7 +293,7 @@ type QuotaRow = (i64, String, i64, f64, Option<i64>, bool, bool, i64, i64);
 ///
 /// 放行的条件是「`auto_disabled = 1` 且现在已经不该禁用了」——覆盖两种情况:
 /// 管理员把配额调高了、或者把到期时间延后了。两者都该立刻生效,不必等下个重置日。
-async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> {
+async fn evaluate_quotas(conn: &mut sqlx::SqliteConnection, now: i64) -> Result<(usize, usize)> {
     // 用量取自跨 agent 求和的视图(§6.2)。LEFT JOIN 保证没有流量记录的用户也在结果里。
     let rows: Vec<QuotaRow> = sqlx::query_as(
         "SELECT u.id, u.name, u.quota_bytes, u.traffic_multiplier, u.expire_at,
@@ -298,7 +302,7 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
            FROM users u
            LEFT JOIN user_traffic_total t ON t.user_id = u.id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     let mut to_disable: Vec<(i64, String, &'static str)> = Vec::new();
@@ -307,7 +311,7 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
     for (id, name, quota, mult, expire_at, enabled, auto_disabled, cyc_up, cyc_down) in rows {
         // 判定规则本体在 model::user —— 这里不重写,否则边界条件会与 TUI 侧漂开。
         let expired = crate::model::user::expired(expire_at, now);
-        let used = ((cyc_up + cyc_down) as f64 * mult) as i64;
+        let used = (cyc_up.saturating_add(cyc_down) as f64 * mult) as i64;
         let over = crate::model::user::over_quota(quota, used);
 
         if (over || expired) && enabled {
@@ -322,12 +326,11 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
         return Ok((0, 0));
     }
 
-    let mut tx = pool.begin().await?;
     for (id, name, why) in &to_disable {
         // auto_disabled = 1 标记「这是系统关的」,月重置时才敢放。
         sqlx::query("UPDATE users SET enabled = 0, auto_disabled = 1 WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         sqlx::query(
             "INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)",
@@ -335,13 +338,13 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
         .bind("user_auto_disabled")
         .bind(format!("用户 {name} 已自动停用:{why}"))
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
     for (id, name) in &to_enable {
         sqlx::query("UPDATE users SET enabled = 1, auto_disabled = 0 WHERE id = ?")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         sqlx::query(
             "INSERT INTO agent_events (agent_id, kind, message, at) VALUES (NULL, ?, ?, ?)",
@@ -349,10 +352,9 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
         .bind("user_auto_enabled")
         .bind(format!("用户 {name} 已自动恢复"))
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await?;
 
     Ok((to_disable.len(), to_enable.len()))
 }
@@ -383,71 +385,73 @@ async fn evaluate_quotas(pool: &SqlitePool, now: i64) -> Result<(usize, usize)> 
 /// 失败不重试也不回滚已记的值 —— 下一轮巡检自然重来,而握手是天然的兜底。
 async fn push_config(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc: &Arc<Rpc>) {
     let online = registry.lock().await.online_ids();
-    for agent_id in online {
-        let master_rev: i64 =
-            match sqlx::query_scalar("SELECT config_revision FROM agents WHERE id = ?")
-                .bind(agent_id)
-                .fetch_one(pool)
-                .await
-            {
-                Ok(r) => r,
-                // 查不到通常是这台刚被删掉(连接还没断)。跳过就好,
-                // 上报路径上的存在性检查会把那条连接收掉。
+    futures_util::stream::iter(online)
+        .for_each_concurrent(4, |agent_id| async move {
+            let master_rev: i64 =
+                match sqlx::query_scalar("SELECT config_revision FROM agents WHERE id = ?")
+                    .bind(agent_id)
+                    .fetch_one(pool)
+                    .await
+                {
+                    Ok(r) => r,
+                    // 查不到通常是这台刚被删掉(连接还没断)。跳过就好,
+                    // 上报路径上的存在性检查会把那条连接收掉。
+                    Err(e) => {
+                        tracing::debug!(agent_id, error = %e, "读取 config_revision 失败,本轮跳过");
+                        return;
+                    }
+                };
+
+            // `None` = 握手的 catch_up 还没跑完(它是并行 spawn 的)。
+            // 这时候不抢着发:catch_up 正要处理这件事,两边都发就是重复下发。
+            let Some(sent) = registry.lock().await.sent_config_rev(agent_id) else {
+                return;
+            };
+            if sent >= master_rev {
+                return;
+            }
+
+            let options = match crate::service::build_agent_config(pool, agent_id).await {
+                Ok(o) => o,
                 Err(e) => {
-                    tracing::debug!(agent_id, error = %e, "读取 config_revision 失败,本轮跳过");
-                    continue;
+                    // 组装就失败(节点缺必填参数、协议读不懂),根本没发出去。
+                    // 记一条审计:界面上要能解释「为什么这台一直没跟上」。
+                    tracing::error!(agent_id, error = %e, "组装配置失败,未下发");
+                    let now = chrono::Local::now().timestamp();
+                    let _ = crate::db::agent_repo::log_event(
+                        pool,
+                        Some(agent_id),
+                        "config_build_failed",
+                        &e.to_string(),
+                        now,
+                    )
+                    .await;
+                    return;
                 }
             };
 
-        // `None` = 握手的 catch_up 还没跑完(它是并行 spawn 的)。
-        // 这时候不抢着发:catch_up 正要处理这件事,两边都发就是重复下发。
-        let Some(sent) = registry.lock().await.sent_config_rev(agent_id) else {
-            continue;
-        };
-        if sent >= master_rev {
-            continue;
-        }
-
-        let options = match crate::service::build_agent_config(pool, agent_id).await {
-            Ok(o) => o,
-            Err(e) => {
-                // 组装就失败(节点缺必填参数、协议读不懂),根本没发出去。
-                // 记一条审计:界面上要能解释「为什么这台一直没跟上」。
-                tracing::error!(agent_id, error = %e, "组装配置失败,未下发");
-                let now = chrono::Local::now().timestamp();
-                let _ = crate::db::agent_repo::log_event(
-                    pool,
-                    Some(agent_id),
-                    "config_build_failed",
-                    &e.to_string(),
-                    now,
-                )
-                .await;
-                continue;
+            let payload = serde_json::json!({ "revision": master_rev, "options": options });
+            match rpc.call_default(registry, agent_id, method::CONFIG_APPLY, payload).await {
+                Ok(_) => {
+                    registry.lock().await.mark_config_sent(agent_id, master_rev);
+                    tracing::info!(agent_id, rev = master_rev, "config.apply 已下发并生效");
+                }
+                Err(e) => {
+                    // agent 回的 error 里带着 box.New 的失败原文(§4.2),值得留痕。
+                    tracing::error!(agent_id, error = %e, "config.apply 失败(下一轮重试)");
+                    let now = chrono::Local::now().timestamp();
+                    let _ = crate::db::agent_repo::log_event(
+                        pool,
+                        Some(agent_id),
+                        "config_apply_failed",
+                        &e.to_string(),
+                        now,
+                    )
+                    .await;
+                }
             }
-        };
-
-        let payload = serde_json::json!({ "revision": master_rev, "options": options });
-        match rpc.call_default(registry, agent_id, method::CONFIG_APPLY, payload).await {
-            Ok(_) => {
-                registry.lock().await.mark_config_sent(agent_id, master_rev);
-                tracing::info!(agent_id, rev = master_rev, "config.apply 已下发并生效");
-            }
-            Err(e) => {
-                // agent 回的 error 里带着 box.New 的失败原文(§4.2),值得留痕。
-                tracing::error!(agent_id, error = %e, "config.apply 失败(下一轮重试)");
-                let now = chrono::Local::now().timestamp();
-                let _ = crate::db::agent_repo::log_event(
-                    pool,
-                    Some(agent_id),
-                    "config_apply_failed",
-                    &e.to_string(),
-                    now,
-                )
-                .await;
-            }
-        }
-    }
+        })
+        .await;
 }
 
 /// 向**库里比它新**的那些在线 agent 下发禁用名单。
@@ -508,24 +512,31 @@ async fn push_user_state(pool: &SqlitePool, registry: &Arc<Mutex<Registry>>, rpc
         }
     };
 
-    for (agent_id, master_rev) in behind {
-        let payload = serde_json::json!({
-            "user_state_revision": master_rev,
-            "disabled": disabled,
-        });
-        match rpc.call_default(registry, agent_id, method::USER_STATE, payload).await {
-            Ok(_) => {
-                registry.lock().await.mark_user_sent(agent_id, master_rev);
-                tracing::info!(
-                    agent_id,
-                    rev = master_rev,
-                    count = disabled.len(),
-                    "user.state 已下发"
-                );
+    futures_util::stream::iter(behind)
+        .for_each_concurrent(4, |(agent_id, master_rev)| {
+            let disabled = &disabled;
+            async move {
+                let payload = serde_json::json!({
+                    "user_state_revision": master_rev,
+                    "disabled": disabled,
+                });
+                match rpc.call_default(registry, agent_id, method::USER_STATE, payload).await {
+                    Ok(_) => {
+                        registry.lock().await.mark_user_sent(agent_id, master_rev);
+                        tracing::info!(
+                            agent_id,
+                            rev = master_rev,
+                            count = disabled.len(),
+                            "user.state 已下发"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(agent_id, error = %e, "user.state 下发失败(下一轮重试)")
+                    }
+                }
             }
-            Err(e) => tracing::warn!(agent_id, error = %e, "user.state 下发失败(下一轮重试)"),
-        }
-    }
+        })
+        .await;
 }
 
 /// `agent_events` 的保留天数。
@@ -642,8 +653,8 @@ async fn drain_commands(
 /// 这个库(§8.0),这就是「TUI 刚改了东西」唯一不需要额外信号通道的信号源。
 ///
 /// 读失败时返回上一次的值(视作没变)—— 一次读不到不该触发一轮空推送。
-async fn data_version(pool: &SqlitePool, last: i64) -> i64 {
-    sqlx::query_scalar::<_, i64>("PRAGMA data_version").fetch_one(pool).await.unwrap_or(last)
+async fn data_version(conn: &mut sqlx::SqliteConnection, last: i64) -> i64 {
+    sqlx::query_scalar::<_, i64>("PRAGMA data_version").fetch_one(conn).await.unwrap_or(last)
 }
 
 /// 醒来的两种理由。
@@ -652,6 +663,73 @@ enum Wake {
     Tick,
     /// 库被别的进程改了(TUI/CLI 刚写完)。只做下发,不做时间相关的判定。
     DbChanged,
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn config_pushes_progress_across_agents_with_a_four_request_limit() {
+        let path = std::env::temp_dir().join(format!("sbx-dispatch-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let rpc = Arc::new(Rpc::new());
+        let (reports, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        for i in 0..5 {
+            let (id, _) = crate::db::agent_repo::create(&pool, &format!("a{i}"), 0).await.unwrap();
+            sqlx::query("UPDATE agents SET config_revision=1 WHERE id=?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut reg = registry.lock().await;
+            reg.register(id, tx);
+            reg.mark_config_sent(id, 0);
+            drop(reg);
+            let reports = reports.clone();
+            tokio::spawn(async move {
+                if let Some(env) = rx.recv().await {
+                    reports.send((id, env)).unwrap();
+                }
+            });
+        }
+        let (p, reg, r) = (pool.clone(), registry.clone(), rpc.clone());
+        let task = tokio::spawn(async move { push_config(&p, &reg, &r).await });
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            received.push(
+                tokio::time::timeout(std::time::Duration::from_secs(3), incoming.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(100), incoming.recv())
+            .await
+            .is_err());
+        let (id, env) = received.remove(0);
+        rpc.resolve(
+            id,
+            sbx_shared::Envelope::resp_ok(env.id.unwrap(), env.method, serde_json::json!({})),
+        )
+        .await;
+        received.push(
+            tokio::time::timeout(std::time::Duration::from_secs(3), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        for (id, env) in received {
+            rpc.resolve(
+                id,
+                sbx_shared::Envelope::resp_ok(env.id.unwrap(), env.method, serde_json::json!({})),
+            )
+            .await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap();
+    }
 }
 
 pub fn spawn(
@@ -672,13 +750,23 @@ pub fn spawn(
         // 不碰磁盘、不加锁,比这个循环里任何一次真正的查询都便宜。
         let mut watch = tokio::time::interval(std::time::Duration::from_secs(1));
         watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut seen_version = data_version(&state.pool, 0).await;
+        // 固定同一连接比较 data_version,从现有四连接池中保留一条,不增加池上限。
+        let mut observer = loop {
+            match state.pool.acquire().await {
+                Ok(conn) => break conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "等待数据库观察连接");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        };
+        let mut seen_version = data_version(&mut observer, 0).await;
 
         loop {
             let wake = tokio::select! {
                 _ = ticker.tick() => Wake::Tick,
                 _ = watch.tick() => {
-                    let v = data_version(&state.pool, seen_version).await;
+                    let v = data_version(&mut observer, seen_version).await;
                     if v == seen_version {
                         continue;
                     }
@@ -733,7 +821,9 @@ pub fn spawn(
 
             // 自己刚才那些写(下发成功后没有写库,但 drain_commands 会写 finish)
             // 不该在下一拍被当成「外部改动」再触发一次。重新取一次基线。
-            seen_version = data_version(&state.pool, seen_version).await;
+            // 吸收本轮审计写入,避免失败日志每秒唤醒下一次失败重试。
+            // 处理期间重叠的管理员变更仍由固定周期的 revision 巡检补齐。
+            seen_version = data_version(&mut observer, seen_version).await;
         }
     });
 }
@@ -1399,16 +1489,17 @@ mod tests {
         let p2 = crate::db::init_pool(path.to_string_lossy().as_ref()).await.unwrap();
 
         // 同一个池上取两次:没人写过,值不该变。
-        let base = data_version(&p1, 0).await;
-        assert_eq!(data_version(&p1, base).await, base, "没人写就不该变");
+        let mut observer = p1.acquire().await.unwrap();
+        let base = data_version(&mut observer, 0).await;
+        assert_eq!(data_version(&mut observer, base).await, base, "没人写就不该变");
 
         // **另一个连接**写 —— 这是 TUI 改库那一幕。
         crate::db::agent_repo::create(&p2, "from-tui", 0).await.unwrap();
-        let after = data_version(&p1, base).await;
+        let after = data_version(&mut observer, base).await;
         assert_ne!(after, base, "别的连接写完之后必须变,否则永远不会被唤醒");
 
         // 再读一次,没有新的写:要稳定下来,不能每拍都在跳。
-        assert_eq!(data_version(&p1, after).await, after, "没有新写入就该稳住");
+        assert_eq!(data_version(&mut observer, after).await, after, "没有新写入就该稳住");
     }
 
     /// 造一台在线 agent:注册一条假连接,并把「已下发版本」对齐到当前库值,

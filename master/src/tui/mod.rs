@@ -12,6 +12,7 @@
 //! 离线的在重连握手时补齐。所以每个写操作之后状态栏都会说明「什么时候生效」,
 //! 免得人对着「改了但没变」发懵。
 
+mod amount;
 mod clip;
 mod data;
 mod forms;
@@ -37,6 +38,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::db::Move;
 use crate::install;
+use amount::parse_quota;
 use data::SpeedTracker;
 use modal::{Action, Modal, Outcome};
 
@@ -1358,6 +1360,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                         vec![
                             format!("将删除 {name},以及它名下的 {nodes} 个节点。"),
                             "这些节点上的用户分配会一并清除,且不可撤销。".into(),
+                            "用户已用额度和历史流量会保留。".into(),
                         ],
                         Action::DeleteAgent { id, name },
                     ));
@@ -1415,6 +1418,7 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
                         vec![
                             format!("将删除节点 {tag}(id {id})。"),
                             format!("{users} 个用户对它的分配会一并清除。"),
+                            "用户已用额度和历史流量会保留。".into(),
                         ],
                         Action::DeleteNode { id, tag },
                     ));
@@ -1705,7 +1709,7 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
     use modal::{val, Field, Form};
     let id = a.id;
     let quota = match a.nic_quota_bytes {
-        Some(q) if q > 0 => format!("{:.0}", q as f64 / 1_073_741_824.0),
+        Some(q) if q > 0 => amount::quota_text(q),
         _ => "0".into(),
     };
     let reset = a.nic_reset_day.map(|d| d.to_string()).unwrap_or_default();
@@ -1740,14 +1744,12 @@ fn agent_edit(a: &data::AgentRow) -> Modal {
                 if name.is_empty() {
                     return Err("名称不能为空".into());
                 }
-                let gb: f64 = val(f, "quota").parse().map_err(|_| "配额要是一个数字(0 = 不限)")?;
-                if gb < 0.0 {
-                    return Err("配额不能是负数".into());
-                }
+                let bytes =
+                    crate::tui::amount::parse_quota(&val(f, "quota")).map_err(|e| e.to_string())?;
                 Ok(Action::EditAgent {
                     id,
                     name,
-                    quota_bytes: if gb > 0.0 { Some((gb * 1_073_741_824.0) as i64) } else { None },
+                    quota_bytes: (bytes > 0).then_some(bytes),
                     reset_day: forms::parse_reset_day(&val(f, "reset"))?,
                     nic_accounting_mode: crate::model::agent::NicAccountingMode::all()
                         .get(f.iter().find(|x| x.key == "nic_mode").map(|x| x.index()).unwrap_or(0))
@@ -2258,18 +2260,10 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
 /// (一边挡住负数、另一边没挡)。
 fn parse_multiplier(s: &str) -> Result<f64> {
     let v: f64 = s.parse().map_err(|_| anyhow::anyhow!("计费倍率 {s} 不是数字"))?;
-    if v < 0.0 {
-        anyhow::bail!("计费倍率不能是负数");
+    if !v.is_finite() || v < 0.0 {
+        anyhow::bail!("计费倍率必须是有限的非负数");
     }
     Ok(v)
-}
-
-fn parse_quota(gb: &str) -> Result<i64> {
-    let v: f64 = gb.parse().map_err(|_| anyhow::anyhow!("配额 {gb} 不是数字"))?;
-    if v < 0.0 {
-        anyhow::bail!("配额不能是负数");
-    }
-    Ok((v * 1_073_741_824.0) as i64)
 }
 
 #[cfg(test)]

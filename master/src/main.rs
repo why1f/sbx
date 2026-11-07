@@ -25,6 +25,11 @@ mod tls;
 mod tui;
 mod upgrade;
 
+#[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
+mod regression_tests;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
@@ -616,12 +621,12 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
         speed: Arc::new(Mutex::new(std::collections::HashMap::new())),
         heartbeat_secs: cfg.cluster.heartbeat_secs,
         report_interval_secs: cfg.cluster.report_interval_secs,
+        ip_query_interval_secs: cfg.cluster.ip_query_interval_secs,
         idle_limit: cluster::idle_limit(cfg.cluster.heartbeat_secs),
     };
 
-    // §9.1 的 Telegram Bot。拿不到租约(另一个进程已经在跑)不是错误,
-    // 起不来也不该拖垮主控 —— 通知是锦上添花,agent 连不上才是全网停服。
-    let tg_tx = if cfg.telegram.enabled {
+    // Bot 在后台等待租约,不阻塞 WS 启动;事件通道在接管后继续使用。
+    let tg_bot = if cfg.telegram.enabled {
         match tg::start(
             state.pool.clone(),
             cfg.telegram.clone(),
@@ -630,7 +635,7 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
         )
         .await
         {
-            Ok(tx) => tx,
+            Ok(bot) => Some(bot),
             Err(e) => {
                 tracing::error!(error = %e, "Telegram Bot 未能启动(主控继续运行)");
                 None
@@ -642,7 +647,11 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
 
     // §6.3 的配额/到期巡检。与 WS 服务端并行跑,周期沿用 report_interval_secs
     // ——没必要比上报更频繁,因为它判定的依据正是上报进来的用量。
-    supervisor::spawn(state.clone(), cfg.cluster.report_interval_secs, tg_tx);
+    supervisor::spawn(
+        state.clone(),
+        cfg.cluster.report_interval_secs,
+        tg_bot.as_ref().map(|bot| bot.events.clone()),
+    );
 
     // §10 的订阅 HTTP 服务。与集群端口是**两个独立监听**:
     // 集群那个要对公网开(agent 要连),订阅这个默认只听 127.0.0.1 由 nginx 反代。
@@ -724,6 +733,9 @@ async fn run_daemon(cfg: config::Config, pool: sqlx::SqlitePool) -> Result<()> {
             .context("WS 服务端异常退出")?;
     }
 
+    if let Some(bot) = tg_bot {
+        bot.stop().await;
+    }
     tracing::info!("主控已停止");
     Ok(())
 }

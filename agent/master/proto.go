@@ -52,11 +52,12 @@ const (
 	MethodPing         = "ping"
 
 	// agent → 主控
-	MethodStatsReport   = "stats.report"
-	MethodSysinfoReport = "sysinfo.report"
-	MethodBoxEvent      = "box.event"
-	MethodLog           = "log"
-	MethodPong          = "pong"
+	MethodStatsReport     = "stats.report"
+	MethodSysinfoReport   = "sysinfo.report"
+	MethodAddressesReport = "addresses.report"
+	MethodBoxEvent        = "box.event"
+	MethodLog             = "log"
+	MethodPong            = "pong"
 )
 
 // Envelope 是线信封。
@@ -130,8 +131,10 @@ type AgentHelloAck struct {
 	ServerTime         int64  `json:"server_time"`
 	HeartbeatSecs      uint64 `json:"heartbeat_secs"`
 	ReportIntervalSecs uint64 `json:"report_interval_secs"`
-	ConfigRevision     int64  `json:"config_revision"`
-	UserStateRevision  int64  `json:"user_state_revision"`
+	// nil: old master, use 600s; explicit 0 disables periodic queries only.
+	IPQueryIntervalSecs *uint64 `json:"ip_query_interval_secs,omitempty"`
+	ConfigRevision      int64   `json:"config_revision"`
+	UserStateRevision   int64   `json:"user_state_revision"`
 }
 
 // ─────────────────────────── 主控 → agent(§4.2)───────────────────────────

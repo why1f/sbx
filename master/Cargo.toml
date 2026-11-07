@@ -1,6 +1,6 @@
 [package]
 name    = "sbx"
-version = "0.4.37"
+version = "0.4.38"
 edition.workspace = true
 license.workspace = true
 
@@ -24,6 +24,7 @@ chrono             = { version = "0.4", default-features = false, features = ["c
 uuid               = { version = "1", features = ["v4"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
 toml               = "0.8"
+toml_edit          = "0.22"
 rand               = "0.8"
 sha2               = "0.10"
 subtle             = "2"

@@ -92,13 +92,11 @@ pub fn agent_add() -> Modal {
                 if name.is_empty() {
                     return Err("名称不能为空".into());
                 }
-                let gb: f64 = val(f, "quota").parse().map_err(|_| "配额要是一个数字(0 = 不限)")?;
-                if gb < 0.0 {
-                    return Err("配额不能是负数".into());
-                }
+                let bytes =
+                    crate::tui::amount::parse_quota(&val(f, "quota")).map_err(|e| e.to_string())?;
                 Ok(Action::AddAgent {
                     name,
-                    quota_bytes: if gb > 0.0 { Some((gb * 1_073_741_824.0) as i64) } else { None },
+                    quota_bytes: (bytes > 0).then_some(bytes),
                     reset_day: parse_reset_day(&val(f, "reset"))?,
                     nic_accounting_mode: crate::model::agent::NicAccountingMode::all()
                         .get(f.iter().find(|x| x.key == "nic_mode").map(|x| x.index()).unwrap_or(0))
@@ -328,11 +326,8 @@ pub fn user_add() -> Modal {
 pub fn user_edit(u: &UserRow) -> Modal {
     let id = u.id;
     let name = u.name.clone();
-    let quota_gb = if u.quota_bytes > 0 {
-        format!("{:.0}", u.quota_bytes as f64 / 1_073_741_824.0)
-    } else {
-        "0".into()
-    };
+    let quota_gb =
+        if u.quota_bytes > 0 { super::amount::quota_text(u.quota_bytes) } else { "0".into() };
     let expire = u.expire_at.map(fmt_date).unwrap_or_default();
     let reset = u.reset_day.map(|d| d.to_string()).unwrap_or_default();
 
@@ -344,7 +339,7 @@ pub fn user_edit(u: &UserRow) -> Modal {
                 Field::text(
                     "mult",
                     "计费倍率 (2.0 双向 / 1.0 单向)",
-                    &format!("{:.1}", u.traffic_multiplier),
+                    &u.traffic_multiplier.to_string(),
                 ),
                 Field::text("expire", "到期 (YYYY-MM-DD,留空 = 永久)", &expire),
                 Field::text("reset", "重置日 (1-31,留空 = 不重置)", &reset),
@@ -805,5 +800,24 @@ mod preview {
                 .collect();
             println!("── {name} ──\n{}\n", out.join("\n"));
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_probes {
+    use super::*;
+    #[tokio::test]
+    async fn recovery_unchanged_user_editor_must_preserve_billing_values() {
+        let path =
+            std::env::temp_dir().join(format!("sbx-editor-review-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let quota = 268_435_456;
+        let uid = crate::db::node_repo::add_user(&pool, "alice", quota, 0).await.unwrap();
+        crate::db::node_repo::update_user(&pool, uid, quota, 1.25, None, None).await.unwrap();
+        let users = super::super::data::load_users(&pool).await.unwrap();
+        let Modal::Form(form) = user_edit(&users[0]) else { panic!("expected form") };
+        let parsed_quota = super::super::parse_quota(&val(&form.fields, "quota")).unwrap();
+        let parsed_multiplier = super::super::parse_multiplier(&val(&form.fields, "mult")).unwrap();
+        assert_eq!((parsed_quota,parsed_multiplier),(quota,1.25),"opening and saving an unchanged editor must not turn 0.25 GB into unlimited or round 1.25x");
     }
 }

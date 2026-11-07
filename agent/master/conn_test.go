@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,46 @@ import (
 	"github.com/why1f/sbx/agent/sysinfo"
 	"github.com/why1f/sbx/agent/tracker"
 )
+
+func TestAddressChangesAreReportedWithoutReconnecting(t *testing.T) {
+	h := newHarness(t, nil)
+	defer h.ws.Close()
+	handshakeAs(t, h.ws)
+	var current atomic.Value
+	current.Store("198.51.100.1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(current.Load().(string)))
+	}))
+	defer srv.Close()
+	h.conn.sys.SetEndpoints([]string{srv.URL}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.conn.watchAddresses(ctx, 50*time.Millisecond, nil)
+	for _, want := range []string{"198.51.100.1", "198.51.100.2"} {
+		current.Store(want)
+		deadline := time.Now().Add(5 * time.Second)
+		matched := false
+		for time.Now().Before(deadline) {
+			env := readUntil(t, h.ws, MethodAddressesReport)
+			var report sysinfo.Addresses
+			if err := json.Unmarshal(env.Payload, &report); err != nil {
+				t.Fatal(err)
+			}
+			if report.IPv4 != nil && *report.IPv4 == want {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("did not receive changed IP %s", want)
+		}
+	}
+	select {
+	case <-h.fm.conns:
+		t.Fatal("address update must not require reconnection")
+	default:
+	}
+}
 
 // 这组测试用一个**假主控**跑真实的 Conn。它守的是 conn.go 里三条最容易悄悄坏掉的约定:
 //
@@ -124,6 +165,10 @@ func writeEnv(t *testing.T, ws *websocket.Conn, env *Envelope) {
 
 // handshakeAs 扮演主控完成握手,返回 agent 发来的 hello。
 func handshakeAs(t *testing.T, ws *websocket.Conn) *AgentHello {
+	return handshakeWithIPInterval(t, ws, nil, 1)
+}
+
+func handshakeWithIPInterval(t *testing.T, ws *websocket.Conn, ipInterval *uint64, reportInterval uint64) *AgentHello {
 	t.Helper()
 	env := readEnv(t, ws)
 	if env.Method != MethodAgentHello || env.Kind != KindReq {
@@ -134,12 +179,13 @@ func handshakeAs(t *testing.T, ws *websocket.Conn) *AgentHello {
 		t.Fatalf("解析 hello: %v", err)
 	}
 	ack := AgentHelloAck{
-		AgentID:            1,
-		ServerTime:         time.Now().Unix(),
-		HeartbeatSecs:      1,
-		ReportIntervalSecs: 1,
-		ConfigRevision:     hello.ConfigRevision,
-		UserStateRevision:  hello.UserStateRevision,
+		AgentID:             1,
+		ServerTime:          time.Now().Unix(),
+		HeartbeatSecs:       1,
+		ReportIntervalSecs:  reportInterval,
+		IPQueryIntervalSecs: ipInterval,
+		ConfigRevision:      hello.ConfigRevision,
+		UserStateRevision:   hello.UserStateRevision,
 	}
 	// 复用 hello 的 id —— 真主控就是这么回的(server.rs 的 resp_ok(hello_id, ...))。
 	writeEnv(t, ws, respOK(env.ID, MethodAgentHelloAck, ack))
@@ -156,6 +202,10 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, st *state.LastApplied) *harness {
+	return newHarnessWithSetup(t, st, nil)
+}
+
+func newHarnessWithSetup(t *testing.T, st *state.LastApplied, setup func(*Conn)) *harness {
 	t.Helper()
 	fm := startFakeMaster(t)
 	dir := t.TempDir()
@@ -168,6 +218,10 @@ func newHarness(t *testing.T, st *state.LastApplied) *harness {
 	// 关掉公网地址自探。它在拨号**之前**跑,真去打外网会让这些测试
 	// 随外网状况随机超时 —— 而这一组测试要验的是 WS 协议,不是 IP 探测。
 	conn.sys.SetEndpoints(nil, nil)
+	conn.networkChanges = func(context.Context) <-chan struct{} { return nil }
+	if setup != nil {
+		setup(conn)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = conn.Run(ctx) }()

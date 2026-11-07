@@ -20,6 +20,7 @@
 package boxctl
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -160,6 +161,13 @@ func (c *Controller) Running() (bool, int64) {
 		return false, 0
 	}
 	return true, c.since.Unix()
+}
+
+// Matches lets persistence retries reuse the running box without interrupting traffic.
+func (c *Controller) Matches(raw json.RawMessage) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.box != nil && bytes.Equal(c.current, raw)
 }
 
 // Close 停掉当前实例。进程退出路径用。
