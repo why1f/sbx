@@ -10,7 +10,8 @@
 ## 功能
 
 - 多 agent / 多节点 / 多用户管理
-- 八种协议：VLESS Reality、VLESS WS、VMess WS、Shadowsocks、Trojan、Hysteria2、TUIC、AnyTLS
+- 八种协议：VLESS Reality、Shadowsocks、Hysteria2、VLESS WS、VMess WS、Trojan、TUIC、AnyTLS
+- Shadowsocks 可切换 SS2022 AES-128/AES-256、AES-128-GCM、AES-256-GCM、ChaCha20-Poly1305；默认仍为 SS2022 AES-128，切换后客户端需刷新订阅。
 - 主控是 sing-box 配置的唯一真源；agent 离线时按最后一次配置冷启动
 - 用户配额、到期、周期重置、流量倍率、手动/自动停用
 - agent 网卡流量、CPU、内存、地址和在线状态
@@ -19,6 +20,7 @@
 - Base64 分享链接、Clash/Mihomo YAML、浏览器流量页
 - Telegram 绑定、用量查询、阈值告警和定时播报
 - 主控与 agent 自升级，发布资产自动校验 SHA-256
+- 可[手动构建并切换 sing-box 内核版本](packaging/KERNEL_BUILDS.md)，稳定版/预发布版分开选择，默认不自动查新或更新
 - `sbx doctor` 检查二进制、配置、数据库、systemd、监听、证书和可选服务
 
 核心路径已有单元、真实 socket、真实 sing-box、跨语言 golden 和跨机流量测试：

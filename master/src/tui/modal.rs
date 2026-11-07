@@ -203,6 +203,16 @@ pub enum Action {
         only: Option<i64>,
         name: String,
     },
+    OpenKernelUpgrade {
+        id: i64,
+        name: String,
+    },
+    UpgradeKernel {
+        only: Option<i64>,
+        name: String,
+        channel: crate::upgrade::kernel::Channel,
+        version: String,
+    },
     /// 升级**主控自己**。要挂起 TUI 去跑安装脚本,所以由主循环处理。
     SelfUpgrade,
     /// 改这台 agent 的出站地址族策略。进 sing-box 配置,会推进 config_revision。
@@ -223,6 +233,7 @@ pub struct NodeDraft {
     pub port: u16,
     pub server_name: Option<String>,
     pub path: Option<String>,
+    pub ss_method: Option<String>,
     pub ipv6: bool,
     pub relay_host: String,
     pub relay_port: Option<u16>,
@@ -536,6 +547,9 @@ impl Modal {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
                     Outcome::Run(Action::UpgradeAgents { only: None, name: name.clone() })
                 }
+                KeyCode::Char('k') | KeyCode::Char('K') => {
+                    Outcome::Run(Action::OpenKernelUpgrade { id: *agent_id, name: name.clone() })
+                }
                 _ => Outcome::Close(None),
             },
 
@@ -740,7 +754,7 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
 
         Modal::Upgrade { name, online, version, .. } => {
             let w = 72.min(area.width.max(1));
-            let h = 12u16.min(area.height.max(1));
+            let h = 13u16.min(area.height.max(1));
             let rect = centered(area, 0, 0, w, h);
             f.render_widget(Clear, rect);
             let lines = vec![
@@ -756,6 +770,7 @@ pub fn render(f: &mut Frame, area: Rect, modal: &Modal) {
                 Line::from(""),
                 Line::from(format!("  [u]  只升级 {name}")),
                 Line::from(format!("  [a]  升级在线的全部 {online} 台")),
+                Line::from("  [k]  选择 sing-box 内核版本"),
                 Line::from(""),
                 Line::from(Span::styled(
                     "  升完 agent 会替换自己的二进制并退出,由 systemd 拉起新的。",

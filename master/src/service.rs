@@ -181,7 +181,17 @@ fn build_inbound(
                     m
                 }
             };
-            Ok(serde_json::json!({
+            let users: Vec<_> = users
+                .iter()
+                .map(|(name, uuid, password)| {
+                    Ok(serde_json::json!({
+                        "name": name,
+                        "password": secrets::ss_user_password_for(method, uuid, password)?,
+                    }))
+                })
+                .collect::<Result<_>>()?;
+            secrets::ss_key_len(method)?;
+            let mut inbound = serde_json::json!({
                 "type": "shadowsocks",
                 "tag": tag,
                 "listen": "::",
@@ -190,13 +200,13 @@ fn build_inbound(
                 // 服务端密钥与每个用户各自的密钥是两回事:2022 系列方法里
                 // 两者共同参与派生,少了服务端这把,所有用户都连不上。
                 "password": need("ss_password")?,
-                "users": users.iter()
-                    .map(|(name, uuid, _)| serde_json::json!({
-                        "name": name,
-                        "password": secrets::ss_user_password(uuid),
-                    }))
-                    .collect::<Vec<_>>(),
-            }))
+                "users": users,
+            });
+            if users.is_empty() {
+                // 空名单仍须是多用户模式,不能回退为只凭服务端密钥即可使用的单用户节点。
+                inbound["managed"] = serde_json::json!(true);
+            }
+            Ok(inbound)
         }
 
         Protocol::Trojan => Ok(serde_json::json!({
@@ -1303,6 +1313,69 @@ mod tests {
                 "bob-password".to_string(),
             ),
         ]
+    }
+
+    #[test]
+    fn shadowsocks_methods_match_server_and_subscription_fixtures() {
+        use base64::Engine as _;
+        let dir = testdata_dir().join("shadowsocks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let users = golden_users();
+        let user = crate::sub::SubUser {
+            name: users[0].0.clone(),
+            uuid: users[0].1.clone(),
+            password: users[0].2.clone(),
+        };
+        for method in secrets::SS_METHODS {
+            let mut params = crate::model::node::NodeParams::default();
+            secrets::set_ss_method(&mut params, method).unwrap();
+            params.ss_password = Some(match secrets::ss_key_len(method).unwrap() {
+                Some(length) => base64::engine::general_purpose::STANDARD.encode(vec![7u8; length]),
+                None => "unused-server-password".into(),
+            });
+            let inbound = build_inbound(
+                "node-1",
+                Protocol::Shadowsocks,
+                8443,
+                &serde_json::to_value(&params).unwrap(),
+                &users,
+            )
+            .unwrap();
+            let node = crate::sub::ExportNode {
+                tag: "node-1".into(),
+                agent_name: "local".into(),
+                protocol: Protocol::Shadowsocks,
+                listen_port: 8443,
+                params,
+                agent_ipv4: Some("127.0.0.1".into()),
+                agent_ipv6: None,
+            };
+            let opts = crate::sub::ExportOptions::default();
+            let uri = crate::sub::generate_links(&user, std::slice::from_ref(&node), &opts)
+                .remove(0)
+                .link;
+            let clash = crate::sub::generate_clash_yaml(&user, std::slice::from_ref(&node), &opts);
+            let empty_inbound = build_inbound(
+                "node-1",
+                Protocol::Shadowsocks,
+                8443,
+                &serde_json::to_value(&node.params).unwrap(),
+                &[],
+            )
+            .unwrap();
+            let output = serde_json::to_string_pretty(
+                &serde_json::json!({"inbound":inbound,"empty_inbound":empty_inbound,"uri":uri,"clash":clash}),
+            )
+            .unwrap()
+                + "\n";
+            let file = dir.join(format!("{method}.json"));
+            match std::fs::read_to_string(&file) {
+                Ok(old) => {
+                    assert_eq!(old.replace("\r\n", "\n"), output, "fixture changed: {method}")
+                }
+                Err(_) => std::fs::write(file, output).unwrap(),
+            }
+        }
     }
 
     /// 生成八个协议的 golden 配置并与仓库里的文件比对。

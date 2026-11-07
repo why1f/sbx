@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "repository": "why1f/sbx",
+  "agent_version": "0.4.38",
+  "sing_box_version": "1.14.4",
+  "channel": "stable",
+  "source_commit": "1111111111111111111111111111111111111111",
+  "release_tag": "agent-v0.4.38-singbox-v1.14.4",
+  "protocol_version": 1,
+  "tests_passed": true,
+  "assets": [
+    {
+      "arch": "amd64",
+      "url": "https://github.com/why1f/sbx/releases/download/agent-v0.4.38-singbox-v1.14.4/sbx-agent-v0.4.38-singbox-v1.14.4-linux-amd64",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "arch": "arm64",
+      "url": "https://github.com/why1f/sbx/releases/download/agent-v0.4.38-singbox-v1.14.4/sbx-agent-v0.4.38-singbox-v1.14.4-linux-arm64",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}

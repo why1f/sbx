@@ -15,10 +15,39 @@ use crate::model::node::{NodeParams, Protocol};
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
 
-/// shadowsocks 默认加密方式。2022 系列而不是 aes-256-gcm:
-/// 前者带重放保护和 per-user 密钥派生,后者在多用户 inbound 上根本没有用户概念。
+/// 保留已有节点默认算法及密钥,只列出当前 sing-box 多用户实现支持的常用算法。
 pub const SS_DEFAULT_METHOD: &str = "2022-blake3-aes-128-gcm";
+pub const SS_METHODS: &[&str] = &[
+    SS_DEFAULT_METHOD,
+    "2022-blake3-aes-256-gcm",
+    "aes-128-gcm",
+    "aes-256-gcm",
+    "chacha20-ietf-poly1305",
+];
+
+pub fn ss_key_len(method: &str) -> Result<Option<usize>> {
+    match method {
+        "2022-blake3-aes-128-gcm" => Ok(Some(16)),
+        "2022-blake3-aes-256-gcm" => Ok(Some(32)),
+        "aes-128-gcm" | "aes-256-gcm" | "chacha20-ietf-poly1305" => Ok(None),
+        _ => anyhow::bail!(
+            "不支持的 Shadowsocks 多用户算法 {method};可选:{}",
+            SS_METHODS.join(" / ")
+        ),
+    }
+}
+
+/// 用户明确切换算法时才换服务端密钥;单纯编辑端口等字段不换密钥。
+pub fn set_ss_method(params: &mut NodeParams, method: &str) -> Result<()> {
+    ss_key_len(method)?;
+    if params.ss_method.as_deref().unwrap_or(SS_DEFAULT_METHOD) != method {
+        params.ss_password = None;
+    }
+    params.ss_method = Some(method.to_string());
+    fill(Protocol::Shadowsocks, params)
+}
 
 /// 按协议补齐 `params` 里缺的密钥材料。已有的值原样保留。
 pub fn fill(proto: Protocol, params: &mut NodeParams) -> Result<()> {
@@ -41,8 +70,22 @@ pub fn fill(proto: Protocol, params: &mut NodeParams) -> Result<()> {
             if params.ss_method.is_none() {
                 params.ss_method = Some(SS_DEFAULT_METHOD.into());
             }
+            let key_len = ss_key_len(params.ss_method.as_deref().unwrap())?;
             if params.ss_password.is_none() {
-                params.ss_password = Some(random_b64_16());
+                params.ss_password = Some(match key_len {
+                    Some(16) => random_b64_16(),
+                    _ => STANDARD.encode(rand::random::<[u8; 32]>()),
+                });
+            }
+            let password = params.ss_password.as_deref().unwrap();
+            if password.is_empty() {
+                anyhow::bail!("Shadowsocks 服务端密钥不能为空");
+            }
+            if let Some(length) = key_len {
+                let decoded = STANDARD.decode(password).context("SS2022 密钥不是合法 Base64")?;
+                if decoded.len() != length {
+                    anyhow::bail!("SS2022 服务端密钥需要 {length} 字节");
+                }
             }
         }
         Protocol::VlessWs => {
@@ -127,6 +170,31 @@ pub fn ss_user_password(uuid: &str) -> String {
     STANDARD.encode(bytes)
 }
 
+pub fn ss_user_password_for(method: &str, uuid: &str, password: &str) -> Result<String> {
+    Ok(match ss_key_len(method)? {
+        // 兼容已有 AES-128 节点的用户密钥。
+        Some(16) => ss_user_password(uuid),
+        Some(_) => {
+            let mut hash = Sha256::new();
+            hash.update(b"sbx/ss2022/aes256/user-key\0");
+            hash.update(password.as_bytes());
+            STANDARD.encode(hash.finalize())
+        }
+        None => password.to_string(),
+    })
+}
+
+pub fn ss_client_password(params: &NodeParams, uuid: &str, password: &str) -> Result<String> {
+    let method = params.ss_method.as_deref().unwrap_or(SS_DEFAULT_METHOD);
+    let user_key = ss_user_password_for(method, uuid, password)?;
+    if ss_key_len(method)?.is_some() {
+        let server_key = params.ss_password.as_deref().context("缺少 SS2022 服务端密钥")?;
+        Ok(format!("{server_key}:{user_key}"))
+    } else {
+        Ok(user_key)
+    }
+}
+
 /// 生成一张自签证书,返回 `(cert_pem, key_pem)`。
 ///
 /// rcgen 默认是 ECDSA P-256:比 RSA 小得多,握手也快。证书内容基本没人验 ——
@@ -140,6 +208,37 @@ pub fn self_signed(cn: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ss_switches_keys_only_when_the_algorithm_changes() {
+        let mut params = NodeParams::default();
+        fill(Protocol::Shadowsocks, &mut params).unwrap();
+        let old_key = params.ss_password.clone();
+        set_ss_method(&mut params, SS_DEFAULT_METHOD).unwrap();
+        assert_eq!(
+            params.ss_password, old_key,
+            "editing defaults must preserve existing credentials"
+        );
+        set_ss_method(&mut params, "2022-blake3-aes-256-gcm").unwrap();
+        assert_eq!(STANDARD.decode(params.ss_password.as_ref().unwrap()).unwrap().len(), 32);
+        assert_ne!(params.ss_password, old_key);
+        let key = params.ss_password.clone();
+        assert!(set_ss_method(&mut params, "2022-blake3-chacha20-poly1305").is_err());
+        assert_eq!(params.ss_password, key, "invalid selection must not change credentials");
+        for method in SS_METHODS {
+            set_ss_method(&mut params, method).unwrap();
+            let user_key = ss_user_password_for(
+                method,
+                "b831381d-6324-4d53-ad4f-8cda48b30811",
+                "alice-password",
+            )
+            .unwrap();
+            match ss_key_len(method).unwrap() {
+                Some(length) => assert_eq!(STANDARD.decode(user_key).unwrap().len(), length),
+                None => assert_eq!(user_key, "alice-password"),
+            }
+        }
+    }
 
     /// reality 私钥必须是 clamp 过的:低 3 位清零、最高位清零、次高位置一。
     /// 不 clamp 的话公钥算出来与 sing-box 侧不一致,而那个 bug 没有任何报错。

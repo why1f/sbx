@@ -22,3 +22,7 @@ e2e/e2e-driver.exe
 *.db-shm
 last-applied.json
 /tls/
+
+# Python workflow helper/test cache.
+__pycache__/
+*.pyc

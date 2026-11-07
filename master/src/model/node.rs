@@ -59,13 +59,13 @@ impl Protocol {
     pub fn all() -> &'static [Protocol] {
         &[
             Protocol::VlessReality,
+            Protocol::Shadowsocks,
+            Protocol::Hysteria2,
             Protocol::VlessWs,
             Protocol::VmessWs,
-            Protocol::Shadowsocks,
             Protocol::Trojan,
             Protocol::Tuic,
             Protocol::Anytls,
-            Protocol::Hysteria2,
         ]
     }
 }
@@ -124,8 +124,8 @@ pub struct NodeParams {
     /// 加密方式。默认 `2022-blake3-aes-128-gcm`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ss_method: Option<String>,
-    /// **服务端**密钥,base64(16 字节)。与每个用户各自的 password 是两回事:
-    /// 2022 系列方法里,服务端密钥 + 用户密钥共同参与派生。
+    /// 服务端密钥。SS2022 为 base64(16/32 字节);普通 AEAD 使用随机密码。
+    /// 与用户凭据分开,切换算法时才重新生成。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ss_password: Option<String>,
 

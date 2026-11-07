@@ -328,19 +328,15 @@ fn share_link(u: &SubUser, n: &ExportNode, s: &str, port: u16) -> Option<String>
         Protocol::Shadowsocks => {
             let method = param(p, |x| x.ss_method.as_ref())
                 .unwrap_or_else(|| crate::secrets::SS_DEFAULT_METHOD.to_string());
-            let psk = param(p, |x| x.ss_password.as_ref())?;
-            // AEAD-2022 的 SIP002 userinfo **不得再做 Base64**。
-            //
-            // 外层订阅本身仍是 Base64(一组分享链接的传输格式),那一层是正常的;
-            // 但 `ss://` 里面的 2022 userinfo 必须是明文 `method:password`,
-            // 两部分各自 percent-encode。password 里「服务端密钥:用户密钥」的冒号
-            // 会变成 `%3A`,避免被误读成 method/password 的分隔符。
-            //
-            // 旧写法把整段再用 STANDARD Base64 编一次,形成“两层解码”,而且含
-            // `+` `/` `=` 这些非 URL-safe 字符。部分客户端宽容接受,但它不符合
-            // AEAD-2022 的 SIP002 规则。
-            let pw = format!("{}:{}", psk, crate::secrets::ss_user_password(&u.uuid));
-            Some(format!("ss://{}:{}@{}:{}#{}", enc(&method), enc(&pw), authority, port, tag))
+            let password = crate::secrets::ss_client_password(p, &u.uuid, &u.password).ok()?;
+            let userinfo = if crate::secrets::ss_key_len(&method).ok()?.is_some() {
+                // SS2022 按 SIP002 明文 percent-encode;普通 AEAD 使用 Base64URL。
+                format!("{}:{}", enc(&method), enc(&password))
+            } else {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!("{method}:{password}"))
+            };
+            Some(format!("ss://{userinfo}@{authority}:{port}#{tag}"))
         }
 
         Protocol::Trojan => Some(format!(
@@ -674,10 +670,9 @@ fn clash_proxy(
         Protocol::Shadowsocks => {
             let method = param(p, |x| x.ss_method.as_ref())
                 .unwrap_or_else(|| crate::secrets::SS_DEFAULT_METHOD.to_string());
-            let Some(psk) = param(p, |x| x.ss_password.as_ref()) else {
+            let Ok(pw) = crate::secrets::ss_client_password(p, &u.uuid, &u.password) else {
                 return false;
             };
-            let pw = format!("{}:{}", psk, crate::secrets::ss_user_password(&u.uuid));
             let _ = writeln!(out, "  - name: {name}");
             let _ = writeln!(out, "    type: ss");
             let _ = writeln!(out, "    server: {server}");
@@ -912,13 +907,13 @@ mod tests {
 
         let schemes = [
             "vless://",
+            "ss://",
+            "hysteria2://",
             "vless://",
             "vmess://",
-            "ss://",
             "trojan://",
             "tuic://",
             "anytls://",
-            "hysteria2://",
         ];
         for (link, want) in links.iter().zip(schemes) {
             assert!(

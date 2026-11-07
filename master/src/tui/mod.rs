@@ -1557,6 +1557,15 @@ fn page_key(app: &mut App, k: KeyEvent) -> Option<Action> {
 /// 离线的机器直接跳过。升级是**一次性指令**而不是状态,不会在它下次重连时
 /// 补发 —— 所以回执里必须把跳过的台数说出来,否则人会以为全升了。
 async fn upgrade_agents(app: &mut App, only: Option<i64>, name: &str) -> Result<String> {
+    upgrade_agents_to(app, only, name, None).await
+}
+
+async fn upgrade_agents_to(
+    app: &mut App,
+    only: Option<i64>,
+    name: &str,
+    kernel: Option<&crate::upgrade::kernel::Manifest>,
+) -> Result<String> {
     let version = crate::upgrade::target_version();
     let now = chrono::Local::now().timestamp();
 
@@ -1592,7 +1601,13 @@ async fn upgrade_agents(app: &mut App, only: Option<i64>, name: &str) -> Result<
                 .push(format!("{aname}(架构 {} 没有发布产物)", arch.as_deref().unwrap_or("未知")));
             continue;
         };
-        let url = crate::upgrade::agent_asset_url(version, a);
+        let url = if let Some(build) = kernel {
+            let asset = build.asset(a)?;
+            sums.insert(a.to_string(), asset.sha256.clone());
+            asset.url.clone()
+        } else {
+            crate::upgrade::agent_asset_url(version, a)
+        };
         if !sums.contains_key(a) {
             match crate::upgrade::fetch_sha256(&url).await {
                 Ok(sum) => {
@@ -1612,6 +1627,9 @@ async fn upgrade_agents(app: &mut App, only: Option<i64>, name: &str) -> Result<
     }
 
     let mut msg = format!("已排队 {queued} 台升级到 v{version}(由 daemon 下发)");
+    if let Some(build) = kernel {
+        msg.push_str(&format!(",sing-box {}", build.sing_box_version));
+    }
     if offline > 0 {
         msg.push_str(&format!(",跳过 {offline} 台离线的"));
     }
@@ -1619,6 +1637,50 @@ async fn upgrade_agents(app: &mut App, only: Option<i64>, name: &str) -> Result<
         msg.push_str(&format!(";失败:{}", failed.join("、")));
     }
     Ok(msg)
+}
+
+fn kernel_upgrade_form(id: i64, name: &str, current: Option<&str>) -> Modal {
+    use crate::upgrade::kernel::{parse_version, Channel};
+    use modal::{val, Field, Form};
+    let name = name.to_string();
+    let heading = format!("{name} · 当前 sing-box {}", current.unwrap_or("未知"));
+    Modal::Form(
+        Form::new(
+            "切换 sing-box 内核",
+            vec![
+                Field::select("channel", "版本通道", vec!["稳定版".into(), "预发布版".into()], 0),
+                Field::text("version", "内核版本 (留空 = 最新已构建)", ""),
+                Field::select("scope", "更新范围", vec![name.clone(), "所有在线被控".into()], 0),
+            ],
+            Box::new(move |fields| {
+                let index =
+                    |key| fields.iter().find(|f| f.key == key).map(|f| f.index()).unwrap_or(0);
+                let channel =
+                    if index("channel") == 0 { Channel::Stable } else { Channel::Prerelease };
+                let version = val(fields, "version");
+                if !version.is_empty() {
+                    let parsed = parse_version(&version).map_err(|e| e.to_string())?;
+                    if parsed.pre.is_empty() != (channel == Channel::Stable) {
+                        return Err("版本号与所选通道不一致".into());
+                    }
+                }
+                Ok(Action::UpgradeKernel {
+                    only: if index("scope") == 0 { Some(id) } else { None },
+                    name: name.clone(),
+                    channel,
+                    version,
+                })
+            }),
+        )
+        .head(heading)
+        .with_note(Box::new(|_| {
+            vec![
+                "仅安装与当前主控版本匹配、已通过测试的内核构建。不会自动查新或升级。".into(),
+                "没有所需版本时,先在 GitHub 手动运行内核构建工作流。".into(),
+                "切换会重启代理;恢复默认内核可返回升级菜单按 u。".into(),
+            ]
+        })),
+    )
 }
 
 /// 「这条订阅怎么用」。
@@ -1952,6 +2014,11 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             let mut params = crate::model::node::NodeParams {
                 server_name: d.server_name.clone(),
                 path: d.path.clone(),
+                ss_method: if d.protocol == crate::model::node::Protocol::Shadowsocks {
+                    d.ss_method.clone()
+                } else {
+                    None
+                },
                 ipv6: d.ipv6,
                 relay: crate::model::node::RelaySetting {
                     host: d.relay_host.clone(),
@@ -1980,6 +2047,11 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
             let mut params = node.params.clone();
             params.server_name = draft.server_name.clone();
             params.path = draft.path.clone();
+            if draft.protocol == crate::model::node::Protocol::Shadowsocks {
+                if let Some(method) = &draft.ss_method {
+                    crate::secrets::set_ss_method(&mut params, method)?;
+                }
+            }
             params.ipv6 = draft.ipv6;
             params.relay = crate::model::node::RelaySetting {
                 host: draft.relay_host.clone(),
@@ -2229,6 +2301,15 @@ async fn perform_inner(app: &mut App, action: &Action) -> Result<String> {
         }
 
         Action::UpgradeAgents { only, name } => upgrade_agents(app, *only, name).await,
+        Action::OpenKernelUpgrade { id, name } => {
+            let agent = agent_repo::get(&app.pool, *id).await?.context("被控服务器不存在")?;
+            app.modal = Some(kernel_upgrade_form(*id, name, agent.singbox_version.as_deref()));
+            Ok(String::new())
+        }
+        Action::UpgradeKernel { only, name, channel, version } => {
+            let build = crate::upgrade::kernel::resolve(*channel, version).await?;
+            upgrade_agents_to(app, *only, name, Some(&build)).await
+        }
 
         // 这一条**不在这里做**:它要挂起终端(离开 alternate screen、关 raw mode)
         // 才能让脚本的输出被人看见,而终端句柄在主循环手上。这里只置标记。
@@ -2269,6 +2350,85 @@ fn parse_multiplier(s: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_update_entry_defaults_to_stable_and_validates_explicit_versions() {
+        use crate::upgrade::kernel::Channel;
+        let mut modal = Modal::Upgrade {
+            agent_id: 7,
+            name: "tokyo".into(),
+            online: 2,
+            version: "0.4.38".into(),
+        };
+        assert!(matches!(
+            modal.handle(key('k')),
+            Outcome::Run(Action::OpenKernelUpgrade { id: 7, .. })
+        ));
+        let mut form = kernel_upgrade_form(7, "tokyo", Some("1.14.0"));
+        assert!(
+            matches!(form.handle(KeyEvent::from(KeyCode::Enter)), Outcome::Run(Action::UpgradeKernel {
+            only: Some(7), channel: Channel::Stable, version, ..
+        }) if version.is_empty())
+        );
+        let mut form = kernel_upgrade_form(7, "tokyo", None);
+        if let Modal::Form(f) = &mut form {
+            let field = f.fields.iter_mut().find(|f| f.key == "version").unwrap();
+            field.kind = modal::FieldKind::Text { value: "1.15.0-alpha.13".into() };
+        }
+        assert!(
+            matches!(form.handle(KeyEvent::from(KeyCode::Enter)), Outcome::Stay),
+            "stable must not install prerelease by accident"
+        );
+    }
+
+    #[tokio::test]
+    async fn editing_shadowsocks_algorithm_updates_saved_keys_without_rotating_on_other_edits() {
+        use crate::db::{agent_repo, node_repo};
+        use crate::model::node::Protocol;
+        use base64::Engine as _;
+        let path = std::env::temp_dir().join(format!("sbx-ss-edit-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_pool(path.to_str().unwrap()).await.unwrap();
+        let (agent_id, _) = agent_repo::create(&pool, "ss", 0).await.unwrap();
+        let mut params = crate::model::node::NodeParams::default();
+        crate::secrets::fill(Protocol::Shadowsocks, &mut params).unwrap();
+        let original = params.ss_password.clone();
+        let (id, _) =
+            node_repo::add_node(&pool, agent_id, "ss", Protocol::Shadowsocks, 12345, &params)
+                .await
+                .unwrap();
+        let mut app = App::new(pool, Config::default(), "unused.toml".into());
+        app.refresh().await.unwrap();
+        let action = |port| Action::EditNode {
+            id,
+            draft: modal::NodeDraft {
+                agent_id,
+                tag: String::new(),
+                protocol: Protocol::Shadowsocks,
+                port,
+                server_name: None,
+                path: None,
+                ss_method: Some("2022-blake3-aes-256-gcm".into()),
+                ipv6: false,
+                relay_host: String::new(),
+                relay_port: None,
+            },
+        };
+        perform_inner(&mut app, &action(12345)).await.unwrap();
+        app.refresh().await.unwrap();
+        let saved = app.nodes[0].params.ss_password.clone();
+        assert_ne!(saved, original);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(saved.as_ref().unwrap())
+                .unwrap()
+                .len(),
+            32
+        );
+        perform_inner(&mut app, &action(23456)).await.unwrap();
+        app.refresh().await.unwrap();
+        assert_eq!(app.nodes[0].params.ss_password, saved);
+        assert_eq!(app.nodes[0].listen_port, 23456);
+    }
     /// 接入命令的信息框:命令必须**自己占一行**排在最前面。
     /// 它是这个框存在的唯一理由,也是终端不支持 OSC 52 时要用鼠标去选的那一行。
     #[test]
@@ -3575,6 +3735,7 @@ mod tests {
                     port: 9443,
                     server_name: Some("www.microsoft.com".into()),
                     path: None,
+                    ss_method: None,
                     ipv6: true,
                     relay_host: "198.51.100.9".into(),
                     relay_port: Some(20443),
@@ -3638,6 +3799,7 @@ mod tests {
                     port: 443,
                     server_name: None,
                     path: None,
+                    ss_method: None,
                     ipv6: false,
                     relay_host: String::new(),
                     relay_port: None,

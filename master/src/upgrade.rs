@@ -20,6 +20,7 @@
 //! 的 `replaceExecutable`),所以取不到校验和时**宁可不升**,而不是下发一个空值。
 
 use anyhow::{Context, Result};
+pub mod kernel;
 
 /// 产物下载地址。命名与 `release.yml` 的打包步骤逐字对应 ——
 /// 改了那边就要改这里,否则升级会在 agent 侧以 404 告终。

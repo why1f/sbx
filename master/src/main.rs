@@ -130,6 +130,9 @@ enum Cmd {
         /// ws 系协议(vless-ws / vmess-ws)的路径。留空取 /vless 或 /vmess。
         #[arg(long)]
         path: Option<String>,
+        /// Shadowsocks 加密算法。仅用于 shadowsocks 节点。
+        #[arg(long)]
+        ss_method: Option<String>,
     },
     /// 删除节点。
     NodeRemove { id: i64 },
@@ -398,7 +401,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Cmd::NodeAdd { agent_id, tag, port, protocol, server_name, path } => {
+        Cmd::NodeAdd { agent_id, tag, port, protocol, server_name, path, ss_method } => {
             if db::agent_repo::get(&pool, agent_id).await?.is_none() {
                 anyhow::bail!("没有 id 为 {agent_id} 的被控服务器");
             }
@@ -413,7 +416,11 @@ async fn main() -> Result<()> {
                         .join(" / ")
                 );
             }
-            let mut params = model::node::NodeParams { server_name, path, ..Default::default() };
+            if ss_method.is_some() && proto != model::node::Protocol::Shadowsocks {
+                anyhow::bail!("--ss-method 只适用于 shadowsocks 节点");
+            }
+            let mut params =
+                model::node::NodeParams { server_name, path, ss_method, ..Default::default() };
             // 密钥材料在这里生成一次,存进 params_json。**不在下发时生成** ——
             // 那会让每次 config.apply 都换一套密钥,客户端静默全部失联(§9.1)。
             secrets::fill(proto, &mut params)?;

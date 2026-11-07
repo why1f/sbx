@@ -13,3 +13,7 @@
 由 `agent/boxctl` 的 `TestMasterGoldenConfigsAreAccepted` 喂给真正的 sing-box 校验。
 改了 `build_inbound` 之后:先跑 `cargo test` 看 diff,确认改动是有意的,
 再用同目录下的 `.actual` 覆盖 `.json`,最后跑一遍 agent 侧的 Go 测试。
+
+`shadowsocks/*.json` 由 `shadowsocks_methods_match_server_and_subscription_fixtures`
+生成,包含五种算法的服务端配置、分享链接和 Clash 输出。Go 测试从分享链接读取
+客户端凭据,实际连接本机 echo 服务,验证 TCP/UDP、用户记账及停用后的拒绝行为。

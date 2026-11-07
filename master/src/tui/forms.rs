@@ -40,7 +40,7 @@ fn protocol_note(p: Protocol) -> &'static str {
         Protocol::VlessWs | Protocol::VmessWs => {
             "ws:后端不启 TLS,建议前面挂 nginx/caddy 终结 TLS 再反代到这个端口"
         }
-        Protocol::Shadowsocks => "shadowsocks-2022:服务端密钥自动生成;没有 SNI / path 可填",
+        Protocol::Shadowsocks => "加密算法可用左右键切换;默认 SS2022 AES-128。密码自动生成,切换算法后客户端需刷新订阅",
         Protocol::Hysteria2 => "hysteria2:UDP/QUIC;证书自动自签,客户端订阅带 insecure=1",
         Protocol::Trojan | Protocol::Tuic | Protocol::Anytls => {
             "自签证书在建节点时生成,CN 取当时的 server_name;客户端订阅自动带 allowInsecure"
@@ -51,6 +51,17 @@ fn protocol_note(p: Protocol) -> &'static str {
 
 fn protocol_names() -> Vec<String> {
     Protocol::all().iter().map(|p| p.as_str().to_string()).collect()
+}
+
+fn ss_method_field(current: Option<&str>) -> Field {
+    let current = current.unwrap_or(crate::secrets::SS_DEFAULT_METHOD);
+    let mut options: Vec<String> =
+        crate::secrets::SS_METHODS.iter().map(|s| s.to_string()).collect();
+    let index = options.iter().position(|s| s == current).unwrap_or_else(|| {
+        options.push(current.to_string());
+        options.len() - 1
+    });
+    Field::select("ss_method", "加密算法 (←/→ 切换)", options, index)
 }
 
 // ─────────────────────────── agent ───────────────────────────
@@ -137,6 +148,7 @@ pub fn node_add(agents: &[AgentRow], preselect: usize) -> Modal {
             Field::text("port", "监听端口 *必填", "443"),
             Field::text("sni", "server_name (SNI,留空取默认)", ""),
             Field::text("path", "path (留空取默认)", ""),
+            ss_method_field(None),
             Field::toggle("ipv6", "订阅优先 IPv6 (空格切换)", false),
             Field::text("relay_host", "中转地址 (例 1.2.3.4 / relay.com)", ""),
             Field::text("relay_port", "中转端口 (例 12345)", ""),
@@ -190,6 +202,7 @@ pub fn node_edit(n: &NodeRow) -> Modal {
             Field::text("port", "监听端口 *必填", &n.listen_port.to_string()),
             Field::text("sni", "server_name (SNI)", n.params.server_name.as_deref().unwrap_or("")),
             Field::text("path", "path", n.params.path.as_deref().unwrap_or("")),
+            ss_method_field(n.params.ss_method.as_deref()),
             Field::toggle("ipv6", "订阅优先 IPv6 (空格切换)", n.params.ipv6),
             Field::text("relay_host", "中转地址 (例 1.2.3.4 / relay.com)", &n.params.relay.host),
             Field::text("relay_port", "中转端口 (例 12345)", &relay_port),
@@ -229,6 +242,7 @@ fn field_applies(proto: Protocol, key: &str) -> bool {
     match key {
         "sni" => uses_sni(proto),
         "path" => uses_path(proto),
+        "ss_method" => proto == Protocol::Shadowsocks,
         _ => true,
     }
 }
@@ -259,6 +273,7 @@ fn draft_from(f: &[Field], agent_id: i64) -> Result<NodeDraft, String> {
         port,
         server_name: none_if_empty(val(f, "sni")),
         path: none_if_empty(val(f, "path")),
+        ss_method: none_if_empty(val(f, "ss_method")),
         ipv6: on(f, "ipv6"),
         relay_host,
         relay_port,
@@ -574,6 +589,17 @@ mod tests {
         for p in [Protocol::VlessWs, Protocol::VmessWs] {
             assert!(uses_path(p), "{p} 需要 path");
             assert!(!uses_sni(p), "ws 系不走 TLS,不该有 server_name");
+        }
+    }
+
+    #[test]
+    fn algorithm_selection_preserves_the_current_method_and_only_appears_for_ss() {
+        for proto in Protocol::all() {
+            assert_eq!(field_applies(*proto, "ss_method"), *proto == Protocol::Shadowsocks);
+        }
+        for method in crate::secrets::SS_METHODS {
+            let fields = vec![Field::text("port", "", "443"), ss_method_field(Some(method))];
+            assert_eq!(draft_from(&fields, 1).unwrap().ss_method.as_deref(), Some(*method));
         }
     }
 

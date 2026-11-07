@@ -38,7 +38,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	C "github.com/sagernet/sing-box/constant"
 
 	"github.com/why1f/sbx/agent/boxctl"
 	"github.com/why1f/sbx/agent/config"
@@ -278,7 +277,7 @@ func (c *Conn) handshake(ws *websocket.Conn, v4, v6 *string) (*AgentHelloAck, er
 		Arch:              runtime.GOARCH,
 		Hostname:          hostname,
 		BootID:            sysinfo.BootID(),
-		SingboxVersion:    C.Version,
+		SingboxVersion:    currentKernelVersion,
 		ConfigRevision:    c.st.ConfigRevision,
 		UserStateRevision: c.st.UserStateRevision,
 		IPv4:              v4,

@@ -1,0 +1,32 @@
+{
+  "clash": "# mihomo / clash-meta subscription for alice\nmixed-port: 7890\nallow-lan: false\nmode: rule\nlog-level: info\n\nproxies:\n  - name: node-1\n    type: ss\n    server: 127.0.0.1\n    port: 8443\n    cipher: aes-128-gcm\n    password: alice-password\n    udp: true\n\nproxy-groups:\n  - name: 节点选择\n    type: select\n    proxies:\n      - 自动选择\n      - DIRECT\n      - node-1\n  - name: 自动选择\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies:\n      - node-1\n\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,节点选择\n",
+  "empty_inbound": {
+    "listen": "::",
+    "listen_port": 8443,
+    "managed": true,
+    "method": "aes-128-gcm",
+    "password": "unused-server-password",
+    "tag": "node-1",
+    "type": "shadowsocks",
+    "users": []
+  },
+  "inbound": {
+    "listen": "::",
+    "listen_port": 8443,
+    "method": "aes-128-gcm",
+    "password": "unused-server-password",
+    "tag": "node-1",
+    "type": "shadowsocks",
+    "users": [
+      {
+        "name": "alice",
+        "password": "alice-password"
+      },
+      {
+        "name": "bob",
+        "password": "bob-password"
+      }
+    ]
+  },
+  "uri": "ss://YWVzLTEyOC1nY206YWxpY2UtcGFzc3dvcmQ@127.0.0.1:8443#node-1"
+}

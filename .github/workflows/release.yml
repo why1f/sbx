@@ -140,12 +140,14 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          KERNEL_VERSION="$(go -C agent list -m -f '{{.Version}}' github.com/sagernet/sing-box)"
+          KERNEL_VERSION="${KERNEL_VERSION#v}"
           mkdir -p dist
           for arch in amd64 arm64; do
             BIN="sbx-agent-${GITHUB_REF_NAME}-linux-${arch}"
             GOARCH="$arch" go -C agent build -trimpath \
               -tags with_quic,with_utls \
-              -ldflags "-s -w -buildid= -X main.Version=${VERSION}" \
+              -ldflags "-s -w -buildid= -X main.Version=${VERSION} -X github.com/sagernet/sing-box/constant.Version=${KERNEL_VERSION}" \
               -o "../dist/${BIN}" ./cmd/sbx-agent
             # 逐个算,不要用通配符 —— 下一轮已经有上一轮生成的 .sha256。
             ( cd dist && sha256sum "$BIN" > "${BIN}.sha256" )

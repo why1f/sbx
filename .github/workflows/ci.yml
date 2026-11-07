@@ -9,6 +9,14 @@ on:
     branches: [main, master]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        default: ''
+      dependency_artifact:
+        type: string
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,6 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.dependency_artifact != ''
+        with:
+          name: ${{ inputs.dependency_artifact }}
       # 用 stable 而不是钉死版本:发布产物应当跟着编译器的修复走。
       # 代价是**新版 clippy 引入新 lint 时 CI 会变红**,即使代码一行没改。
       # 那不是误报,修法通常就是一行(照 clippy 给的 help 改),改完往往更清楚。
@@ -43,6 +58,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.dependency_artifact != ''
+        with:
+          name: ${{ inputs.dependency_artifact }}
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -169,6 +191,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.dependency_artifact != ''
+        with:
+          name: ${{ inputs.dependency_artifact }}
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -191,8 +220,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.dependency_artifact != ''
+        with:
+          name: ${{ inputs.dependency_artifact }}
       # dash 是 Debian/Ubuntu 的 /bin/sh。脚本声明自己是 POSIX sh,
       # 只用 bash 测等于没测那条承诺 —— 被控机上可能只有 dash/busybox。
+      - name: kernel build automation tests
+        run: |
+          if [ -f packaging/test_kernel_variant.py ]; then
+            python3 -m unittest discover -s packaging -p test_kernel_variant.py
+          fi
       - name: dash
         run: dash packaging/test-install.sh
       - name: bash
@@ -218,6 +259,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: inputs.dependency_artifact != ''
+        with:
+          name: ${{ inputs.dependency_artifact }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5

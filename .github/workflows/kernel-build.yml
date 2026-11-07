@@ -1,0 +1,164 @@
+name: Build agent with selected sing-box
+
+# Manual only. No schedule, push trigger, source commit, or branch push.
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'sing-box 通道（版本留空时取该通道最新版本）'
+        type: choice
+        options: [stable, prerelease]
+        default: stable
+        required: true
+      sing_box_version:
+        description: 'sing-box 版本，可带 v；留空 = 最新'
+        type: string
+        default: ''
+      sbx_version:
+        description: '基线 sbx 正式版本；留空 = 最新正式版'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-build-${{ inputs.sbx_version || 'latest' }}-${{ inputs.channel }}-${{ inputs.sing_box_version || 'latest' }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      source_commit: ${{ steps.resolve.outputs.source_commit }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      exists: ${{ steps.resolve.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve official versions and existing builds
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_CHANNEL: ${{ inputs.channel }}
+          KERNEL_VERSION: ${{ inputs.sing_box_version }}
+          AGENT_VERSION: ${{ inputs.sbx_version }}
+        run: python packaging/kernel_variant.py resolve --channel "$KERNEL_CHANNEL" --kernel "$KERNEL_VERSION" --agent "$AGENT_VERSION"
+      - name: Show selected build
+        env:
+          BUILD_TAG: ${{ steps.resolve.outputs.release_tag }}
+          ALREADY_EXISTS: ${{ steps.resolve.outputs.exists }}
+        run: |
+          echo "Build: $BUILD_TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Already published: $ALREADY_EXISTS (existing builds are reused)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-metadata
+          path: kernel-metadata.json
+          if-no-files-found: error
+
+  prepare:
+    needs: resolve
+    if: needs.resolve.outputs.exists != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-metadata
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: source/agent/go.sum
+      - name: Update only temporary Go dependency files
+        run: python packaging/kernel_variant.py prepare --source source --output dependency-locks
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-dependency-locks
+          path: dependency-locks/
+          if-no-files-found: error
+
+  verify:
+    needs: [resolve, prepare]
+    if: needs.resolve.outputs.exists != 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ needs.resolve.outputs.source_commit }}
+      dependency_artifact: kernel-dependency-locks
+
+  build:
+    needs: [resolve, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+          path: source
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-metadata
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-dependency-locks
+          path: source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: source/agent/go.sum
+      - name: Package both architectures and manifest
+        env:
+          KERNEL_TESTS_PASSED: 'true'
+        run: python packaging/kernel_variant.py package --source source --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-release-assets
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-${{ needs.resolve.outputs.release_tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-metadata
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-release-assets
+          path: dist
+      - name: Publish immutable optional build without changing latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python packaging/kernel_variant.py publish --output dist

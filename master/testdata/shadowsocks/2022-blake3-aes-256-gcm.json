@@ -1,0 +1,32 @@
+{
+  "clash": "# mihomo / clash-meta subscription for alice\nmixed-port: 7890\nallow-lan: false\nmode: rule\nlog-level: info\n\nproxies:\n  - name: node-1\n    type: ss\n    server: 127.0.0.1\n    port: 8443\n    cipher: 2022-blake3-aes-256-gcm\n    password: \"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=:0xwShvDUTttDeuvh4QPtVflzvns8/4/obnuBun4iVZI=\"\n    udp: true\n\nproxy-groups:\n  - name: 节点选择\n    type: select\n    proxies:\n      - 自动选择\n      - DIRECT\n      - node-1\n  - name: 自动选择\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies:\n      - node-1\n\nrules:\n  - GEOIP,CN,DIRECT\n  - MATCH,节点选择\n",
+  "empty_inbound": {
+    "listen": "::",
+    "listen_port": 8443,
+    "managed": true,
+    "method": "2022-blake3-aes-256-gcm",
+    "password": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+    "tag": "node-1",
+    "type": "shadowsocks",
+    "users": []
+  },
+  "inbound": {
+    "listen": "::",
+    "listen_port": 8443,
+    "method": "2022-blake3-aes-256-gcm",
+    "password": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+    "tag": "node-1",
+    "type": "shadowsocks",
+    "users": [
+      {
+        "name": "alice",
+        "password": "0xwShvDUTttDeuvh4QPtVflzvns8/4/obnuBun4iVZI="
+      },
+      {
+        "name": "bob",
+        "password": "rklaY5kS5fKBxh1Txf6BGmodcMKRtBA+MK3w79OVsW0="
+      }
+    ]
+  },
+  "uri": "ss://2022-blake3-aes-256-gcm:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc%3D%3A0xwShvDUTttDeuvh4QPtVflzvns8%2F4%2FobnuBun4iVZI%3D@127.0.0.1:8443#node-1"
+}
